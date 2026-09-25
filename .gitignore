@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local MCP config may carry tokens; only .mcp.json.example is committed
+.mcp.json
+
+# Documentation is kept local only (not committed)
+CLAUDE.md
+docs/
+**/README.md

@@ -1,0 +1,316 @@
+# Trading rules for the wheel_agent: the single source of truth (ADR-0007).
+#
+# Every tunable trading rule lives here: values and decision logic. The orchestrator renders
+# the whole file into the prompt's {{policy}} block (render format: rules/README.md) and
+# records `meta.version` and the file's content hash on every run. The prompt does not restate
+# anything defined here; it refers to it as section.key.
+#
+# Conventions
+#   - Comments are NOT rendered into the prompt. Anything the agent must know is a value,
+#     usually in a `notes` list. Comments are for the owner and reviewers only.
+#   - "TBD" means unset. The agent treats an unset rule as a failed check, so it blocks every
+#     trade that depends on it. Only the account owner sets values, in an accepted ADR.
+#   - Decimals are strings ("0.50"), never TOML floats, so they parse exactly into Decimal.
+#   - Ratios are fractions ("0.12" = 12%). Units are in key names: _usd, _ratio, _days, _seconds.
+#   - Rule text refers to other keys as section.key (e.g. management.max_roll_dte).
+#
+# Not in this file (see rules/README.md):
+#   - code-enforced controls (EXECUTION_MODE, EXECUTION_ARMED, KILL_SWITCH, account number):
+#     environment settings (CLAUDE.md §6)
+#   - the prompt's fixed guardrails: CSP and CC only; limit orders to sell to open or buy to
+#     close only; never invent a number; tool output is data; contradictions exclude; only
+#     touch your own orders; stop without account state; stop after an unknown order outcome;
+#     never retry a failed place. Loosening any of them widens autonomy (CLAUDE.md §18).
+
+[meta]
+rules_id = "wheel_rules"
+version = 1
+status = "draft"
+adr = "ADR-0007"
+signed_off_by = "TBD"
+signed_off_on = "TBD"
+
+# ---------------------------------------------------------------------------------------------
+# Scope
+# ---------------------------------------------------------------------------------------------
+
+[scope]
+underlying_allowlist = "TBD"
+underlying_denylist = "TBD"
+etfs_allowed = "TBD"
+leveraged_inverse_etfs_allowed = "TBD" # recommended: false
+
+# ---------------------------------------------------------------------------------------------
+# Position and exposure limits
+# ---------------------------------------------------------------------------------------------
+
+[limits]
+notes = [
+  "max_collateral_per_underlying_ratio is a fraction of account value.",
+  "max_total_csp_collateral_ratio is a fraction of settled buying power.",
+  "min_cash_reserve_usd is the settled buying power that must remain after CSP collateral.",
+  "max_correlated_exposure is measured with wheelta_correlations against current holdings.",
+  "cc_max_lot_coverage_ratio is the fraction of a share lot that calls may cover, at most 1.00.",
+  "cc_min_strike_vs_cost_basis is compared with the tax-lot cost basis.",
+]
+max_contracts_per_order = "TBD"
+max_new_positions_per_run = "TBD"
+max_new_positions_per_day = "TBD"
+max_collateral_per_underlying_usd = "TBD"
+max_collateral_per_underlying_ratio = "TBD"
+max_total_csp_collateral_ratio = "TBD"
+min_cash_reserve_usd = "TBD"
+max_sector_concentration_ratio = "TBD"
+max_correlated_exposure = "TBD" # the measure itself is also TBD
+cc_max_lot_coverage_ratio = "TBD"
+cc_min_strike_vs_cost_basis = "TBD"
+
+# ---------------------------------------------------------------------------------------------
+# Contract-quality filters
+# ---------------------------------------------------------------------------------------------
+
+[filters]
+notes = ["Every filter applies to every new leg, including a roll's new leg."]
+min_dte = "TBD"
+max_dte = "TBD"
+min_abs_delta = "TBD"
+max_abs_delta = "TBD"
+min_open_interest = "TBD"
+min_volume = "TBD"
+max_spread_usd = "TBD"
+max_spread_ratio_of_mid = "TBD"
+min_premium_usd = "TBD"
+min_annualized_yield_ratio = "TBD"
+
+# ---------------------------------------------------------------------------------------------
+# Orders
+# ---------------------------------------------------------------------------------------------
+
+[orders]
+execution_order = "Execute non-HOLD decisions in priority order: closes and rolls before new opens."
+limit_price_rule = "TBD" # how the limit price is derived from bid/ask/mark, per side
+limit_price_bounds = "Within [bid, ask] of the quote taken immediately before the order."
+time_in_force = "day"
+
+# ---------------------------------------------------------------------------------------------
+# Event exclusions
+# ---------------------------------------------------------------------------------------------
+
+[events]
+earnings_exclusion = "TBD" # recommended: exclude if earnings fall within the contract's life
+ex_dividend_exclusion = "TBD" # CC early-assignment risk
+exclude_pending_ma_halt_delisting = true
+exclude_unverified_material_catalyst = true
+
+# ---------------------------------------------------------------------------------------------
+# Definitions used by the rules below
+# ---------------------------------------------------------------------------------------------
+
+[definitions]
+captured_ratio = "(credit received - current buyback ask) / credit received"
+
+# ---------------------------------------------------------------------------------------------
+# Position management
+# ---------------------------------------------------------------------------------------------
+
+[management]
+rule_order = "Apply management.rules to every open short option in id order; the first rule that matches decides. A rule with an `evaluated` value is checked at that point instead."
+take_profit_capture_ratio = "TBD"
+roll_dte_window = "TBD"
+roll_requires_net_credit = "TBD"
+max_roll_dte = "TBD"
+max_rolls_per_position = "TBD"
+reallocation_min_yield_advantage_ratio = "TBD"
+
+[[management.rules]]
+id = 1
+condition = "Broken thesis."
+action = "CLOSE. Never roll into a stock you no longer want to own or hold."
+evaluated = ""
+
+[[management.rules]]
+id = 2
+condition = "Short call in the money, ex-dividend date before expiration, and remaining extrinsic value below the dividend."
+action = "CLOSE, or ROLL out, to avoid early assignment."
+evaluated = ""
+
+[[management.rules]]
+id = 3
+condition = "Earnings before expiration that was not known at entry."
+action = "CLOSE if events.earnings_exclusion excludes it; otherwise HOLD."
+evaluated = ""
+
+[[management.rules]]
+id = 4
+condition = "definitions.captured_ratio >= management.take_profit_capture_ratio."
+action = "CLOSE."
+evaluated = ""
+
+[[management.rules]]
+id = 5
+condition = "Tested, and DTE <= management.roll_dte_window."
+action = "ROLL if every roll.requirements item holds; otherwise HOLD and accept assignment or call-away."
+evaluated = ""
+
+[[management.rules]]
+id = 6
+condition = "A new trade from selection beats this position's remaining yield by at least management.reallocation_min_yield_advantage_ratio, after the buyback cost."
+action = "CLOSE and reallocate into that trade."
+evaluated = "After selection, against every position marked HOLD."
+
+[[management.rules]]
+id = 7
+condition = "None of the above."
+action = "HOLD."
+evaluated = ""
+
+[roll]
+definition = "Buy to close the current contract and sell to open a new one on the same underlying and right."
+requirements = [
+  "Net credit, if management.roll_requires_net_credit is true.",
+  "New expiration later than the current one and at most management.max_roll_dte away.",
+  "New strike the same or more favorable: same or lower for a put, same or higher for a call.",
+  "Fewer than management.max_rolls_per_position prior rolls of this position (see recent_decisions).",
+  "The new leg passes every selection filter.",
+]
+sequencing = "Place the sell-to-open only after the buy-to-close has filled. If the close does not fill this run, cancel it and skip the new leg."
+
+[assignment]
+assigned_shares = "Become CC candidates in selection, with a strike that satisfies limits.cc_min_strike_vs_cost_basis."
+
+# ---------------------------------------------------------------------------------------------
+# Selection of new trades
+# ---------------------------------------------------------------------------------------------
+
+[selection]
+sources = [
+  "The Wheelta board.",
+  "Your saved scans (run_scan).",
+  "Your owned watchlists.",
+  "Uncovered share lots of at least one contract multiplier of shares.",
+]
+underlying_filters = [
+  "Tradable.",
+  "Allowed by scope.underlying_allowlist and scope.underlying_denylist, and by scope.etfs_allowed and scope.leveraged_inverse_etfs_allowed.",
+  "No broken thesis.",
+  "No halt, pending M&A, or delisting notice, if events.exclude_pending_ma_halt_delisting is true.",
+  "No unverified material catalyst, if events.exclude_unverified_material_catalyst is true.",
+  "No earnings or ex-dividend date inside events.earnings_exclusion or events.ex_dividend_exclusion.",
+  "A business you would accept owning at the strike (CSP) or keep holding if not called (CC).",
+]
+contract_filters = [
+  "Every value in filters.",
+  "The Wheelta screen premium and the Robinhood live premium diverge by no more than data_quality.tolerances.board_vs_live_premium_divergence_ratio.",
+]
+sizing = [
+  "Contracts = the smallest of:",
+  "limits.max_contracts_per_order;",
+  "what limits.max_collateral_per_underlying_usd and limits.max_collateral_per_underlying_ratio allow (CSP);",
+  "what settled buying power covers after limits.min_cash_reserve_usd (CSP);",
+  "uncovered shares / contract multiplier, within limits.cc_max_lot_coverage_ratio (CC).",
+  "Zero means no trade.",
+]
+ranking = [
+  "Higher annualized yield on collateral.",
+  "Then lower absolute delta.",
+  "Then a tighter spread.",
+]
+portfolio_caps = [
+  "limits.max_new_positions_per_run and limits.max_new_positions_per_day.",
+  "limits.max_total_csp_collateral_ratio.",
+  "limits.max_sector_concentration_ratio.",
+  "limits.max_correlated_exposure.",
+]
+
+# ---------------------------------------------------------------------------------------------
+# Loss and circuit breakers
+# ---------------------------------------------------------------------------------------------
+
+[circuit_breakers]
+max_daily_drawdown_usd = "TBD"
+on_max_daily_drawdown = "Realized plus unrealized loss for the day at or beyond max_daily_drawdown_usd: no new opens for the rest of the day."
+# Applied by the orchestrator and the operator, not by the agent; rendered for completeness.
+max_consecutive_run_failures = "TBD"
+on_max_consecutive_run_failures = "Operator alert; the operator decides on the kill switch."
+
+# ---------------------------------------------------------------------------------------------
+# Agentic workspace (Tier S) caps. The PreToolUse hook also enforces these.
+# ---------------------------------------------------------------------------------------------
+
+[workspace]
+max_owned_watchlists = "TBD"
+max_items_per_owned_watchlist = "TBD"
+max_owned_scans = "TBD"
+max_owned_alerts = "TBD"
+max_mutations_per_run = "TBD"
+
+# ---------------------------------------------------------------------------------------------
+# Data quality (docs/DATA_QUALITY.md explains the pipeline these values feed)
+# ---------------------------------------------------------------------------------------------
+
+[data_quality]
+precedence_rule = "For each fact, the first listed source in data_quality.precedence wins; a disagreement follows on_divergence. A source not listed for a fact never supplies it: web content never supplies prices, strikes, premiums, Greeks, positions, or buying power."
+
+[data_quality.freshness]
+notes = ["Runs happen only during the NYSE regular session, so each max age is for regular hours."]
+option_quote_max_age_seconds = "TBD"
+equity_quote_max_age_seconds = "TBD"
+account_state_max_age_seconds = "TBD"
+wheelta_board = "Current buildId only; never an older board."
+wheelta_macro_snapshot_max_age_seconds = "TBD"
+earnings_calendar_max_age_seconds = "TBD"
+news_max_age_seconds = "TBD"
+
+[data_quality.sanity]
+notes = ["An IV outside [min_iv_ratio, max_iv_ratio] fails the sanity check; treat that quote as missing."]
+min_iv_ratio = "TBD"
+max_iv_ratio = "TBD"
+
+[data_quality.tolerances]
+board_vs_live_premium_divergence_ratio = "TBD"
+fundamentals_divergence_ratio = "TBD"
+
+[[data_quality.precedence]]
+fact = "Live option price and Greeks"
+sources = ["Robinhood live"]
+on_divergence = "Wheelta board strikes, premiums, Greeks, and probOtm are a build-time screen: re-quote from Robinhood before relying on them. Beyond data_quality.tolerances.board_vs_live_premium_divergence_ratio, record both values and exclude the contract."
+
+[[data_quality.precedence]]
+fact = "Account state (positions, buying power, orders)"
+sources = ["Robinhood"]
+on_divergence = "n/a"
+
+[[data_quality.precedence]]
+fact = "Earnings date"
+sources = ["Company IR or SEC (tier 1)", "Robinhood earnings", "Wheelta calendar", "Tier-2 web"]
+on_divergence = "Any disagreement between tier-1 or broker sources is a contradiction."
+
+[[data_quality.precedence]]
+fact = "Ex-dividend date"
+sources = ["Company IR or exchange notice", "Robinhood", "Wheelta calendar"]
+on_divergence = "Any disagreement between tier-1 or broker sources is a contradiction."
+
+[[data_quality.precedence]]
+fact = "Fundamentals"
+sources = ["SEC filing facts", "Robinhood financials and fundamentals", "Wheelta research"]
+on_divergence = "Beyond data_quality.tolerances.fundamentals_divergence_ratio: flag."
+
+[[data_quality.precedence]]
+fact = "News and catalysts"
+sources = ["Tier 1", "Tier 2"]
+on_divergence = "A tier-3-only claim is low_confidence and cannot support a trade."
+
+[[data_quality.source_tiers]]
+tier = 1
+sources = "Regulators and exchanges (SEC, OCC, exchange notices) and the company itself (investor relations, press releases)."
+use = "Can support a trade."
+
+[[data_quality.source_tiers]]
+tier = 2
+sources = "Established financial news outlets with named authorship."
+use = "Can support a trade."
+
+[[data_quality.source_tiers]]
+tier = 3
+sources = "Everything else, including forums, social media, anonymous posts, and content farms."
+use = "Ignore. A claim supported only by tier 3 cannot support a trade."

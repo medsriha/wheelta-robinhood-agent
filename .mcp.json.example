@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "robinhood": {
+      "type": "http",
+      "url": "https://agent.robinhood.com/mcp/trading"
+    },
+    "wheelta": {
+      "type": "http",
+      "url": "https://mcp.wheelta.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${WHEELTA_MCP_TOKEN}"
+      }
+    }
+  }
+}

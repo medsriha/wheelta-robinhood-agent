@@ -1,0 +1,28 @@
+[project]
+name = "wheelta-robinhood-agent"
+version = "0.0.0"
+description = "Hourly research agent for cash-secured put and covered call opportunities (scaffolding only)"
+readme = "README.md"
+requires-python = ">=3.11"
+# Phase 0: no dependencies yet. Add them with `uv add` when phase 1 opens (see CLAUDE.md §23).
+dependencies = []
+
+[dependency-groups]
+dev = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+# Mirrors wheelta-mcp; S/DTZ/T20 added for a trading codebase (bandit, naive datetimes, print).
+select = ["E", "F", "I", "B", "UP", "W", "S", "DTZ", "T20"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
