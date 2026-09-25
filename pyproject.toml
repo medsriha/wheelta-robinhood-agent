@@ -1,7 +1,7 @@
 [project]
 name = "wheelta-robinhood-agent"
 version = "0.0.0"
-description = "Hourly research agent for cash-secured put and covered call opportunities (scaffolding only)"
+description = "Hourly autonomous agent that trades cash-secured puts and covered calls on a Robinhood Agentic account (scaffolding only)"
 readme = "README.md"
 requires-python = ">=3.11"
 # Phase 0: no dependencies yet. Add them with `uv add` when phase 1 opens (see CLAUDE.md §23).
