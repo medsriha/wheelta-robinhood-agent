@@ -10,6 +10,10 @@
 #     usually in a `notes` list. Comments are for the owner and reviewers only.
 #   - "TBD" means unset. The agent treats an unset rule as a failed check, so it blocks every
 #     trade that depends on it. Only the account owner sets values, in an accepted ADR.
+#   - "none" means the owner deliberately set no limit: the check always passes.
+#   - "agent_discretion" means the owner chose no fixed value: the agent decides from the
+#     guidance named in the rule and records its reasoning. The meaning of both is also a value
+#     (conventions.value_conventions), because comments are not rendered.
 #   - Decimals are strings ("0.50"), never TOML floats, so they parse exactly into Decimal.
 #   - Ratios are fractions ("0.12" = 12%). Units are in key names: _usd, _ratio, _days, _seconds.
 #   - Rule text refers to other keys as section.key (e.g. management.max_roll_dte).
@@ -24,21 +28,29 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 1
+version = 3
 status = "draft"
-adr = "ADR-0007"
+adr = "ADR-0010"
 signed_off_by = "TBD"
 signed_off_on = "TBD"
+
+[conventions]
+value_conventions = [
+  "TBD: unset. Any check that depends on it fails, so no trade that needs it is made.",
+  "none: deliberately no limit. The check always passes.",
+  "agent_discretion: no fixed value. Decide from the guidance the rule names, and state the values you weighed in the decision's rationale.",
+]
 
 # ---------------------------------------------------------------------------------------------
 # Scope
 # ---------------------------------------------------------------------------------------------
 
 [scope]
-underlying_allowlist = "TBD"
-underlying_denylist = "TBD"
-etfs_allowed = "TBD"
-leveraged_inverse_etfs_allowed = "TBD" # recommended: false
+notes = ["Leveraged, inverse, and volatility funds are not wheel underlyings at any premium."]
+underlying_allowlist = "none" # the universe is whatever selection.sources produce
+underlying_denylist = "none"
+etfs_allowed = true
+leveraged_inverse_etfs_allowed = false # matches the Wheelta board's exclude_leveraged
 
 # ---------------------------------------------------------------------------------------------
 # Position and exposure limits
@@ -47,40 +59,49 @@ leveraged_inverse_etfs_allowed = "TBD" # recommended: false
 [limits]
 notes = [
   "max_collateral_per_underlying_ratio is a fraction of account value.",
-  "max_total_csp_collateral_ratio is a fraction of settled buying power.",
-  "min_cash_reserve_usd is the settled buying power that must remain after CSP collateral.",
+  "max_total_csp_collateral_ratio is a fraction of the pre-order CSP cash base: available settled cash plus cash already reserved for existing CSP positions and working CSP orders. See definitions.cash_accounting.",
+  "min_cash_reserve_usd is the available settled cash that must remain after the new CSP reservation. Do not subtract existing reservations twice.",
   "max_correlated_exposure is measured with wheelta_correlations against current holdings.",
   "cc_max_lot_coverage_ratio is the fraction of a share lot that calls may cover, at most 1.00.",
   "cc_min_strike_vs_cost_basis is compared with the tax-lot cost basis.",
+  "All available settled cash may be used; there are no dollar caps.",
+  "cc_min_strike_vs_cost_basis is agent_discretion: a strike below the lot's cost basis locks in a loss on the shares if they are called away. Choose one only when the premium and your thesis justify it, and state the cost basis, strike, and premium in the rationale.",
 ]
-max_contracts_per_order = "TBD"
-max_new_positions_per_run = "TBD"
-max_new_positions_per_day = "TBD"
-max_collateral_per_underlying_usd = "TBD"
-max_collateral_per_underlying_ratio = "TBD"
-max_total_csp_collateral_ratio = "TBD"
-min_cash_reserve_usd = "TBD"
-max_sector_concentration_ratio = "TBD"
-max_correlated_exposure = "TBD" # the measure itself is also TBD
-cc_max_lot_coverage_ratio = "TBD"
-cc_min_strike_vs_cost_basis = "TBD"
+# Owner, 2026-09-25: reuse all available cash; no dollar, per-underlying, sector, or
+# correlation caps. The count caps below are the only brake on a runaway or injected run.
+max_contracts_per_order = 10
+max_new_positions_per_run = 5
+max_new_positions_per_day = 10
+max_collateral_per_underlying_usd = "none"
+max_collateral_per_underlying_ratio = "1.00"
+max_total_csp_collateral_ratio = "1.00"
+min_cash_reserve_usd = "0.00"
+max_sector_concentration_ratio = "none"
+max_correlated_exposure = "none"
+cc_max_lot_coverage_ratio = "1.00"
+cc_min_strike_vs_cost_basis = "agent_discretion"
 
 # ---------------------------------------------------------------------------------------------
 # Contract-quality filters
 # ---------------------------------------------------------------------------------------------
 
 [filters]
-notes = ["Every filter applies to every new leg, including a roll's new leg."]
-min_dte = "TBD"
-max_dte = "TBD"
-min_abs_delta = "TBD"
-max_abs_delta = "TBD"
-min_open_interest = "TBD"
-min_volume = "TBD"
-max_spread_usd = "TBD"
-max_spread_ratio_of_mid = "TBD"
-min_premium_usd = "TBD"
-min_annualized_yield_ratio = "TBD"
+notes = [
+  "Every filter applies only to sell-to-open legs, including a roll's new leg. Buy-to-close legs use orders.close_checks.",
+  "min_premium_usd is per share (the quoted option price), not per contract.",
+  "max_spread_ratio_of_mid is (ask - bid) / mid.",
+  "min_annualized_yield_ratio is premium / collateral, annualized over DTE (CSP collateral = strike x multiplier; CC collateral = share price x multiplier).",
+]
+min_dte = 7
+max_dte = 45 # the board's own gates: DTE 1-45, |delta| 0.15-0.35
+min_abs_delta = "0.15"
+max_abs_delta = "0.30"
+min_open_interest = 100 # Hub "caution" band; the board does not gate on OI
+min_volume = "none" # day volume is near zero early in the session even on liquid contracts
+max_spread_usd = "none" # max_spread_ratio_of_mid scales with price instead
+max_spread_ratio_of_mid = "0.30" # board max_entry_slippage_pct 0.15 = 0.30 full spread
+min_premium_usd = "0.10"
+min_annualized_yield_ratio = "0.10" # board junk floor is 0.06; spreadsheet "good trade" 0.10
 
 # ---------------------------------------------------------------------------------------------
 # Orders
@@ -88,17 +109,29 @@ min_annualized_yield_ratio = "TBD"
 
 [orders]
 execution_order = "Execute non-HOLD decisions in priority order: closes and rolls before new opens."
-limit_price_rule = "TBD" # how the limit price is derived from bid/ask/mark, per side
+open_checks = "Apply selection.underlying_filters, selection.contract_filters, selection.sizing, selection.portfolio_caps, and circuit_breakers to each sell-to-open attempt, using fresh account state."
+close_checks = "For buy-to-close, verify contract identity, a fresh executable ask and valid bid/ask bounds, current short quantity at least the remaining close quantity, broker-reported funds sufficient for the debit, and no conflicting working order. Do not apply entry DTE, delta, yield, premium, event, or board-comparison filters. Missing facts needed to establish the close decision or execute it still block that close."
+limit_price_rule = "Price in your favor, then walk toward the market to get filled. Sell to open: start above the mid and step down toward the bid. Buy to close: start below the mid and step up toward the ask. Choose the starting price, step size, and wait per step from the live spread and quote (agent_discretion). Every price is on the contract's tick increment and inside orders.limit_price_bounds."
 limit_price_bounds = "Within [bid, ask] of the quote taken immediately before the order."
 time_in_force = "day"
+working = [
+  "Work each order until it fills, one price step at a time per orders.limit_price_rule.",
+  "After placing a step, check it with get_option_orders. If it is still unfilled when you move on, cancel it with cancel_option_order and confirm the cancel with get_option_orders before placing the next step.",
+  "A partial fill is a position. After cancellation is confirmed, read the final filled quantity, including fills during cancellation. Work only the target quantity minus confirmed cumulative fills; never infer that a cancel request released the reservation.",
+  "Each step is a new order: redo procedure step 4 in full (re-quote, re-check, review, place, confirm) at the new price.",
+  "Never have more than one open order of yours on the same contract.",
+  "Stop working an order and cancel its unfilled remainder when the next price would fall outside orders.limit_price_bounds, when the applicable orders.open_checks or orders.close_checks fails (QUOTE_MOVED), or when the decision no longer holds. Preserve any fills in the record.",
+  "Follow the prompt's stop-on-error protocol for every place or cancel error, timeout, or unknown outcome. Price walking never permits a retry of an uncertain action.",
+  "An order still open when you return your output stays open as a day order. The next run cancels it (procedure step 1) and decides again.",
+]
 
 # ---------------------------------------------------------------------------------------------
 # Event exclusions
 # ---------------------------------------------------------------------------------------------
 
 [events]
-earnings_exclusion = "TBD" # recommended: exclude if earnings fall within the contract's life
-ex_dividend_exclusion = "TBD" # CC early-assignment risk
+earnings_exclusion = "Exclude a new leg if the underlying's next earnings date falls on or before the leg's expiration."
+ex_dividend_exclusion = "Exclude a new covered call if an ex-dividend date falls on or before its expiration and the call's extrinsic value is below the dividend. Cash-secured puts: no ex-dividend exclusion."
 exclude_pending_ma_halt_delisting = true
 exclude_unverified_material_catalyst = true
 
@@ -108,6 +141,7 @@ exclude_unverified_material_catalyst = true
 
 [definitions]
 captured_ratio = "(credit received - current buyback ask) / credit received"
+cash_accounting = "Use a fresh validated AccountSnapshot immediately before each attempt. available_settled_cash_usd already excludes every broker reservation; csp_reserved_cash_usd includes existing short puts and unfilled working sell-to-open puts, each counted once. The pre-order CSP cash base is their sum. New CSP collateral must fit available settled cash after the reserve; existing plus new CSP collateral must fit limits.max_total_csp_collateral_ratio times that base. Never treat unsettled proceeds or margin buying power as settled cash. If the broker fields or reservation timing cannot establish these amounts, record insufficient data."
 
 # ---------------------------------------------------------------------------------------------
 # Position management
@@ -115,12 +149,15 @@ captured_ratio = "(credit received - current buyback ask) / credit received"
 
 [management]
 rule_order = "Apply management.rules to every open short option in id order; the first rule that matches decides. A rule with an `evaluated` value is checked at that point instead."
-take_profit_capture_ratio = "TBD"
-roll_dte_window = "TBD"
-roll_requires_net_credit = "TBD"
-max_roll_dte = "TBD"
-max_rolls_per_position = "TBD"
-reallocation_min_yield_advantage_ratio = "TBD"
+# Owner, 2026-09-25: the agent judges profit-taking and reallocation itself.
+take_profit_capture_ratio = "agent_discretion"
+take_profit_guidance = "Close when the premium left no longer pays for the risk left. Weigh definitions.captured_ratio against the fraction of the contract's life elapsed, the remaining yield against this run's best new candidates, DTE and gamma near expiration, and the underlying's trend and news since entry. State captured_ratio, DTE, and remaining yield in the rationale."
+roll_dte_window = 14
+roll_requires_net_credit = true
+max_roll_dte = 45
+max_rolls_per_position = 2
+reallocation_min_yield_advantage_ratio = "agent_discretion"
+reallocation_guidance = "Reallocate only when the new trade's annualized yield, after paying this position's buyback ask, clearly beats this position's remaining yield, and the new trade is at least as safe by delta, cushion, and events. State both yields and the buyback cost in the rationale."
 
 [[management.rules]]
 id = 1
@@ -142,7 +179,7 @@ evaluated = ""
 
 [[management.rules]]
 id = 4
-condition = "definitions.captured_ratio >= management.take_profit_capture_ratio."
+condition = "Profit worth taking now, judged per management.take_profit_guidance."
 action = "CLOSE."
 evaluated = ""
 
@@ -154,7 +191,7 @@ evaluated = ""
 
 [[management.rules]]
 id = 6
-condition = "A new trade from selection beats this position's remaining yield by at least management.reallocation_min_yield_advantage_ratio, after the buyback cost."
+condition = "A new trade from selection is a better use of this position's capital, judged per management.reallocation_guidance."
 action = "CLOSE and reallocate into that trade."
 evaluated = "After selection, against every position marked HOLD."
 
@@ -170,10 +207,10 @@ requirements = [
   "Net credit, if management.roll_requires_net_credit is true.",
   "New expiration later than the current one and at most management.max_roll_dte away.",
   "New strike the same or more favorable: same or lower for a put, same or higher for a call.",
-  "Fewer than management.max_rolls_per_position prior rolls of this position (see recent_decisions).",
+  "Fewer than management.max_rolls_per_position prior rolls in this position's durable position_book lineage. A roll is counted once when its replacement leg first fills; price steps and further partial fills are not extra rolls. Unknown lineage or roll count blocks a roll.",
   "The new leg passes every selection filter.",
 ]
-sequencing = "Place the sell-to-open only after the buy-to-close has filled. If the close does not fill this run, cancel it and skip the new leg."
+sequencing = "Place the sell-to-open only after the entire target buy-to-close quantity has filled and fresh account state confirms the close. If the close fills only partly or not at all this run, cancel its unfilled remainder, confirm the terminal state, and skip the new leg. Keep any partial close recorded. Recheck every roll requirement for the replacement using actual close fills and the proposed opening price; a completed close does not guarantee that a replacement can be opened."
 
 [assignment]
 assigned_shares = "Become CC candidates in selection, with a strike that satisfies limits.cc_min_strike_vs_cost_basis."
@@ -200,13 +237,14 @@ underlying_filters = [
 ]
 contract_filters = [
   "Every value in filters.",
-  "The Wheelta screen premium and the Robinhood live premium diverge by no more than data_quality.tolerances.board_vs_live_premium_divergence_ratio.",
+  "Apply selection.board_comparison; an absent screen for an independently discovered contract does not by itself fail selection.",
 ]
+board_comparison = "Compare the same premium measure for the same underlying, right, strike, and expiration when a current Wheelta board row supplies a screen used for this candidate. Absolute difference divided by the positive screen premium must not exceed data_quality.tolerances.board_vs_live_premium_divergence_ratio. Record both values and the row/build identity. Missing or stale evidence for a board-derived candidate blocks that candidate; do not relabel it as independently discovered to bypass the check. For a covered call or a contract discovered independently through Robinhood or held shares with no matching screen used, record not_applicable and rely on Robinhood. If the board is unavailable, skip board work while independently sourced work may continue."
 sizing = [
-  "Contracts = the smallest of:",
+  "Contracts = floor of the smallest applicable capacity below, expressed in contracts:",
   "limits.max_contracts_per_order;",
   "what limits.max_collateral_per_underlying_usd and limits.max_collateral_per_underlying_ratio allow (CSP);",
-  "what settled buying power covers after limits.min_cash_reserve_usd (CSP);",
+  "what available settled cash covers after limits.min_cash_reserve_usd, using definitions.cash_accounting (CSP);",
   "uncovered shares / contract multiplier, within limits.cc_max_lot_coverage_ratio (CC).",
   "Zero means no trade.",
 ]
@@ -227,10 +265,10 @@ portfolio_caps = [
 # ---------------------------------------------------------------------------------------------
 
 [circuit_breakers]
-max_daily_drawdown_usd = "TBD"
+max_daily_drawdown_usd = "none" # owner, 2026-09-25: no daily loss breaker
 on_max_daily_drawdown = "Realized plus unrealized loss for the day at or beyond max_daily_drawdown_usd: no new opens for the rest of the day."
 # Applied by the orchestrator and the operator, not by the agent; rendered for completeness.
-max_consecutive_run_failures = "TBD"
+max_consecutive_run_failures = 3
 on_max_consecutive_run_failures = "Operator alert; the operator decides on the kill switch."
 
 # ---------------------------------------------------------------------------------------------
@@ -238,11 +276,12 @@ on_max_consecutive_run_failures = "Operator alert; the operator decides on the k
 # ---------------------------------------------------------------------------------------------
 
 [workspace]
-max_owned_watchlists = "TBD"
-max_items_per_owned_watchlist = "TBD"
-max_owned_scans = "TBD"
-max_owned_alerts = "TBD"
-max_mutations_per_run = "TBD"
+# Robinhood's own limits on these objects are undocumented; these are modest local caps.
+max_owned_watchlists = 5
+max_items_per_owned_watchlist = 50
+max_owned_scans = 5
+max_owned_alerts = 50
+max_mutations_per_run = 25
 
 # ---------------------------------------------------------------------------------------------
 # Data quality (docs/DATA_QUALITY.md explains the pipeline these values feed)
@@ -253,27 +292,27 @@ precedence_rule = "For each fact, the first listed source in data_quality.preced
 
 [data_quality.freshness]
 notes = ["Runs happen only during the NYSE regular session, so each max age is for regular hours."]
-option_quote_max_age_seconds = "TBD"
-equity_quote_max_age_seconds = "TBD"
-account_state_max_age_seconds = "TBD"
+option_quote_max_age_seconds = 60 # each price step re-quotes anyway (orders.working)
+equity_quote_max_age_seconds = 60
+account_state_max_age_seconds = 120 # also re-read before every order (procedure step 4)
 wheelta_board = "Current buildId only; never an older board."
-wheelta_macro_snapshot_max_age_seconds = "TBD"
-earnings_calendar_max_age_seconds = "TBD"
-news_max_age_seconds = "TBD"
+wheelta_macro_snapshot_max_age_seconds = 86400 # Wheelta refreshes macro once a day, 07:35 ET
+earnings_calendar_max_age_seconds = 86400
+news_max_age_seconds = 3600
 
 [data_quality.sanity]
 notes = ["An IV outside [min_iv_ratio, max_iv_ratio] fails the sanity check; treat that quote as missing."]
-min_iv_ratio = "TBD"
-max_iv_ratio = "TBD"
+min_iv_ratio = "0.05"
+max_iv_ratio = "5.00"
 
 [data_quality.tolerances]
-board_vs_live_premium_divergence_ratio = "TBD"
-fundamentals_divergence_ratio = "TBD"
+board_vs_live_premium_divergence_ratio = "0.25" # board premiums are up to ~2 h old (build schedule)
+fundamentals_divergence_ratio = "0.05"
 
 [[data_quality.precedence]]
 fact = "Live option price and Greeks"
 sources = ["Robinhood live"]
-on_divergence = "Wheelta board strikes, premiums, Greeks, and probOtm are a build-time screen: re-quote from Robinhood before relying on them. Beyond data_quality.tolerances.board_vs_live_premium_divergence_ratio, record both values and exclude the contract."
+on_divergence = "Wheelta board strikes, premiums, Greeks, and probOtm are a build-time screen: re-quote from Robinhood before relying on them. Apply selection.board_comparison only when a matching board screen was used; a covered call or an independently discovered contract does not require a board premium."
 
 [[data_quality.precedence]]
 fact = "Account state (positions, buying power, orders)"

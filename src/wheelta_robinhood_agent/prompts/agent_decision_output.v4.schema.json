@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentDecisionOutput v4",
+  "description": "Phase-0 contract: agent choices and judgments only. Context-aware reference validation and deterministic assembly are specified in docs/OUTPUT_ASSEMBLY.md. Version is supplied by code, not by the model.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decisions",
+    "cancellation_rationales",
+    "rejected_candidates",
+    "unresolved_questions"
+  ],
+  "properties": {
+    "decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decision"
+      }
+    },
+    "cancellation_rationales": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/cancellation_rationale"
+      }
+    },
+    "rejected_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rejection"
+      }
+    },
+    "unresolved_questions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/research_question"
+      }
+    }
+  },
+  "$defs": {
+    "reference": {
+      "type": "string",
+      "minLength": 1
+    },
+    "proposed_leg": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "facts_ref",
+        "limit_price"
+      ],
+      "properties": {
+        "facts_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "limit_price": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]+)?$",
+          "description": "Discretionary intended limit; never a reported broker price. Tick and quote bounds require resolved evidence."
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "target_ref",
+        "replacement_ref",
+        "funding_close_refs",
+        "proposed_legs",
+        "execution_refs",
+        "rationale",
+        "thesis",
+        "invalidation_conditions",
+        "evidence_refs"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "OPEN_CSP",
+            "OPEN_CC",
+            "CLOSE",
+            "ROLL",
+            "HOLD"
+          ]
+        },
+        "target_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "replacement_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/reference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "funding_close_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "uniqueItems": true
+        },
+        "proposed_legs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/proposed_leg"
+          }
+        },
+        "execution_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "uniqueItems": true
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "thesis": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "invalidation_conditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "cancellation_rationale": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cancel_call_ref",
+        "rationale",
+        "evidence_refs"
+      ],
+      "properties": {
+        "cancel_call_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_ref",
+        "rationale",
+        "evidence_refs"
+      ],
+      "properties": {
+        "target_ref": {
+          "$ref": "#/$defs/reference"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "research_question": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_ref",
+        "question",
+        "evidence_refs"
+      ],
+      "properties": {
+        "target_ref": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/reference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reference"
+          },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

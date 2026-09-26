@@ -1,7 +1,8 @@
 <!--
 prompt_id: wheel_agent
 version: 2
-status: draft (ADR-0006 and ADR-0007, Proposed). Supersedes v1: the trading rules and decision
+status: archived draft, never run; use wheel_agent.v3.md (ADR-0010). Originally superseded v1:
+        the trading rules and decision
         logic moved into rules/trading_rules.toml. Tool names are provisional until the
         tools are built and verified against our own tools/list (docs/integrations/robinhood-tools-snapshot.md).
 rendering: the orchestrator substitutes every {{placeholder}} before the session starts. An
