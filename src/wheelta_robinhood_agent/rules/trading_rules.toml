@@ -28,9 +28,9 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 3
+version = 5
 status = "draft"
-adr = "ADR-0010"
+adr = "ADR-0015"
 signed_off_by = "TBD"
 signed_off_on = "TBD"
 
@@ -65,6 +65,7 @@ notes = [
   "cc_max_lot_coverage_ratio is the fraction of a share lot that calls may cover, at most 1.00.",
   "cc_min_strike_vs_cost_basis is compared with the tax-lot cost basis.",
   "All available settled cash may be used; there are no dollar caps.",
+  "max_new_positions_per_run and max_new_positions_per_day count new position lineages. A roll's replacement leg continues its existing lineage and does not count; rolls are limited by management.max_rolls_per_position.",
   "cc_min_strike_vs_cost_basis is agent_discretion: a strike below the lot's cost basis locks in a loss on the shares if they are called away. Choose one only when the premium and your thesis justify it, and state the cost basis, strike, and premium in the rationale.",
 ]
 # Owner, 2026-09-25: reuse all available cash; no dollar, per-underlying, sector, or
@@ -88,9 +89,9 @@ cc_min_strike_vs_cost_basis = "agent_discretion"
 [filters]
 notes = [
   "Every filter applies only to sell-to-open legs, including a roll's new leg. Buy-to-close legs use orders.close_checks.",
-  "min_premium_usd is per share (the quoted option price), not per contract.",
+  "min_premium_usd is per share, not per contract, and is measured at the live bid: the worst price a sell-to-open price walk can fill at.",
   "max_spread_ratio_of_mid is (ask - bid) / mid.",
-  "min_annualized_yield_ratio is premium / collateral, annualized over DTE (CSP collateral = strike x multiplier; CC collateral = share price x multiplier).",
+  "min_annualized_yield_ratio is premium / collateral, annualized over DTE (CSP collateral = strike x multiplier; CC collateral = share price x multiplier). The premium is the live bid, as for min_premium_usd. Annualize per definitions.annualization.",
 ]
 min_dte = 7
 max_dte = 45 # the board's own gates: DTE 1-45, |delta| 0.15-0.35
@@ -140,6 +141,11 @@ exclude_unverified_material_catalyst = true
 # ---------------------------------------------------------------------------------------------
 
 [definitions]
+# Owner, 2026-09-25 (ADR-0015): tested, broken_thesis, remaining_yield, annualization.
+tested = "A short put is tested when the underlying's live price is at or below its strike. A short call is tested when the underlying's live price is at or above its strike."
+broken_thesis = "agent_discretion: the reason you entered the position no longer holds, in your judgment. Compare current evidence with the thesis and invalidation conditions in position_book, and name the evidence in the rationale. Missing entry history does not by itself make a thesis broken."
+remaining_yield = "Current buyback ask per share x contract multiplier / collateral, annualized per definitions.annualization over the remaining DTE. Collateral is defined as in filters (CSP: strike x multiplier; CC: current share price x multiplier)."
+annualization = "ratio x 365 / DTE, with DTE in calendar days."
 captured_ratio = "(credit received - current buyback ask) / credit received"
 cash_accounting = "Use a fresh validated AccountSnapshot immediately before each attempt. available_settled_cash_usd already excludes every broker reservation; csp_reserved_cash_usd includes existing short puts and unfilled working sell-to-open puts, each counted once. The pre-order CSP cash base is their sum. New CSP collateral must fit available settled cash after the reserve; existing plus new CSP collateral must fit limits.max_total_csp_collateral_ratio times that base. Never treat unsettled proceeds or margin buying power as settled cash. If the broker fields or reservation timing cannot establish these amounts, record insufficient data."
 
@@ -151,17 +157,19 @@ cash_accounting = "Use a fresh validated AccountSnapshot immediately before each
 rule_order = "Apply management.rules to every open short option in id order; the first rule that matches decides. A rule with an `evaluated` value is checked at that point instead."
 # Owner, 2026-09-25: the agent judges profit-taking and reallocation itself.
 take_profit_capture_ratio = "agent_discretion"
-take_profit_guidance = "Close when the premium left no longer pays for the risk left. Weigh definitions.captured_ratio against the fraction of the contract's life elapsed, the remaining yield against this run's best new candidates, DTE and gamma near expiration, and the underlying's trend and news since entry. State captured_ratio, DTE, and remaining yield in the rationale."
+take_profit_guidance = "Close when the premium left no longer pays for the risk left. Weigh definitions.captured_ratio against the fraction of the contract's life elapsed, definitions.remaining_yield against this run's best new candidates, DTE and gamma near expiration, and the underlying's trend and news since entry. State captured_ratio, DTE, and remaining yield in the rationale."
 roll_dte_window = 14
 roll_requires_net_credit = true
 max_roll_dte = 45
 max_rolls_per_position = 2
 reallocation_min_yield_advantage_ratio = "agent_discretion"
-reallocation_guidance = "Reallocate only when the new trade's annualized yield, after paying this position's buyback ask, clearly beats this position's remaining yield, and the new trade is at least as safe by delta, cushion, and events. State both yields and the buyback cost in the rationale."
+close_quantity = "agent_discretion"
+close_quantity_guidance = "For a CLOSE decision, choose how many contracts to buy back, from one up to the position's current short quantity. Pass that number to the decision-facts tool as its discretionary close quantity, the same way you pass a discretionary limit price, and use the quantity it returns. State the quantity and why in the rationale. Any remainder stays open and is managed under management.rules in later runs. A ROLL closes the whole position."
+reallocation_guidance = "Reallocate only when the new trade's annualized yield, after paying this position's buyback ask, clearly beats this position's definitions.remaining_yield, and the new trade is at least as safe by delta, cushion, and events. State both yields and the buyback cost in the rationale."
 
 [[management.rules]]
 id = 1
-condition = "Broken thesis."
+condition = "Broken thesis, per definitions.broken_thesis."
 action = "CLOSE. Never roll into a stock you no longer want to own or hold."
 evaluated = ""
 
@@ -185,7 +193,7 @@ evaluated = ""
 
 [[management.rules]]
 id = 5
-condition = "Tested, and DTE <= management.roll_dte_window."
+condition = "Tested, per definitions.tested, and DTE <= management.roll_dte_window."
 action = "ROLL if every roll.requirements item holds; otherwise HOLD and accept assignment or call-away."
 evaluated = ""
 
@@ -229,7 +237,7 @@ sources = [
 underlying_filters = [
   "Tradable.",
   "Allowed by scope.underlying_allowlist and scope.underlying_denylist, and by scope.etfs_allowed and scope.leveraged_inverse_etfs_allowed.",
-  "No broken thesis.",
+  "No broken thesis, per definitions.broken_thesis.",
   "No halt, pending M&A, or delisting notice, if events.exclude_pending_ma_halt_delisting is true.",
   "No unverified material catalyst, if events.exclude_unverified_material_catalyst is true.",
   "No earnings or ex-dividend date inside events.earnings_exclusion or events.ex_dividend_exclusion.",
@@ -270,6 +278,9 @@ on_max_daily_drawdown = "Realized plus unrealized loss for the day at or beyond 
 # Applied by the orchestrator and the operator, not by the agent; rendered for completeness.
 max_consecutive_run_failures = 3
 on_max_consecutive_run_failures = "Operator alert; the operator decides on the kill switch."
+# Applied by the post-run audit, not by the agent (docs/VALIDATION.md, ADR-0014).
+max_consecutive_unverifiable_runs = 3
+on_max_consecutive_unverifiable_runs = "Operator alert when the same audit check is unverifiable in this many consecutive completed runs."
 
 # ---------------------------------------------------------------------------------------------
 # Agentic workspace (Tier S) caps. The PreToolUse hook also enforces these.

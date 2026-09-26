@@ -1,14 +1,30 @@
 [project]
 name = "wheelta-robinhood-agent"
 version = "0.0.0"
-description = "Hourly autonomous agent that trades cash-secured puts and covered calls on a Robinhood Agentic account (scaffolding only)"
+description = "Hourly autonomous agent that trades cash-secured puts and covered calls on a Robinhood Agentic account (phase 1: dry run)"
 readme = "README.md"
 requires-python = ">=3.11"
-# Phase 0: no dependencies yet. Add them with `uv add` when phase 1 opens (see CLAUDE.md §23).
-dependencies = []
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wheelta_robinhood_agent"]
 
 [dependency-groups]
-dev = []
+dev = [
+    "hypothesis>=6.168.1",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-socket>=0.8.1",
+    "ruff>=0.16.9",
+]
 
 [tool.ruff]
 line-length = 100
@@ -26,3 +42,11 @@ select = ["E", "F", "I", "B", "UP", "W", "S", "DTZ", "T20"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "--disable-socket"
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+mypy_path = "src"
+packages = ["wheelta_robinhood_agent"]
+plugins = ["pydantic.mypy"]

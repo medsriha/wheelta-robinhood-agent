@@ -11,7 +11,7 @@ placeholders:
   execution_mode      effective live | off; unarmed live renders off
   account_ref         configured Agentic account, last 4 digits only
   workspace_prefix    ROBINHOOD_WORKSPACE_PREFIX
-  policy_version      meta.version of rules/trading_rules.toml (v3)
+  policy_version      meta.version of rules/trading_rules.toml
   policy              every rules section except meta, rendered per rules/README.md
   available_tools     verified, fully qualified tool names and purposes for this effective mode
   position_book       durable entry facts, thesis, events known at entry, and roll lineage
