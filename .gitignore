@@ -224,3 +224,6 @@ __marimo__/
 CLAUDE.md
 docs/
 **/README.md
+
+# Personal Claude Code settings (Robinhood order-tool deny rules live here)
+.claude/settings.local.json

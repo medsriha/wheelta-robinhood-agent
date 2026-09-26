@@ -18,7 +18,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from wheelta_robinhood_agent.domain.enums import ExecutionMode
+from wheelta_robinhood_agent.domain.enums import AppEnv, ExecutionMode
 from wheelta_robinhood_agent.domain.gating import effective_execution_mode
 
 # ADR-0013: phase 1 caps the effective mode at off, whatever the environment requests.
@@ -26,12 +26,6 @@ PHASE_EXECUTION_CEILING = ExecutionMode.OFF
 
 # The cron interval is hourly; the run budget must leave room before the next fire.
 _CRON_INTERVAL_SECONDS = 3600
-
-
-class AppEnv(StrEnum):
-    LOCAL = "local"
-    STAGING = "staging"
-    PRODUCTION = "production"
 
 
 class LogLevel(StrEnum):
@@ -156,6 +150,38 @@ def load_settings(env_file: Path | None = None) -> Settings:
     """
     try:
         return Settings(_env_file=env_file)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or '<settings>'}: {err['msg']}"
+            for err in exc.errors()
+        )
+        raise SettingsError(f"invalid configuration: {problems}") from None
+
+
+class DatabaseSettings(BaseSettings):
+    """Only DATABASE_URL, for the migration preDeployCommand (CLAUDE.md §20).
+
+    Full Settings requires every agent secret, which a migration step must not need.
+    """
+
+    model_config = SettingsConfigDict(
+        extra="ignore", frozen=True, case_sensitive=True, env_file=None, hide_input_in_errors=True
+    )
+
+    DATABASE_URL: SecretStr
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _not_blank(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("required; must not be blank")
+        return value
+
+
+def load_database_url() -> SecretStr:
+    """Load DATABASE_URL alone, failing fast without echoing the value."""
+    try:
+        return DatabaseSettings().DATABASE_URL
     except ValidationError as exc:
         problems = "; ".join(
             f"{'.'.join(str(p) for p in err['loc']) or '<settings>'}: {err['msg']}"

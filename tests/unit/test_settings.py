@@ -4,6 +4,7 @@ from wheelta_robinhood_agent.config.settings import (
     PHASE_EXECUTION_CEILING,
     Settings,
     SettingsError,
+    load_database_url,
     load_settings,
 )
 from wheelta_robinhood_agent.domain.enums import ExecutionMode
@@ -152,3 +153,14 @@ def test_env_file_loads_when_given(
     path = tmp_path / ".env"  # type: ignore[operator]
     path.write_text("AGENT_MODEL=from-file\n")
     assert load_settings(path).AGENT_MODEL == "from-file"
+
+
+def test_load_database_url_alone(env: pytest.MonkeyPatch) -> None:
+    env.delenv("ANTHROPIC_API_KEY")
+    assert load_database_url().get_secret_value() == REQUIRED["DATABASE_URL"]
+    env.setenv("DATABASE_URL", " ")
+    with pytest.raises(SettingsError, match="DATABASE_URL"):
+        load_database_url()
+    env.delenv("DATABASE_URL")
+    with pytest.raises(SettingsError, match="DATABASE_URL"):
+        load_database_url()
