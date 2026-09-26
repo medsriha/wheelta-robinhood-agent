@@ -73,6 +73,7 @@ class PositionEventType(StrEnum):
     CLOSED = "closed"
     GAP = "gap"
     RECONCILIATION = "reconciliation"
+    NOTE = "note"
 
 
 class WorkspaceEventType(StrEnum):

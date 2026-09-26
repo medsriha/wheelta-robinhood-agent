@@ -1,0 +1,485 @@
+{
+  "provenance": {
+    "server": {
+      "name": "robinhood-trading",
+      "version": "1.6.0"
+    },
+    "captured_on": "2026-09-26",
+    "method": "claude-agent-sdk 0.2.160 get_mcp_status (names, readOnly annotation) + Claude Code deferred tool schemas (read tools only)",
+    "scrubbed": "no account numbers, tokens, or personal data; tool metadata only",
+    "not_captured": "input schemas of write tools (hidden by .claude/settings.local.json deny rules) and crypto reads (out of scope)"
+  },
+  "tools": [
+    {
+      "name": "add_option_to_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "add_to_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "cancel_crypto_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "cancel_equity_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "cancel_option_exercise",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "cancel_option_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "create_alert",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "create_scan",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "create_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "delete_alert",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "exercise_option",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "follow_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "get_accounts",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false,
+      "lists_all_accounts": true
+    },
+    {
+      "name": "get_alert_log",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": true
+    },
+    {
+      "name": "get_alerts",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": true
+    },
+    {
+      "name": "get_crypto_account_onboarding_info",
+      "read_only_hint": true,
+      "schema_captured": false
+    },
+    {
+      "name": "get_crypto_orders",
+      "read_only_hint": true,
+      "schema_captured": false
+    },
+    {
+      "name": "get_crypto_positions",
+      "read_only_hint": true,
+      "schema_captured": false
+    },
+    {
+      "name": "get_crypto_quotes",
+      "read_only_hint": true,
+      "schema_captured": false
+    },
+    {
+      "name": "get_currency_pairs",
+      "read_only_hint": true,
+      "schema_captured": false
+    },
+    {
+      "name": "get_earnings_calendar",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_earnings_results",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_analyst_ratings",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_fundamentals",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_historicals",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_orders",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_positions",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_price_book",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_quotes",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_tax_lots",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_technical_indicators",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_equity_tradability",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_financials",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_index_historicals",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_index_quotes",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_indexes",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_limited_margin_upgrade_info",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_chains",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_historicals",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_instruments",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_level_upgrade_info",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_orders",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_positions",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_quotes",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_option_watchlist",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": true
+    },
+    {
+      "name": "get_pnl_trade_history",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_politician_trades",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_popular_watchlists",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_portfolio",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_realized_pnl",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": "account_number",
+      "login_scoped": false
+    },
+    {
+      "name": "get_scanner_datapoints",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_scanner_filter_specs",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_scans",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": true
+    },
+    {
+      "name": "get_sec_filing",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_sec_filing_facts",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_sec_filing_facts_catalog",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_sec_filing_index",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "get_watchlist_items",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": true
+    },
+    {
+      "name": "get_watchlists",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": true
+    },
+    {
+      "name": "mark_alerts_read",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "place_crypto_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "place_equity_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "place_option_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "preview_crypto_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "preview_scan",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "remove_from_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "remove_option_from_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "review_equity_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "review_option_order",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "run_scan",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": true
+    },
+    {
+      "name": "search",
+      "read_only_hint": true,
+      "schema_captured": true,
+      "account_arg": null,
+      "login_scoped": false
+    },
+    {
+      "name": "unfollow_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "update_alert",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "update_scan_config",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "update_scan_filters",
+      "read_only_hint": false,
+      "schema_captured": false
+    },
+    {
+      "name": "update_watchlist",
+      "read_only_hint": false,
+      "schema_captured": false
+    }
+  ]
+}

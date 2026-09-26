@@ -11,6 +11,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import BaseModel
 
+from wheelta_robinhood_agent.config.prompts import load_prompt
 from wheelta_robinhood_agent.domain.decision_output import (
     LIMIT_PRICE_PATTERN,
     SCHEMA_VERSION,
@@ -115,7 +116,7 @@ def test_valid_document_parses() -> None:
 
 
 def test_prompt_example_parses() -> None:
-    prompt = SCHEMA_PATH.with_name("wheel_agent.v5.md").read_text()
+    prompt = load_prompt().body
     example = prompt.split("```json", 1)[1].split("```", 1)[0]
     assert parse_agent_decision_output(example).ok
 

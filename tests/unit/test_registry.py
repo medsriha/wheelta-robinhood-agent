@@ -10,11 +10,16 @@ from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGIST
 
 
 def test_robinhood_registry_shape() -> None:
-    assert ROBINHOOD_REGISTRY.verified is False  # third-party snapshot until captured
+    assert ROBINHOOD_REGISTRY.verified is True  # names captured 2026-09-26 (ADR-0017)
     live = {t.name for t in ROBINHOOD_REGISTRY.tools if t.live_order_tool}
     assert live == set(LIVE_ORDER_TOOLS)
     assert all(ROBINHOOD_REGISTRY.get(n).tier is ToolTier.X for n in live)  # type: ignore[union-attr]
     for t in ROBINHOOD_REGISTRY.tools:
+        # preview_scan evaluates a scanner filter set without saving: read-only, not an order
+        # preview (ADR-0017). It is the only exception to the order-prefix rule.
+        if t.name == "preview_scan":
+            assert t.tier is ToolTier.R
+            continue
         if t.name.startswith(("place_", "cancel_", "review_", "preview_", "exercise_")):
             assert t.tier in (ToolTier.X, ToolTier.EXCLUDED), t.name
         if "crypto" in t.name:

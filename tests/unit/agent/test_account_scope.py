@@ -17,19 +17,38 @@ from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGIST
 ACCOUNT = SecretStr("5QR12345678")
 
 
-def test_every_registered_robinhood_tool_has_a_spec_and_account_tools_are_unverified() -> None:
+def test_every_registered_robinhood_tool_has_a_spec() -> None:
     for tool in ROBINHOOD_REGISTRY.tools:
         if tool.tier is ToolTier.EXCLUDED or (tool.tier is ToolTier.X and not tool.live_order_tool):
             continue  # never callable; absent from the table means unverified anyway
         assert tool.name in ROBINHOOD_ACCOUNT_SCOPE, tool.name
-    for name in ("get_accounts", "get_portfolio", "get_option_positions", "get_option_orders"):
-        assert ROBINHOOD_ACCOUNT_SCOPE[name] is UNVERIFIED
+
+
+def test_account_reads_verified_on_account_number_from_capture() -> None:
+    # ADR-0017: every account-specific read in robinhood-trading 1.6.0 requires account_number.
+    for name in (
+        "get_portfolio", "get_realized_pnl", "get_pnl_trade_history",
+        "get_limited_margin_upgrade_info", "get_option_level_upgrade_info",
+        "get_equity_tradability", "get_equity_tax_lots", "get_equity_positions",
+        "get_equity_orders", "get_option_positions", "get_option_orders",
+    ):  # fmt: skip
+        assert ROBINHOOD_ACCOUNT_SCOPE[name] == AccountScopeSpec.verified("account_number"), name
+
+
+def test_discovery_workspace_reads_and_tier_s_x_stay_unverified() -> None:
+    for name in (
+        "get_accounts",
+        "get_scans",
+        "run_scan",
+        "get_watchlists",
+        "get_watchlist_items",
+        "get_option_watchlist",
+        "get_alerts",
+        "get_alert_log",
+    ):
+        assert ROBINHOOD_ACCOUNT_SCOPE[name] is UNVERIFIED, name
     for tool in ROBINHOOD_REGISTRY.by_tier(ToolTier.S) + ROBINHOOD_REGISTRY.by_tier(ToolTier.X):
         assert account_scope_for("robinhood", tool.name).scope is AccountScope.UNVERIFIED
-
-
-def test_no_spec_is_verified_while_schemas_are_uncaptured() -> None:
-    assert all(s.scope is not AccountScope.VERIFIED for s in ROBINHOOD_ACCOUNT_SCOPE.values())
 
 
 def test_market_data_tools_are_not_scoped() -> None:

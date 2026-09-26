@@ -104,7 +104,7 @@ def test_web_tool_input() -> None:
     )
     assert web_tool_input("WebFetch", {"url": "file:///etc/passwd"}) is None
     assert web_tool_input("WebFetch", {"url": 3}) is None
-    assert web_tool_input("mcp__robinhood__get_equity_news", {"symbol": "AAPL"}) is None
+    assert web_tool_input("mcp__robinhood__get_equity_quotes", {"symbol": "AAPL"}) is None
 
 
 def test_capture_and_denial() -> None:

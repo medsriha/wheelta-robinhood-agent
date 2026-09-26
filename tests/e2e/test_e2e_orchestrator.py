@@ -1,6 +1,6 @@
 """Full runs of `orchestrator.run_once` against fake MCP servers and a scripted fake CLI.
 
-Real pieces: Settings, rules, prompt v5, the orchestrator, `ClaudeSDKClient`/`Query` (hook and
+Real pieces: Settings, rules, prompt v6, the orchestrator, `ClaudeSDKClient`/`Query` (hook and
 in-process MCP dispatch), our hooks, result boundary, facts tool, web cache, assembler, audit,
 and a throwaway Postgres ledger. Fake pieces: the CLI transport (e2e_fake_cli.py), the remote
 servers and their fixture result mappers (e2e_fakes.py), the clock, and the notifier.
@@ -241,6 +241,104 @@ def test_invalid_agent_output_still_assembles_from_events(harness: Callable[...,
     assert stored.record.decisions == ()
     assert stored.record.decision_output_status.value != "valid"
     assert len(calls) == 6
+
+
+def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness]) -> None:
+    """ADR-0018: earlier notes reach the prompt; this run's HOLD and question become notes."""
+    import json
+    from datetime import timedelta
+
+    from wheelta_robinhood_agent.agent.account_scope import account_scope_id
+    from wheelta_robinhood_agent.domain.enums import DecisionAction, StrategyKind
+    from wheelta_robinhood_agent.domain.options import OccSymbol
+    from wheelta_robinhood_agent.domain.positions import (
+        PositionInstrument,
+        PositionNote,
+        PositionNoteKind,
+    )
+    from wheelta_robinhood_agent.ledger.positions import open_position, position_book, record_note
+
+    h = harness()
+    scope = account_scope_id(h.settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER)
+    earlier = h.clock.now - timedelta(hours=1)
+    with h.conn() as c:
+        prior = open_run_slot(c, AppEnv.LOCAL, slot_for(earlier)).run_id
+        position_id = open_position(
+            c,
+            run_id=prior,
+            account_scope_id=scope,
+            underlying="AAPL",
+            strategy=StrategyKind.CASH_SECURED_PUT,
+            instruments=[
+                PositionInstrument(
+                    occ_symbol=OccSymbol.parse("AAPL  261016P00150000"),
+                    broker_instrument_id="inst-aapl-150p",
+                    short_quantity=1,
+                )
+            ],
+            observed_at=earlier,
+            imported=True,
+        )
+        record_note(
+            c,
+            position_id,
+            dedup_key=f"note:{prior}:decision:0",
+            note=PositionNote(
+                run_id=prior,
+                noted_at=earlier,
+                kind=PositionNoteKind.DECISION,
+                action=DecisionAction.HOLD,
+                decision_ref="decision:0",
+                text="Watching the supplier report before deciding.",
+            ),
+        )
+    position_ref = f"position:{position_id}"
+
+    async def script(model: FakeModel) -> str:
+        await research(model)
+        hold = {
+            "action": "HOLD",
+            "target_ref": position_ref,
+            "replacement_ref": None,
+            "funding_close_refs": [],
+            "proposed_legs": [],
+            "execution_refs": [],
+            "rationale": "Supplier report was neutral; keep holding.",
+            "thesis": None,
+            "invalidation_conditions": [],
+            "evidence_refs": [],
+        }
+        question = {
+            "target_ref": position_ref,
+            "question": "When is guidance?",
+            "evidence_refs": [],
+        }
+        return json.dumps(
+            {
+                "decisions": [hold],
+                "cancellation_rationales": [],
+                "unresolved_questions": [question],
+            }
+        )
+
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    assert "Watching the supplier report before deciding." in str(h.clis[0].options.system_prompt)
+    with h.conn() as c:
+        (entry,) = position_book(c, scope, as_of=h.clock.now).entries
+    assert [(n.kind, n.action, n.text) for n in entry.notes] == [
+        (
+            PositionNoteKind.DECISION,
+            DecisionAction.HOLD,
+            "Watching the supplier report before deciding.",
+        ),
+        (
+            PositionNoteKind.DECISION,
+            DecisionAction.HOLD,
+            "Supplier report was neutral; keep holding.",
+        ),
+        (PositionNoteKind.QUESTION, None, "When is guidance?"),
+    ]
+    assert entry.notes[-1].run_id == h.run_id
 
 
 # -- tool exposure ------------------------------------------------------------------------------

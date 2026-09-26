@@ -13,9 +13,9 @@ from pydantic import BaseModel, ConfigDict
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-# ADR-0012: the active prompt; paired with AgentDecisionOutput v5.
+# ADR-0018: the active prompt (v5 plus position notes); paired with AgentDecisionOutput v5.
 ACTIVE_PROMPT_ID = "wheel_agent"
-ACTIVE_PROMPT_VERSION = 5
+ACTIVE_PROMPT_VERSION = 6
 
 _PLACEHOLDER_RE = re.compile(r"\{\{([a-z_]+)\}\}")
 _ANY_BRACES_RE = re.compile(r"\{\{.*?\}\}")

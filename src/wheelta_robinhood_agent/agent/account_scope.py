@@ -1,14 +1,14 @@
 """Per-tool account scope for the PreToolUse hook (CLAUDE.md §9, §18, §24).
 
 Every account-specific Robinhood call (reads included) must be confined to the full configured
-`ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`. The Robinhood argument schemas are UNVERIFIED (third-party
-snapshot, docs/integrations/robinhood-tools-snapshot.md), so no tool yet has a known account
-argument. Per CLAUDE.md §18 ("Tools with unverified account scope are withheld") every
-account-scoped or possibly account-scoped Robinhood tool is `UNVERIFIED` and denied.
+`ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`. Read-tool input schemas were captured from
+`robinhood-trading` 1.6.0 on 2026-09-26 (ADR-0017): every account-specific read takes a required
+`account_number`, so those tools are VERIFIED on that argument.
 
-`ROBINHOOD_ACCOUNT_SCOPE` is a data table: once our own `tools/list` is captured, a tool whose
-account argument is confirmed becomes `AccountScopeSpec.verified("<arg name>")` (with an ADR,
-CLAUDE.md §5). A Robinhood tool missing from the table is `UNVERIFIED` (fail closed).
+Still `UNVERIFIED` (denied, CLAUDE.md §18): workspace reads (scans, watchlists, alerts), whose
+schemas carry no account argument because they belong to the Robinhood login rather than an
+account, so they can't be confined to the Agentic account; and every Tier S/X tool, whose
+schemas weren't captured. A Robinhood tool missing from the table is `UNVERIFIED` (fail closed).
 
 Account discovery (`get_accounts`) is trusted-code-only (CLAUDE.md §9): the model never
 calls it, so it stays `UNVERIFIED` here. Matching is on the full account number only;
@@ -60,23 +60,28 @@ UNVERIFIED = AccountScopeSpec(AccountScope.UNVERIFIED)
 _NOT_SCOPED_TOOLS = (
     "search",
     "get_equity_quotes", "get_equity_historicals", "get_equity_fundamentals",
-    "get_equity_price_book", "get_equity_technical_indicators", "get_equity_news",
+    "get_equity_price_book", "get_equity_technical_indicators", "get_equity_analyst_ratings",
     "get_option_chains", "get_option_instruments", "get_option_quotes", "get_option_historicals",
     "get_indexes", "get_index_quotes", "get_index_historicals",
     "get_earnings_calendar", "get_earnings_results", "get_financials",
     "get_sec_filing_index", "get_sec_filing", "get_sec_filing_facts",
     "get_sec_filing_facts_catalog", "get_politician_trades", "get_scanner_filter_specs",
-    "get_popular_watchlists",
+    "get_scanner_datapoints", "preview_scan", "get_popular_watchlists",
 )  # fmt: skip
 
-# Account state, orders, positions, and the Agentic workspace (scans, watchlists, alerts,
-# whose account binding is unknown), plus every Tier S/X tool. Listed explicitly so the table
-# documents them; absence from the table would give the same answer.
-_UNVERIFIED_TOOLS = (
-    "get_accounts", "get_portfolio", "get_realized_pnl", "get_pnl_trade_history",
+# Account-specific reads whose captured schema requires `account_number` (ADR-0017).
+_ACCOUNT_NUMBER_TOOLS = (
+    "get_portfolio", "get_realized_pnl", "get_pnl_trade_history",
     "get_limited_margin_upgrade_info", "get_option_level_upgrade_info",
     "get_equity_tradability", "get_equity_tax_lots", "get_equity_positions", "get_equity_orders",
-    "get_option_positions", "get_option_orders", "get_advanced_orders",
+    "get_option_positions", "get_option_orders",
+)  # fmt: skip
+
+# Account discovery (trusted code only), workspace reads with no account argument (login-scoped,
+# ADR-0017), and every Tier S/X tool. Listed explicitly so the table documents them; absence
+# from the table would give the same answer.
+_UNVERIFIED_TOOLS = (
+    "get_accounts",
     "get_option_watchlist", "get_scans", "run_scan", "get_watchlists", "get_watchlist_items",
     "get_alerts", "get_alert_log",
     "create_scan", "update_scan_filters", "update_scan_config",
@@ -90,6 +95,7 @@ _UNVERIFIED_TOOLS = (
 ROBINHOOD_ACCOUNT_SCOPE: Mapping[str, AccountScopeSpec] = MappingProxyType(
     {
         **{name: NOT_SCOPED for name in _NOT_SCOPED_TOOLS},
+        **{name: AccountScopeSpec.verified("account_number") for name in _ACCOUNT_NUMBER_TOOLS},
         **{name: UNVERIFIED for name in _UNVERIFIED_TOOLS},
     }
 )

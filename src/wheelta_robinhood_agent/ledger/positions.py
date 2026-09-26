@@ -14,6 +14,9 @@ the last N runs) and is rebuilt from `positions` identities plus `position_event
   no replacement fill appends no roll event and does not count.
 - `assignment` links share lots; `gap` records ambiguity; `reconciliation` may replace the
   current instruments and, with `corrects_event_id`, supersede an earlier event (e.g. a gap).
+- `note` keeps one earlier-run judgment (decision rationale/thesis or open question) about
+  the lineage (ADR-0018). The book shows the newest `MAX_NOTES_PER_POSITION`; notes leave the
+  book with the lineage when it closes, and stay in the ledger.
 - `closed` ends the lineage; reopening is a new lineage.
 """
 
@@ -35,8 +38,10 @@ from wheelta_robinhood_agent.domain.positions import (
     PositionBook,
     PositionBookEntry,
     PositionInstrument,
+    PositionNote,
     RollEvent,
     count_rolls,
+    latest_notes,
 )
 from wheelta_robinhood_agent.ledger.errors import DedupConflict, IdentityConflict, UnknownEntity
 from wheelta_robinhood_agent.ledger.events import AppendedEvent, EventTable, append_event
@@ -327,6 +332,28 @@ def record_reconciliation(
     )
 
 
+def record_note(
+    conn: Conn,
+    position_id: uuid.UUID,
+    *,
+    dedup_key: str,
+    note: PositionNote,
+) -> AppendedEvent:
+    """Append an earlier-run note to the lineage; idempotent per `dedup_key` (ADR-0018)."""
+    if not dedup_key.startswith("note:"):
+        raise ValueError("a note dedup_key starts with 'note:'")
+    return append_event(
+        conn,
+        EventTable.POSITION,
+        entity_id=position_id,
+        run_id=note.run_id,
+        event_type=PositionEventType.NOTE.value,
+        observed_at=note.noted_at,
+        dedup_key=dedup_key,
+        payload=note.model_dump(mode="json"),
+    )
+
+
 def close_position(
     conn: Conn,
     position_id: uuid.UUID,
@@ -431,6 +458,7 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
     entry_fill_ids: list[uuid.UUID] = []
     share_lots: dict[str, None] = {}
     rolls: list[RollEvent] = []
+    notes: list[PositionNote] = []
     for e in live:
         kind, payload = e["event_type"], e["payload"]
         if kind == PositionEventType.FILL_LINKED and payload["role"] == FillRole.ENTRY:
@@ -453,6 +481,8 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
             share_lots.update(dict.fromkeys(payload["share_lot_refs"]))
         elif kind == PositionEventType.GAP:
             gaps.append(Gap.model_validate(payload))
+        elif kind == PositionEventType.NOTE:
+            notes.append(PositionNote.model_validate(payload))
         if kind != PositionEventType.OPENED and "current_instruments" in payload:
             instruments = payload["current_instruments"]
 
@@ -482,6 +512,7 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
         if credit_gap is not None:
             gaps.append(credit_gap)
 
+    shown_notes, omitted_notes = latest_notes(notes)
     history_unknown = not entry_fill_ids or any(g.field in HISTORY_GAP_FIELDS for g in gaps)
     return PositionBookEntry(
         position_id=position_id,
@@ -500,6 +531,8 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
         roll_count=None if history_unknown else count_rolls(rolls),
         history_quality=_history_quality(gaps),
         gaps=tuple(gaps),
+        notes=shown_notes,
+        notes_omitted=omitted_notes,
     )
 
 
@@ -563,6 +596,7 @@ __all__ = [
     "position_book",
     "record_assignment",
     "record_gap",
+    "record_note",
     "record_reconciliation",
     "record_roll",
 ]

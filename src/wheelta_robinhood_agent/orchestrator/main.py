@@ -3,8 +3,9 @@
 boot (settings, rules, prompt; fail fast) → logging → slot/run_id → ledger connection →
 single-flight lock (`skipped_concurrent`) → run slot (completed → no-op; interrupted →
 reconcile and finalize without a new session) → preflight (kill switch, NYSE session) →
-session plan (effective mode capped at off; no order tool can be exposed) → prompt v5 →
-agent session → `assemble_run_record` → `run_audit` → persist → alerts/heartbeat → exit code.
+session plan (effective mode capped at off; no order tool can be exposed) → prompt v6 →
+agent session → `assemble_run_record` → position notes (ADR-0018) → `run_audit` → persist →
+alerts/heartbeat → exit code.
 
 Contains no trading logic. Everything the run decides is recorded as run events.
 `python -m wheelta_robinhood_agent.orchestrator` calls `main()`.
@@ -86,6 +87,7 @@ from wheelta_robinhood_agent.domain.enums import (
     ToolTier,
 )
 from wheelta_robinhood_agent.domain.events import RunEventType
+from wheelta_robinhood_agent.domain.position_notes import notes_from_run_record
 from wheelta_robinhood_agent.domain.positions import PositionBook
 from wheelta_robinhood_agent.domain.run import AuditStatus
 from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
@@ -663,7 +665,23 @@ class _Run:
                     self.metrics.order(attempt.status)
         for calls in tool_call_records(self.conn, self.run_id):
             self.metrics.tool_call(calls.identity.server)
+        if book is not None:
+            self._record_notes(record, book)
         return record
+
+    def _record_notes(self, record: RunRecord, book: PositionBook) -> None:
+        """Carry this run's judgments on active lineages into later runs (ADR-0018).
+
+        Notes are context only, so a failure is logged and counted but does not fail the run.
+        """
+        try:
+            for item in notes_from_run_record(record, book):
+                ledger_positions.record_note(
+                    self.conn, item.position_id, dedup_key=item.dedup_key, note=item.note
+                )
+        except Exception as exc:  # noqa: BLE001 - notes are context; the record is stored
+            self.log.exception("position notes failed", extra={"error_type": type(exc).__name__})
+            self.metrics.error(f"position_notes:{type(exc).__name__}")
 
     def _audit(
         self,

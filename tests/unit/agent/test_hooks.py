@@ -428,11 +428,17 @@ def test_account_argument_on_unscoped_read_denied() -> None:
     )
 
 
-def test_shipped_scope_table_denies_account_reads() -> None:
+def test_shipped_scope_table_confines_account_reads() -> None:
     from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
 
     s = session(account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
-    assert_denied(s, s.pre(RH + "get_option_positions"), "account scope unverified")
+    assert_denied(s, s.pre(RH + "get_option_positions"), "missing")
+    s = session(account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
+    assert_denied(
+        s, s.pre(RH + "get_option_positions", {"account_number": "999999999"}), "does not match"
+    )
+    s = session(account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
+    assert_denied(s, s.pre(RH + "get_watchlists"), "account scope unverified")
 
 
 # ---- kill switch and stop latch ------------------------------------------------------------

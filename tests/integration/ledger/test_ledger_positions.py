@@ -12,13 +12,20 @@ from wheelta_robinhood_agent.domain.enums import (
     AppEnv,
     AttemptStatus,
     DataQuality,
+    DecisionAction,
     StrategyKind,
     ToolTier,
 )
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.orders import OrderIntent
-from wheelta_robinhood_agent.domain.positions import PositionBookEntry, PositionInstrument
+from wheelta_robinhood_agent.domain.positions import (
+    MAX_NOTES_PER_POSITION,
+    PositionBookEntry,
+    PositionInstrument,
+    PositionNote,
+    PositionNoteKind,
+)
 from wheelta_robinhood_agent.ledger.errors import DedupConflict
 from wheelta_robinhood_agent.ledger.ids import new_id
 from wheelta_robinhood_agent.ledger.orders import (
@@ -36,6 +43,7 @@ from wheelta_robinhood_agent.ledger.positions import (
     position_book,
     record_assignment,
     record_gap,
+    record_note,
     record_reconciliation,
     record_roll,
 )
@@ -398,3 +406,71 @@ def test_book_lists_unresolved_owned_orders(conn: Conn, run_id: uuid.UUID) -> No
     book = position_book(conn, ACCOUNT, as_of=AS_OF)
     assert book.unresolved_owned_order_ids == (working,)
     assert [g.evidence_ids for g in book.gaps] == [(pending.intent_id,)]
+
+
+def _hold_note(run_id: uuid.UUID, ref: str, text: str = "Thesis intact; hold.") -> PositionNote:
+    return PositionNote(
+        run_id=run_id,
+        noted_at=T0,
+        kind=PositionNoteKind.DECISION,
+        action=DecisionAction.HOLD,
+        decision_ref=ref,
+        text=text,
+    )
+
+
+def test_notes_follow_the_lineage_until_it_closes(conn: Conn, run_id: uuid.UUID) -> None:
+    position_id = _open_with_entry(conn, run_id)
+    later = open_run_slot(conn, AppEnv.LOCAL, SLOT + timedelta(hours=1)).run_id
+    record_note(
+        conn, position_id, dedup_key=f"note:{run_id}:decision:0", note=_hold_note(run_id, "d:0")
+    )
+    question = PositionNote(
+        run_id=later, noted_at=T0, kind=PositionNoteKind.QUESTION, text="Guidance date?"
+    )
+    record_note(conn, position_id, dedup_key=f"note:{later}:question:0", note=question)
+    # Re-finalizing a slot appends nothing new.
+    again = record_note(
+        conn, position_id, dedup_key=f"note:{run_id}:decision:0", note=_hold_note(run_id, "d:0")
+    )
+    assert not again.created
+
+    entry = _entry(conn, position_id)
+    assert entry.notes == (_hold_note(run_id, "d:0"), question)
+    assert entry.notes_omitted == 0
+    assert entry.thesis == "Range-bound into earnings"
+
+    close_position(
+        conn,
+        position_id,
+        run_id=later,
+        observed_at=T0,
+        source_tool_call_ids=[_read(conn, later)],
+    )
+    assert position_book(conn, ACCOUNT, as_of=AS_OF).entries == ()
+    stored = conn.execute(
+        "SELECT count(*) FROM position_events WHERE entity_id = %s AND event_type = 'note'",
+        (position_id,),
+    ).fetchone()
+    assert stored == (2,)
+
+
+def test_book_shows_only_the_newest_notes(conn: Conn, run_id: uuid.UUID) -> None:
+    position_id = _open_with_entry(conn, run_id)
+    total = MAX_NOTES_PER_POSITION + 2
+    for i in range(total):
+        record_note(
+            conn,
+            position_id,
+            dedup_key=f"note:{run_id}:decision:{i}",
+            note=_hold_note(run_id, f"d:{i}"),
+        )
+    entry = _entry(conn, position_id)
+    assert entry.notes_omitted == 2
+    assert [n.decision_ref for n in entry.notes] == [f"d:{i}" for i in range(2, total)]
+
+
+def test_note_dedup_key_is_namespaced(conn: Conn, run_id: uuid.UUID) -> None:
+    position_id = _open_with_entry(conn, run_id)
+    with pytest.raises(ValueError, match="note:"):
+        record_note(conn, position_id, dedup_key="decision:0", note=_hold_note(run_id, "d:0"))

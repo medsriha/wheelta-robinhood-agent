@@ -4,11 +4,16 @@ A lineage (`position_id`) is stable through rolls. A roll is counted once, when 
 replacement order first fills, regardless of price steps or later partial fills. A short
 imported without known history has null entry facts and an unknown (None) roll count, never
 0. Lineages are never merged by ticker or OCC alone; ambiguity is an explicit gap.
+
+Notes (ADR-0018) carry the agent's own earlier judgments about an active lineage (decision
+rationale, thesis, open questions) into later runs. They are context, never evidence, and
+leave the book with the lineage when it closes.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import date
-from typing import Self
+from enum import StrEnum
+from typing import Final, Self
 from uuid import UUID
 
 from pydantic import model_validator
@@ -23,7 +28,7 @@ from wheelta_robinhood_agent.domain.base import (
     UtcDatetime,
     require_unique,
 )
-from wheelta_robinhood_agent.domain.enums import DataQuality, StrategyKind
+from wheelta_robinhood_agent.domain.enums import DataQuality, DecisionAction, StrategyKind
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.options import OccSymbol
 
@@ -71,6 +76,58 @@ def count_rolls(events: Iterable[RollEvent]) -> int:
     return len({event.replacement_order_id for event in events})
 
 
+# ADR-0018: newest notes shown per lineage. A prompt-size bound, not a trading rule.
+MAX_NOTES_PER_POSITION: Final = 24
+
+
+class PositionNoteKind(StrEnum):
+    DECISION = "decision"
+    QUESTION = "question"
+
+
+class PositionNote(DomainModel):
+    """One earlier-run judgment about a lineage, kept verbatim (ADR-0018).
+
+    A `decision` note is a management decision (HOLD/CLOSE/ROLL) that targeted the lineage:
+    its rationale, plus the thesis and invalidation conditions a roll replacement supplied.
+    A `question` note is an unresolved research question that targeted the lineage. The text
+    is the agent's judgment from `run_id`; it supplies no financial fact to a later run.
+    """
+
+    run_id: UUID
+    noted_at: UtcDatetime
+    kind: PositionNoteKind
+    action: DecisionAction | None = None
+    decision_ref: Ref | None = None
+    text: NonEmptyStr
+    thesis: NonEmptyStr | None = None
+    invalidation_conditions: tuple[NonEmptyStr, ...] = ()
+
+    @model_validator(mode="after")
+    def _check_note(self) -> Self:
+        if self.kind is PositionNoteKind.DECISION:
+            if self.action is None or self.decision_ref is None:
+                raise ValueError("a decision note names its action and decision_ref")
+        elif (
+            self.action is not None
+            or self.decision_ref is not None
+            or self.thesis is not None
+            or self.invalidation_conditions
+        ):
+            raise ValueError("a question note carries only its text")
+        return self
+
+
+def latest_notes(
+    notes: Sequence[PositionNote], limit: int = MAX_NOTES_PER_POSITION
+) -> tuple[tuple[PositionNote, ...], int]:
+    """The newest `limit` notes in recorded order, and how many older ones were left out."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    kept = tuple(notes[-limit:])
+    return kept, len(notes) - len(kept)
+
+
 class PositionBookEntry(DomainModel):
     """One active lineage with the entry evidence management needs.
 
@@ -81,6 +138,8 @@ class PositionBookEntry(DomainModel):
       lineage.
     - `entry_weighted_credit` is the quantity-weighted entry fill price in the broker's
       option price units (per-share vs per-contract **unverified** until fixtures exist).
+    - `notes` are the newest earlier-run notes, oldest first; `notes_omitted` counts older
+      ones not shown (ADR-0018).
     """
 
     position_id: UUID
@@ -99,10 +158,14 @@ class PositionBookEntry(DomainModel):
     roll_count: Count | None
     history_quality: DataQuality
     gaps: tuple[Gap, ...] = ()
+    notes: tuple[PositionNote, ...] = ()
+    notes_omitted: Count = 0
 
     @model_validator(mode="after")
     def _check_entry(self) -> Self:
         require_unique(self.entry_fill_ids, "entry fill id")
+        if len(self.notes) > MAX_NOTES_PER_POSITION:
+            raise ValueError(f"at most {MAX_NOTES_PER_POSITION} notes per lineage")
         require_unique(tuple(e.roll_event_id for e in self.roll_events), "roll event id")
         if any(e.position_id != self.position_id for e in self.roll_events):
             raise ValueError("roll events must belong to this lineage")

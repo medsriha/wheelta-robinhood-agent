@@ -219,7 +219,7 @@ CREATE TABLE position_events (
     sequence             integer     NOT NULL CHECK (sequence > 0),
     event_type           text        NOT NULL CHECK (event_type IN (
                              'opened', 'fill_linked', 'roll', 'assignment', 'closed',
-                             'gap', 'reconciliation')),
+                             'gap', 'reconciliation', 'note')),
     order_id             uuid        REFERENCES orders (order_id),
     observed_at          timestamptz NOT NULL,
     source_as_of         timestamptz,
