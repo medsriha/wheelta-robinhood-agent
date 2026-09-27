@@ -1,0 +1,32 @@
+{
+  "provenance": {
+    "tool": "get_accounts",
+    "arguments": {},
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-27",
+    "captured_via": "Claude Code session (read-only call, owner-approved)",
+    "scrubbing": "only the agentic_allowed=true account kept; every other account removed entirely; all account numbers replaced; guide prose dropped",
+    "note": "the live response listed 5 accounts; exactly one had agentic_allowed=true. Fields seen on others: user_option_level (trust accounts only, per guide)."
+  },
+  "data": {
+    "accounts": [
+      {
+        "account_number": "ACCOUNT_REDACTED",
+        "rhs_account_number": "ACCOUNT_REDACTED",
+        "rhc_account_number": "ACCOUNT_REDACTED",
+        "type": "cash",
+        "unsettled_funds": "0.0000",
+        "brokerage_account_type": "individual",
+        "nickname": "Agentic",
+        "is_default": false,
+        "agentic_allowed": true,
+        "option_level": "option_level_2",
+        "management_type": "self_directed",
+        "affiliate": "rhf",
+        "state": "active",
+        "deactivated": false,
+        "permanently_deactivated": false
+      }
+    ]
+  }
+}
