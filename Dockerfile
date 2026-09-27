@@ -31,4 +31,6 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONPATH=/app/src \
     HOME=/home/agent
 
-CMD ["python", "-m", "wheelta_robinhood_agent.orchestrator"]
+# Migrations first (idempotent, serialized by an advisory lock), so a run never meets a missing
+# schema even if the platform's pre-deploy step was not configured; then one orchestrator run.
+CMD ["sh", "-c", "python -m wheelta_robinhood_agent.ledger.migrate && exec python -m wheelta_robinhood_agent.orchestrator"]

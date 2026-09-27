@@ -851,5 +851,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     notifier = HttpNotifier(settings.ALERT_WEBHOOK_URL, settings.HEARTBEAT_URL)
     try:
         return run_once(settings, rules, template, OrchestratorDeps(notifier=notifier))
+    except psycopg.errors.UndefinedTable:
+        # The ledger schema is missing: migrations haven't run on this database.
+        _LOG.error(
+            "ledger schema missing; run `python -m wheelta_robinhood_agent.ledger.migrate` "
+            "(the container entrypoint and Railway preDeployCommand both do)"
+        )
+        return EXIT_FAILED
+    except Exception as exc:  # noqa: BLE001 - last resort: fail closed, never crash-dump
+        # One redacted line instead of a raw traceback (CLAUDE.md §7, §14). The run is
+        # recorded as far as it got; the exit code tells Railway and alerting it failed.
+        _LOG.error("run failed with an unhandled %s", type(exc).__name__, exc_info=True)
+        return EXIT_FAILED
     finally:
         notifier.close()

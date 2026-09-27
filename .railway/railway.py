@@ -26,7 +26,12 @@ def railway(ctx):  # type: ignore[no-untyped-def]
         source=github("medsriha/wheelta-robinhood-agent", branch="main"),
         build={"builder": "DOCKERFILE", "dockerfilePath": "Dockerfile"},
         preDeploy="python -m wheelta_robinhood_agent.ledger.migrate",
-        start="python -m wheelta_robinhood_agent.orchestrator",
+        # Same as the Dockerfile CMD: migrate (idempotent) then one run, so a missing
+        # pre-deploy step can't leave the schema absent.
+        start=(
+            "sh -c 'python -m wheelta_robinhood_agent.ledger.migrate"
+            " && exec python -m wheelta_robinhood_agent.orchestrator'"
+        ),
         deploy={
             "cronSchedule": CRON_SCHEDULE,
             # A failed run alerts (heartbeat + webhook) and waits for the next slot; it must
