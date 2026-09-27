@@ -153,7 +153,14 @@ class HeartbeatStatus(StrEnum):
 
 # Only these finalized statuses are healthy invocations (OPERATIONS.md "healthy"). A concurrent
 # skip means the previous run overran its sub-hour budget; a kill-switch skip needs attention.
-_SUCCESS_STATUSES = frozenset({RunStatus.COMPLETED, RunStatus.SKIPPED_MARKET_CLOSED})
+_SUCCESS_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.SKIPPED_MARKET_CLOSED,
+        # ADR-0024: the expected production outcome until live mode is authorized.
+        RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL,
+    }
+)
 
 
 def heartbeat_status_for(run_status: RunStatus) -> HeartbeatStatus:

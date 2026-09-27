@@ -84,6 +84,8 @@ class MappingRequest(_Model):
     effective_input: dict[str, JsonValue]
     payload: JsonValue
     retrieved_at: AwareDatetime
+    # This run's trusted Agentic-eligibility check passed (agent/session.py, CLAUDE.md §9).
+    account_eligible: bool = False
 
 
 class EvidenceMapper(Protocol):

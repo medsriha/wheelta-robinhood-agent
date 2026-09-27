@@ -43,7 +43,12 @@ ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
 LOCAL_TOOLS = {LOCAL_REGISTRY.qualified(t.name) for t in LOCAL_REGISTRY.tools}
 
 
-def _plan(accepted: bool = True, rh: Any = RH, rh_registry: Any = RH_VERIFIED) -> Any:
+def _plan(
+    accepted: bool = True,
+    rh: Any = RH,
+    rh_registry: Any = RH_VERIFIED,
+    proxy_accepted: bool = False,
+) -> Any:
     return plan_session(
         effective_mode=ExecutionMode.OFF,
         workspace_writes=True,
@@ -53,10 +58,11 @@ def _plan(accepted: bool = True, rh: Any = RH, rh_registry: Any = RH_VERIFIED) -
         ),
         observed_at=NOW,
         remote_boundary_accepted=accepted,
+        proxy_accepted=proxy_accepted,
     )
 
 
-def test_defaults_withhold_every_remote_source_and_block_the_session() -> None:
+def test_nothing_accepted_withholds_every_remote_source_and_blocks_the_session() -> None:
     plan = _plan(accepted=False)
     assert set(plan.withheld) == {"robinhood", "wheelta"}
     assert plan.required_unavailable == ("robinhood",)
@@ -64,6 +70,36 @@ def test_defaults_withhold_every_remote_source_and_block_the_session() -> None:
     assert plan.servers == ()
     assert set(plan.tool_access.allowed_tools) == {"WebSearch", "WebFetch", *LOCAL_TOOLS}
     assert {o.status for o in plan.observations} == {SourceStatus.DISABLED}
+
+
+def test_production_defaults_proxy_token_servers_and_never_deliver_directly() -> None:
+    """ADR-0023: a verified server with a token is proxied; nothing is direct."""
+    plan = plan_session(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=True,
+        sources=(
+            RemoteSource(RH_VERIFIED, RH, required=True),
+            RemoteSource(WHEELTA_REGISTRY, WT),
+        ),
+        observed_at=NOW,
+    )
+    assert plan.proxied == (RH,) and plan.servers == ()
+    assert set(plan.withheld) == {"wheelta"}  # unverified registry, proxy or not
+    assert plan.may_start
+    assert "mcp__robinhood__get_option_quotes" in plan.tool_access.allowed_tools
+
+
+def test_stored_cli_login_cannot_be_proxied_and_needs_direct_acceptance() -> None:
+    login = McpHttpServer(
+        name="robinhood",
+        url="https://rh.example/mcp",  # type: ignore[arg-type]
+        uses_stored_cli_login=True,
+    )
+    refused = _plan(accepted=False, rh=login, proxy_accepted=True)
+    assert "no bearer token for the validating proxy" in refused.withheld["robinhood"]
+    assert not refused.may_start
+    local = _plan(accepted=True, rh=login, proxy_accepted=True)  # ADR-0019 local opt-in
+    assert local.servers == (login,) and local.proxied == ()
 
 
 def test_unverified_registry_is_withheld_even_when_the_boundary_is_accepted() -> None:

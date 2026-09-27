@@ -2,20 +2,31 @@
 
 Two parts:
 
-- `plan_session` (pure): decide, before anything connects, which remote servers are exposed.
-  A server is withheld when it has no credentials (Robinhood `needs-auth`, ADR-0004), its
-  registry is unverified (CLAUDE.md §9), or its result boundary has not passed acceptance
-  (`REMOTE_RESULT_BOUNDARY_ACCEPTED`, DATA_QUALITY.md). Withheld tools move from
-  `allowed_tools` to `disallowed_tools`, so the model never sees them. Robinhood withheld or
-  unavailable means **no session**: without it the agent cannot trade or manage positions.
-- `run_agent_session` (async): build hooks (tool access layer 3, recording, result boundary,
-  web cache) and options, connect, poll `get_mcp_status` within the connect budget
-  (`pending` is intermediate; CLAUDE.md §8), turn statuses and tool lists into
-  `SourceObservation`s with discovery diffs, withhold anything unavailable, and only then send
-  the start message. During the session the init `SystemMessage` is re-checked; a
-  RunControl stop (signal, deadline, infrastructure failure) interrupts the SDK. The
-  `ResultMessage` usage/cost feeds `RunMetrics`; its final text is parsed strictly into
-  AgentDecisionOutput v5, and raw (redacted) plus parsed output are persisted.
+- `plan_session` (pure): decide, before anything connects, how each remote server is
+  delivered. A server with a bearer token is **proxied** (ADR-0023): the session serves its
+  tools in-process through the validating proxy (`agent/proxy.py`), accepted by the real-CLI
+  acceptance tests (`PROXY_RESULT_BOUNDARY_ACCEPTED`). A server the CLI would reach itself
+  (**direct**, e.g. the stored Claude Code login, ADR-0018) is exposed only when direct
+  delivery is accepted (`REMOTE_RESULT_BOUNDARY_ACCEPTED`, False; ADR-0019 local dry runs
+  opt in). A server is withheld when it has no credentials (Robinhood `needs-auth`), its
+  registry is unverified (CLAUDE.md §9), or no accepted delivery exists. Withheld tools move
+  from `allowed_tools` to `disallowed_tools`, so the model never sees them. Robinhood withheld
+  or unavailable means **no session**: without it the agent cannot trade or manage positions.
+- `run_agent_session` (async): open each proxied server's upstream connection (initialize +
+  `tools/list`) within the connect budget and turn it into a `SourceObservation` with a
+  discovery diff (401/403 → `needs-auth`); verify in trusted code, through the Robinhood
+  upstream's `get_accounts`, that the configured account is Agentic-eligible (a failed or
+  negative check withholds Robinhood; a pass lets `get_portfolio` snapshots be
+  `agentic_verified`); build hooks (tool access layer 3, recording,
+  result boundary, web cache), the proxies, and options; connect; poll `get_mcp_status` for
+  direct servers only (`pending` is intermediate; CLAUDE.md §8), withhold anything
+  unavailable, and only then send the start message. In-process servers (`wra_local` and the
+  proxies) are absent from `get_mcp_status` until the first query (real CLI 2.1.283), so they
+  are verified by the init `SystemMessage` check instead, which stops the run if Robinhood or
+  `wra_local` is not connected. A RunControl stop (signal, deadline, infrastructure failure)
+  interrupts the SDK. The `ResultMessage` usage/cost feeds `RunMetrics`; its final text is
+  parsed strictly into AgentDecisionOutput v5, and raw (redacted) plus parsed output are
+  persisted.
 
 Effective mode is capped at off in phase 1 (ADR-0013). `assert_no_order_tools` re-checks
 that no Tier X tool is allowed before any session is built, whatever the settings say.
@@ -24,6 +35,7 @@ that no Tier X tool is allowed before any session is built, whatever the setting
 import contextlib
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -41,6 +53,7 @@ from claude_agent_sdk import (
     SystemMessage,
     Transport,
 )
+from claude_agent_sdk.types import McpSdkServerConfig
 
 from wheelta_robinhood_agent.agent.account_scope import (
     ROBINHOOD_ACCOUNT_SCOPE,
@@ -59,11 +72,20 @@ from wheelta_robinhood_agent.agent.ledger_adapters import (
 )
 from wheelta_robinhood_agent.agent.local_server import LOCAL_REGISTRY, build_local_server
 from wheelta_robinhood_agent.agent.options import build_agent_options
+from wheelta_robinhood_agent.agent.proxy import (
+    ValidatingProxy,
+    build_proxy_server,
+    upstream_timeout_seconds,
+)
+from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import LedgerToolEventRecorder
 from wheelta_robinhood_agent.agent.result_boundary import (
     VERIFIED_MAPPERS,
     BoundaryValidator,
     EvidenceMapper,
+    PayloadError,
+    PayloadKind,
+    extract_mcp_payload,
 )
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
 from wheelta_robinhood_agent.agent.tool_access import (
@@ -83,6 +105,7 @@ from wheelta_robinhood_agent.agent.withholding import ServerWithholding
 from wheelta_robinhood_agent.config.facts_rules import facts_rules_from
 from wheelta_robinhood_agent.config.rules import LoadedRules
 from wheelta_robinhood_agent.config.settings import Settings
+from wheelta_robinhood_agent.domain.account import AgenticEligibility
 from wheelta_robinhood_agent.domain.decision_output import (
     DecisionOutputParseResult,
     parse_agent_decision_output,
@@ -93,7 +116,14 @@ from wheelta_robinhood_agent.domain.enums import (
     ToolCallStatus,
     ToolTier,
 )
-from wheelta_robinhood_agent.integrations.registry import ToolRegistry
+from wheelta_robinhood_agent.integrations.mcp_upstream import (
+    McpUpstream,
+    UpstreamAuthError,
+    UpstreamError,
+    open_http_upstream,
+)
+from wheelta_robinhood_agent.integrations.registry import ToolRegistry, diff_discovered
+from wheelta_robinhood_agent.integrations.robinhood.accounts import check_eligibility
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     SERVER_NAME as ROBINHOOD,
 )
@@ -109,16 +139,23 @@ from wheelta_robinhood_agent.observability.redaction import Redactor
 
 Conn = psycopg.Connection[tuple[object, ...]]
 TransportFactory = Callable[[ClaudeAgentOptions], Transport]
+UpstreamFactory = Callable[[McpHttpServer, float], AbstractAsyncContextManager[McpUpstream]]
 
 REMOTE_RESULT_BOUNDARY_ACCEPTED: Final = False
-"""Whether remote MCP results may reach the model through the SDK hook boundary.
+"""Whether remote MCP results may reach the model directly through the SDK hook boundary.
 
-DATA_QUALITY.md: direct SDK tool delivery may be used only after the pinned SDK passes the
-result-boundary acceptance tests (invalid payloads, isError, transport failures, oversized
-output, hook exceptions/timeouts, ledger failures; raw data must never reach a later model
-request). Those tests need the real CLI (`tests/e2e/test_e2e_result_boundary_cli.py`, marked
-`requires_cli`) and have not passed, so every remote server is withheld. This is a code
-constant, not an environment variable: flipping it is a reviewed change with test evidence.
+DATA_QUALITY.md: direct delivery (the CLI connects to the remote server) fails five of the
+real-CLI result-boundary acceptance tests (isError, transport failure, oversized output, hook
+exception, hook timeout), so it is not accepted. Only an ADR-0019 local dry run opts in.
+"""
+
+PROXY_RESULT_BOUNDARY_ACCEPTED: Final = True
+"""Whether remote MCP results may reach the model through the validating proxy (ADR-0023).
+
+Accepted on 2026-09-27: every real-CLI acceptance test in
+`tests/e2e/test_e2e_result_boundary_cli.py` passes through the proxy against the pinned
+claude-agent-sdk 0.2.160 / bundled CLI 2.1.283. A code constant, not an environment variable:
+re-run those tests (WRA_RUN_REQUIRES_CLI=1) whenever the SDK or CLI is bumped.
 """
 
 # Bounds for the session's own waits; not trading values.
@@ -155,11 +192,13 @@ class RemoteSource:
 class SessionPlan:
     effective_mode: ExecutionMode
     tool_access: ToolAccess
-    servers: tuple[McpHttpServer, ...]
+    servers: tuple[McpHttpServer, ...]  # direct: the CLI connects to them itself
     registries: tuple[ToolRegistry, ...]
     observations: tuple[SourceObservation, ...]
     withheld: Mapping[str, str]
     required_unavailable: tuple[str, ...]
+    # Served in-process through the validating proxy (ADR-0023).
+    proxied: tuple[McpHttpServer, ...] = ()
 
     @property
     def may_start(self) -> bool:
@@ -184,9 +223,14 @@ def plan_session(
     sources: Sequence[RemoteSource],
     observed_at: datetime,
     remote_boundary_accepted: bool = REMOTE_RESULT_BOUNDARY_ACCEPTED,
+    proxy_accepted: bool = PROXY_RESULT_BOUNDARY_ACCEPTED,
     local_registry: ToolRegistry = LOCAL_REGISTRY,
 ) -> SessionPlan:
-    """Decide the exposed servers and tools before connecting (fail closed)."""
+    """Decide the exposed servers and tools before connecting (fail closed).
+
+    A server with a token is proxied when the proxy is accepted; otherwise, or without a
+    token our code can present, it is direct only if direct delivery is accepted.
+    """
     registries = (*(s.registry for s in sources), local_registry)
     base = build_tool_access(
         effective_mode=effective_mode, workspace_writes=workspace_writes, registries=registries
@@ -194,6 +238,7 @@ def plan_session(
     withheld: dict[str, str] = {}
     observations: list[SourceObservation] = []
     servers: list[McpHttpServer] = []
+    proxied: list[McpHttpServer] = []
     for source in sources:
         name = source.registry.server
         if isinstance(source.server, SourceObservation):
@@ -201,10 +246,15 @@ def plan_session(
             withheld[name] = f"unavailable before connect ({source.server.status.value})"
             continue
         reason = None
+        proxy = proxy_accepted and source.server.token is not None
         if not source.registry.verified:
             reason = "tool registry unverified (no captured tools/list)"
-        elif not remote_boundary_accepted:
-            reason = "result-boundary acceptance tests have not passed"
+        elif not proxy and not remote_boundary_accepted:
+            reason = (
+                "result-boundary acceptance tests have not passed"
+                if source.server.token is not None
+                else "no bearer token for the validating proxy; direct delivery not accepted"
+            )
         if reason is not None:
             withheld[name] = reason
             observations.append(
@@ -213,7 +263,7 @@ def plan_session(
                 )
             )
             continue
-        servers.append(source.server)
+        (proxied if proxy else servers).append(source.server)
     allowed = set(base.allowed_tools)
     disallowed = set(base.disallowed_tools)
     for registry in registries:
@@ -238,6 +288,7 @@ def plan_session(
         observations=tuple(observations),
         withheld=withheld,
         required_unavailable=required,
+        proxied=tuple(proxied),
     )
 
 
@@ -312,6 +363,8 @@ class SessionDeps:
     session_budget_seconds: Callable[[], float]
     deadline_check: Callable[[], None] = lambda: None
     transport_factory: TransportFactory | None = None
+    # Opens one proxied server's upstream (test seam; default: streamable HTTP).
+    upstream_factory: UpstreamFactory | None = None
     mappers: Mapping[tuple[str, str], EvidenceMapper] = field(
         default_factory=lambda: VERIFIED_MAPPERS
     )
@@ -336,6 +389,8 @@ class SessionResult:
     error: str | None = None
     model_id: str | None = None
     tool_drift: list[str] = field(default_factory=list)
+    # The trusted Agentic-eligibility check (proxied Robinhood only); None if it did not run.
+    eligibility: AgenticEligibility | None = None
 
 
 def _web_cache_parts(
@@ -367,12 +422,24 @@ def _web_cache_parts(
     return precheck, capture, build_web_cache_tool(store, deps.clock, max_age)
 
 
-def build_session_options(deps: SessionDeps, withholding: ServerWithholding) -> ClaudeAgentOptions:
-    """Hooks, local server, and options for this session (no I/O)."""
+def build_session_options(
+    deps: SessionDeps,
+    withholding: ServerWithholding,
+    upstreams: Mapping[str, McpUpstream] | None = None,
+    account_eligible: bool = False,
+) -> ClaudeAgentOptions:
+    """Hooks, local server, validating proxies (one per open upstream), and options (no I/O).
+
+    `account_eligible` is the result of the session's trusted `get_accounts` check."""
     precheck, capture, lookup_tool = _web_cache_parts(deps)
     recorder = LedgerToolEventRecorder(
         deps.conn, run_id=deps.run_id, result_writer=ledger_result_writer
     )
+    validator = BoundaryValidator(
+        redactor=deps.redactor, mappers=deps.mappers, account_eligible=account_eligible
+    )
+    upstreams = dict(upstreams or {})
+    dispatch = ProxyDispatch(frozenset(upstreams))
     settings = deps.settings
     prefix = settings.ROBINHOOD_WORKSPACE_PREFIX
     hook_deps = HookDeps(
@@ -384,7 +451,7 @@ def build_session_options(deps: SessionDeps, withholding: ServerWithholding) -> 
         rules=deps.rules.rules,
         run_control=deps.run_control,
         recorder=recorder,
-        validator=BoundaryValidator(redactor=deps.redactor, mappers=deps.mappers),
+        validator=validator,
         ownership=LedgerWorkspaceOwnership(deps.conn, deps.account_scope_id, prefix),
         counter=LedgerWorkspaceCounter(deps.conn, deps.account_scope_id, prefix, deps.run_id),
         redactor=deps.redactor,
@@ -394,6 +461,7 @@ def build_session_options(deps: SessionDeps, withholding: ServerWithholding) -> 
         web_precheck=precheck,
         web_capture=capture,
         withheld=withholding,
+        proxy_dispatch=dispatch,
     )
     facts_service = DecisionFactsService(
         conn=deps.conn,
@@ -403,10 +471,31 @@ def build_session_options(deps: SessionDeps, withholding: ServerWithholding) -> 
         clock=deps.clock,
     )
     local = build_local_server([lookup_tool, build_facts_tool(facts_service, deps.run_control)])
+    sdk_servers: dict[str, McpSdkServerConfig] = {LOCAL_SERVER_NAME: local}
+    registry_by_name = {r.server: r for r in deps.plan.registries}
+    timeout = upstream_timeout_seconds(settings.MCP_TOOL_TIMEOUT)
+    for name, upstream in upstreams.items():
+        proxy = ValidatingProxy(
+            server=name,
+            upstream=upstream,
+            dispatch=dispatch,
+            recorder=recorder,
+            validator=validator,
+            run_control=deps.run_control,
+            clock=deps.clock,
+            upstream_timeout_seconds=timeout,
+        )
+        sdk_servers[name] = McpSdkServerConfig(
+            type="sdk",
+            name=name,
+            instance=build_proxy_server(
+                proxy, registry_by_name[name], deps.plan.tool_access.allowed_tools
+            ),
+        )
     return build_agent_options(
         tool_access=deps.plan.tool_access,
         mcp_servers=deps.plan.servers,
-        sdk_servers={LOCAL_SERVER_NAME: local},
+        sdk_servers=sdk_servers,
         hooks=build_hooks(hook_deps),
         system_prompt=deps.system_prompt,
         model=settings.AGENT_MODEL,
@@ -497,6 +586,92 @@ def _withhold_unavailable(
             reason = "connected without a verifiable tool list"
         if withholding.withhold(obs.server, reason):
             result.withheld[obs.server] = reason
+
+
+def _default_upstream(
+    server: McpHttpServer, connect_timeout_seconds: float
+) -> AbstractAsyncContextManager[McpUpstream]:
+    return open_http_upstream(server, connect_timeout_seconds=connect_timeout_seconds)
+
+
+async def _open_upstreams(
+    stack: AsyncExitStack, deps: SessionDeps, result: SessionResult
+) -> dict[str, McpUpstream]:
+    """Connect each proxied server within the shared connect budget (CLAUDE.md §8).
+
+    A refused credential is `needs-auth`; any other failure is `failed`; a connected server
+    gets a discovery diff from its full tool list. Failures are observations, never raised.
+    """
+    factory = deps.upstream_factory or _default_upstream
+    registry_by_name = {r.server: r for r in deps.plan.registries}
+    deadline = anyio.current_time() + deps.connect_budget_seconds
+    upstreams: dict[str, McpUpstream] = {}
+    for server in deps.plan.proxied:
+        remaining = deadline - anyio.current_time()
+        status = SourceStatus.FAILED
+        try:
+            if remaining <= 0:
+                raise UpstreamError(f"{server.name} connect: connect budget exhausted")
+            upstream = await stack.enter_async_context(factory(server, remaining))
+        except UpstreamAuthError:
+            status = SourceStatus.NEEDS_AUTH
+        except UpstreamError:
+            pass
+        else:
+            upstreams[server.name] = upstream
+            result.observations.append(
+                SourceObservation(
+                    server=server.name,
+                    status=SourceStatus.CONNECTED,
+                    observed_at=deps.clock(),
+                    discovery=diff_discovered(
+                        registry_by_name[server.name], (t.name for t in upstream.tools)
+                    ),
+                )
+            )
+            continue
+        result.observations.append(
+            SourceObservation(server=server.name, status=status, observed_at=deps.clock())
+        )
+    return upstreams
+
+
+ACCOUNT_LISTING_TOOL: Final = "get_accounts"
+
+
+async def _check_agentic_account(
+    deps: SessionDeps,
+    upstream: McpUpstream,
+    withholding: ServerWithholding,
+    result: SessionResult,
+) -> None:
+    """CLAUDE.md §9: verify, in trusted code, that the configured account is the Agentic
+    account before the model may touch it. The listing goes through the upstream directly
+    (never the model) and is reduced to the configured account's redacted eligibility; no
+    other account's data is kept. A failed or negative check withholds Robinhood, so no
+    session starts (fail closed)."""
+    try:
+        response = await upstream.call_tool(
+            ACCOUNT_LISTING_TOOL,
+            {},
+            timeout_seconds=upstream_timeout_seconds(deps.settings.MCP_TOOL_TIMEOUT),
+        )
+        kind, payload = extract_mcp_payload(response.response)
+        if kind is PayloadKind.TOOL_ERROR:
+            raise UpstreamError(f"{ACCOUNT_LISTING_TOOL}: the tool returned an error")
+        eligibility = check_eligibility(
+            payload, deps.settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, deps.clock()
+        )
+    except (UpstreamError, PayloadError, ValueError, TypeError) as exc:
+        reason = f"Agentic eligibility check failed ({type(exc).__name__})"
+        if withholding.withhold(ROBINHOOD, reason):
+            result.withheld[ROBINHOOD] = reason
+        return
+    result.eligibility = eligibility
+    if not eligibility.eligible:
+        reason = "configured account is not Agentic-eligible: " + "; ".join(eligibility.reasons)
+        if withholding.withhold(ROBINHOOD, reason):
+            result.withheld[ROBINHOOD] = reason
 
 
 def _start_message(withheld: Mapping[str, str]) -> str:
@@ -623,20 +798,44 @@ async def run_agent_session(deps: SessionDeps) -> SessionResult:
     withholding = ServerWithholding()
     for server, reason in deps.plan.withheld.items():
         withholding.withhold(server, reason)
-    configured = [*(s.name for s in deps.plan.servers), LOCAL_SERVER_NAME]
-    options = build_session_options(deps, withholding)
+    async with AsyncExitStack() as upstream_stack:
+        upstreams = await _open_upstreams(upstream_stack, deps, result)
+        _withhold_unavailable(result.observations, withholding, result)
+        # A proxy is served only for a verified connection; a withheld one is not configured.
+        upstreams = {n: u for n, u in upstreams.items() if withholding.reason(n) is None}
+        if ROBINHOOD in upstreams:
+            await _check_agentic_account(deps, upstreams[ROBINHOOD], withholding, result)
+        if ROBINHOOD in result.withheld or deps.run_control.stop_requested:
+            return result
+        await _run_client(deps, withholding, upstreams, result)
+    if result.status is not SessionStatus.NOT_STARTED:
+        close_unresolved_calls(deps)
+        persist_output(deps, result)
+    return result
+
+
+async def _run_client(
+    deps: SessionDeps,
+    withholding: ServerWithholding,
+    upstreams: Mapping[str, McpUpstream],
+    result: SessionResult,
+) -> None:
+    direct = [s.name for s in deps.plan.servers]
+    configured = [*direct, *upstreams, LOCAL_SERVER_NAME]
+    eligible = result.eligibility is not None and result.eligibility.eligible
+    options = build_session_options(deps, withholding, upstreams, account_eligible=eligible)
     transport = deps.transport_factory(options) if deps.transport_factory else None
     client = ClaudeSDKClient(options, transport=transport)
     try:
         with anyio.fail_after(max(deps.connect_budget_seconds, 0.001)):
             await client.connect()
-        observations = await _poll_status(client, deps, configured)
-        result.observations.extend(observations)
-        _withhold_unavailable(observations, withholding, result)
-        required = [s for s in (ROBINHOOD, LOCAL_SERVER_NAME) if s in result.withheld]
-        if required or deps.run_control.stop_requested:
+        if direct:
+            observations = await _poll_status(client, deps, direct)
+            result.observations.extend(observations)
+            _withhold_unavailable(observations, withholding, result)
+        if ROBINHOOD in result.withheld or deps.run_control.stop_requested:
             result.status = SessionStatus.NOT_STARTED
-            return result
+            return
         await _converse(client, deps, configured, withholding, result)
         result.status = (
             SessionStatus.STOPPED
@@ -651,10 +850,6 @@ async def run_agent_session(deps: SessionDeps) -> SessionResult:
     finally:
         with contextlib.suppress(Exception), anyio.move_on_after(DISCONNECT_TIMEOUT_SECONDS):
             await client.disconnect()
-    if result.status is not SessionStatus.NOT_STARTED:
-        close_unresolved_calls(deps)
-        persist_output(deps, result)
-    return result
 
 
 SESSION_ENDED_DEDUP_KEY = "session_ended_without_outcome"
@@ -691,6 +886,7 @@ def run_session_sync(deps: SessionDeps) -> SessionResult:
 
 
 __all__ = [
+    "PROXY_RESULT_BOUNDARY_ACCEPTED",
     "REMOTE_RESULT_BOUNDARY_ACCEPTED",
     "RemoteSource",
     "SessionDeps",

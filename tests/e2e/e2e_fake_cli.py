@@ -14,6 +14,14 @@ CLI behaviour mirrored here (not verified against the real CLI): PreToolUse hook
 the `allowed_tools`/`disallowed_tools` permission check (`dontAsk` denies anything not
 allowed); a hook deny or `continue: false` ends that call; PostToolUse `updatedToolOutput`
 replaces what the model sees; built-in outputs are not replaced.
+
+Mirrored and verified against the real CLI 2.1.283 (tests/e2e/cli_harness/): an MCP
+`tools/call` to an in-process server carries `_meta["claudecode/toolUseId"]`, and in-process
+servers are absent from `get_mcp_status` until the first query.
+
+Remote servers are served as production serves them (ADR-0023): the session's validating
+proxy is an in-process server here too, and `world_upstreams(world)` is its upstream
+(`OrchestratorDeps.upstream_factory`), answering from the world's handlers.
 """
 
 from __future__ import annotations
@@ -21,10 +29,20 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, Transport
+
+from wheelta_robinhood_agent.integrations.mcp_upstream import (
+    McpUpstream,
+    UpstreamAuthError,
+    UpstreamResult,
+    UpstreamTool,
+    UpstreamUnavailable,
+)
+from wheelta_robinhood_agent.integrations.status import McpHttpServer
 
 Handler = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -46,6 +64,8 @@ class FakeWorld:
     init_statuses: dict[str, str] = field(default_factory=dict)
     web_results: dict[str, Any] = field(default_factory=dict)
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    # Servers the proxy opened an upstream to (with their credentials), in order.
+    upstream_servers: list[McpHttpServer] = field(default_factory=list)
 
 
 @dataclass
@@ -103,7 +123,8 @@ class FakeCli(Transport):
         self.turns: list[ToolTurn] = []
         self.user_messages: list[str] = []
         self.interrupted = asyncio.Event()
-        self.local_tools: list[str] = []
+        self.local_tools: dict[str, list[str]] = {}
+        self._queried = False
         self._out: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._hooks: dict[str, list[tuple[str | None, list[str]]]] = {}
@@ -112,6 +133,7 @@ class FakeCli(Transport):
         self._mcp_id = 100
         self._local_ready = False
         self._use_counter = 0
+        self._current_use_id = ""
 
     # -- Transport ------------------------------------------------------------------------
 
@@ -185,6 +207,7 @@ class FakeCli(Transport):
         if kind == "user":
             content = message.get("message", {}).get("content")
             self.user_messages.append(content if isinstance(content, str) else json.dumps(content))
+            self._queried = True
             self._spawn(self._run_script())
 
     async def _control(self, request_id: str, request: dict[str, Any]) -> None:
@@ -244,7 +267,7 @@ class FakeCli(Transport):
                 }
             )
             listed = await self._mcp(server, "tools/list", {})
-            self.local_tools = [t["name"] for t in (listed or {}).get("tools", [])]
+            self.local_tools[server] = [t["name"] for t in (listed or {}).get("tools", [])]
         self._local_ready = True
 
     async def _mcp_status(self) -> dict[str, Any]:
@@ -256,12 +279,14 @@ class FakeCli(Transport):
             if status == "connected":
                 entry["tools"] = [{"name": t} for t in self.world.handlers.get(name, {})]
             entries.append(entry)
+        if not self._queried:  # the real CLI lists in-process servers only after a query
+            return {"mcpServers": entries}
         for name in self._sdk_servers():
             entries.append(
                 {
                     "name": name,
                     "status": "connected",
-                    "tools": [{"name": t} for t in self.local_tools],
+                    "tools": [{"name": t} for t in self.local_tools.get(name, [])],
                 }
             )
         return {"mcpServers": entries}
@@ -274,7 +299,7 @@ class FakeCli(Transport):
         for server in self._http_servers():
             names |= {f"mcp__{server}__{t}" for t in self.world.handlers.get(server, {})}
         for server in self._sdk_servers():
-            names |= {f"mcp__{server}__{t}" for t in self.local_tools}
+            names |= {f"mcp__{server}__{t}" for t in self.local_tools.get(server, [])}
         return names - denied
 
     # -- hooks ------------------------------------------------------------------------------
@@ -304,6 +329,7 @@ class FakeCli(Transport):
             raise ScriptStopped("interrupted")
         self._use_counter += 1
         use_id = f"toolu_{self._use_counter:04d}"
+        self._current_use_id = use_id
         base = {"tool_name": name, "tool_input": tool_input, "tool_use_id": use_id}
         effective = tool_input
         for out in await self._hook("PreToolUse", name, base):
@@ -355,7 +381,18 @@ class FakeCli(Transport):
             return {"url": tool_input.get("url"), "content": "fetched page"}
         _, server, tool = name.split("__", 2)
         if server in self._sdk_servers():
-            return await self._mcp(server, "tools/call", {"name": tool, "arguments": tool_input})
+            params = {
+                "name": tool,
+                "arguments": tool_input,
+                "_meta": {"claudecode/toolUseId": self._current_use_id},
+            }
+            result = await self._mcp(server, "tools/call", params) or {}
+            # Like the real CLI: an isError result fires PostToolUseFailure, and PostToolUse
+            # receives the bare list of content blocks.
+            if result.get("isError") is True:
+                texts = [b.get("text", "") for b in result.get("content") or []]
+                raise FakeToolFailure("\n".join(texts))
+            return result.get("content")
         handler = self.world.handlers.get(server, {}).get(tool)
         if handler is None:
             raise FakeToolFailure(f"unknown tool {name}")
@@ -364,6 +401,7 @@ class FakeCli(Transport):
     # -- the turn ----------------------------------------------------------------------------
 
     async def _run_script(self) -> None:
+        await self._ensure_local()  # the real CLI connects in-process servers at startup
         servers = [*self._http_servers(), *self._sdk_servers()]
         await self._emit(
             {
@@ -415,6 +453,57 @@ class FakeCli(Transport):
             "result": text,
             "terminal_reason": "aborted_tools" if error else "completed",
         }
+
+
+class WorldUpstream:
+    """An `McpUpstream` answering from one fake server's handlers (the proxy's upstream)."""
+
+    def __init__(self, world: FakeWorld, server: str) -> None:
+        self._world = world
+        self._server = server
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    @property
+    def server(self) -> str:
+        return self._server
+
+    @property
+    def tools(self) -> tuple[UpstreamTool, ...]:
+        return tuple(
+            UpstreamTool(name, f"fake {name}", {"type": "object"})
+            for name in self._world.handlers.get(self._server, {})
+        )
+
+    async def call_tool(
+        self, name: str, arguments: Mapping[str, Any], *, timeout_seconds: float
+    ) -> UpstreamResult:
+        self.calls.append((name, dict(arguments)))
+        handler = self._world.handlers.get(self._server, {}).get(name)
+        if handler is None:
+            raise UpstreamUnavailable(f"{name}: MCP error -32602")
+        try:
+            response = handler(dict(arguments))
+        except FakeToolFailure:
+            raise UpstreamUnavailable(f"{name}: MCP error -32603") from None
+        return UpstreamResult(response=response, size_bytes=len(json.dumps(response)))
+
+
+def world_upstreams(
+    world: FakeWorld,
+) -> Callable[[McpHttpServer, float], AbstractAsyncContextManager[McpUpstream]]:
+    """`OrchestratorDeps.upstream_factory`: `world.statuses` decides the connect outcome."""
+
+    @asynccontextmanager
+    async def open_upstream(server: McpHttpServer, timeout: float) -> AsyncIterator[McpUpstream]:
+        world.upstream_servers.append(server)
+        status = world.statuses.get(server.name, "connected")
+        if status == "needs-auth":
+            raise UpstreamAuthError(f"{server.name} connect: the server refused the credential")
+        if status != "connected":
+            raise UpstreamUnavailable(f"{server.name} connect: HTTP 503")
+        yield WorldUpstream(world, server.name)
+
+    return open_upstream
 
 
 def factory(

@@ -49,6 +49,8 @@ class RunStatus(StrEnum):
     SKIPPED_CONCURRENT = "skipped_concurrent"
     SKIPPED_KILLED = "skipped_killed"
     SKIPPED_MARKET_CLOSED = "skipped_market_closed"
+    # ADR-0024: dry runs (effective mode off) run locally only; Railway is production.
+    SKIPPED_DRY_RUN_NOT_LOCAL = "skipped_dry_run_not_local"
     STOPPED = "stopped"
     TIMED_OUT = "timed_out"
     FAILED = "failed"

@@ -20,6 +20,7 @@ from test_e2e_orchestrator import Harness
 
 from wheelta_robinhood_agent.domain.enums import AppEnv, RunStatus
 from wheelta_robinhood_agent.domain.events import RunEventType
+from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
 from wheelta_robinhood_agent.integrations.robinhood.oauth import OAuthRefreshFailed, TokenPair
 from wheelta_robinhood_agent.integrations.robinhood.token_vault import TokenVault
 from wheelta_robinhood_agent.ledger.oauth_credentials import (
@@ -106,9 +107,14 @@ def _credential_event(h: Harness) -> dict[str, Any]:
 
 
 def _bearer(h: Harness) -> str:
+    """The Authorization header the proxy's upstream presents (ADR-0023). The CLI itself is
+    handed no credential at all."""
     servers = h.clis[0].options.mcp_servers
     assert isinstance(servers, dict)
-    return str(servers["robinhood"]["headers"]["Authorization"])
+    assert all("headers" not in cfg for cfg in servers.values())
+    (upstream,) = [s for s in h.world.upstream_servers if s.name == "robinhood"]
+    assert upstream.token is not None
+    return f"Bearer {upstream.token.get_secret_value()}"
 
 
 def _assert_no_token_leak(h: Harness, tokens: Tokens, caplog: pytest.LogCaptureFixture) -> None:
@@ -228,3 +234,40 @@ def test_refresh_failure_is_needs_auth(
     event = _credential_event(h)
     assert event["status"] == "refresh_failed" and "invalid_grant" in event["detail"]
     _assert_no_token_leak(h, tokens, caplog)
+
+
+# -- ADR-0024: dry runs are local only; production keeps its credential fresh --------------------
+
+
+def test_production_off_mode_refreshes_the_credential_but_starts_no_session(
+    make_settings: Any, notifier: RecordingNotifier, key: SecretStr
+) -> None:
+    settings = make_settings(
+        APP_ENV="production",
+        ROBINHOOD_MCP_AUTH="refresh_token",
+        ROBINHOOD_MCP_ACCESS_TOKEN=None,
+        ROBINHOOD_TOKEN_ENCRYPTION_KEY=key.get_secret_value(),
+    )
+    h = Harness(settings, notifier, FakeClock(SESSION_TIME))
+    h.run_id = run_id_for(AppEnv.PRODUCTION, slot_for(SESSION_TIME))
+    tokens = Tokens()
+    with h.conn() as c:
+        insert_credential(
+            c,
+            environment=AppEnv.PRODUCTION,
+            provider=OAuthProvider.ROBINHOOD,
+            client_id="client-1",
+            ciphertext=TokenVault(key).encrypt(
+                SecretStr(tokens.old_access), SecretStr(tokens.old_refresh)
+            ),
+            access_expires_at=SESSION_TIME + timedelta(hours=2),
+            obtained_at=SESSION_TIME - timedelta(days=5),
+            source=CredentialSource.SEED,
+        )
+    refresher = Refresher(tokens)
+    assert h.run(oauth_refresher=refresher) == 0
+    assert refresher.calls == [tokens.old_refresh]  # the rotating token stays alive
+    assert h.clis == [] and h.world.upstream_servers == []  # no session, no MCP connection
+    assert h.status() is RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL
+    assert _credential_event(h)["status"] == "refreshed"
+    assert [hb.status.value for hb in notifier.heartbeats] == ["success"]

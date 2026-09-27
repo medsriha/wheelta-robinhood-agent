@@ -143,6 +143,8 @@ class BoundaryValidator:
         default_factory=lambda: VERIFIED_MAPPERS
     )
     id_factory: Callable[[], uuid.UUID] = new_id
+    # Set by the session from its trusted `get_accounts` check; never from tool output.
+    account_eligible: bool = False
 
     def __call__(self, request: ValidationRequest) -> ValidationOutcome:
         if request.server == BUILTIN_SERVER:
@@ -171,6 +173,7 @@ class BoundaryValidator:
                     effective_input=self.redactor.redact_mapping(request.effective_input),
                     payload=redacted,
                     retrieved_at=request.retrieved_at,
+                    account_eligible=self.account_eligible,
                 ),
                 self.id_factory,
             )

@@ -77,7 +77,8 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: SecretStr
     AGENT_MODEL: str = Field(min_length=1)
     MCP_TIMEOUT: PositiveInt = 30000
-    MCP_TOOL_TIMEOUT: PositiveInt = 60000
+    # Must exceed the proxy's 10 s margin (agent/proxy.py PROXY_TIMEOUT_MARGIN_SECONDS, ADR-0023).
+    MCP_TOOL_TIMEOUT: int = Field(default=60000, gt=10000)
 
     ROBINHOOD_MCP_URL: AnyHttpUrl = AnyHttpUrl("https://agent.robinhood.com/mcp/trading")
     # ROBINHOOD_MCP_AUTH=token only. Absent means Robinhood is unavailable (needs-auth).

@@ -38,6 +38,8 @@ from wheelta_robinhood_agent.domain.run_record import Quote
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 
 ACCOUNT_NUMBER = "5550001234"
+OTHER_ACCOUNT_NUMBER = "5550009876"
+OTHER_ACCOUNT_NICKNAME = "OTHER-ACCOUNT-MUST-NOT-PERSIST"
 INSTRUMENT_ID = "inst-aapl-150p"
 OCC = "AAPL  261016P00150000"
 RAW_MARKER = "RAW-UNMAPPED-PAYLOAD-MARKER"
@@ -88,6 +90,33 @@ def build_world(as_of: datetime) -> FakeWorld:
     def empty(key: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
         return lambda args: _text({"as_of": stamp, key: []})
 
+    def accounts(args: dict[str, Any]) -> dict[str, Any]:
+        # The captured get_accounts shape (tests/fixtures/robinhood/results/), with a second,
+        # non-Agentic account that trusted code must drop.
+        base = {
+            "type": "cash",
+            "state": "active",
+            "deactivated": False,
+            "permanently_deactivated": False,
+            "option_level": "option_level_2",
+        }
+        return _text(
+            {
+                "data": {
+                    "accounts": [
+                        {**base, "account_number": ACCOUNT_NUMBER, "agentic_allowed": True},
+                        {
+                            **base,
+                            "account_number": OTHER_ACCOUNT_NUMBER,
+                            "agentic_allowed": False,
+                            "nickname": OTHER_ACCOUNT_NICKNAME,
+                        },
+                    ]
+                },
+                "guide": "prose",
+            }
+        )
+
     def unmapped(args: dict[str, Any]) -> dict[str, Any]:
         return _text({"symbol": "AAPL", "price": "180.00", "note": RAW_MARKER})
 
@@ -97,6 +126,7 @@ def build_world(as_of: datetime) -> FakeWorld:
     return FakeWorld(
         handlers={
             "robinhood": {
+                "get_accounts": accounts,
                 "get_option_chains": chains,
                 "get_option_quotes": quotes,
                 "get_portfolio": portfolio,
@@ -112,6 +142,7 @@ def build_world(as_of: datetime) -> FakeWorld:
                     for t in ROBINHOOD_REGISTRY.tools
                     if t.name
                     not in {
+                        "get_accounts",
                         "get_option_chains",
                         "get_option_quotes",
                         "get_portfolio",

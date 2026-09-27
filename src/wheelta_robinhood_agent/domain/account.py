@@ -117,3 +117,28 @@ class AccountSnapshot(DomainModel):
         if self.quality is DataQuality.OK and self.gaps:
             raise ValueError("a snapshot with gaps cannot have quality 'ok'")
         return self
+
+
+class AgenticEligibility(DomainModel):
+    """Whether the configured account is Robinhood's Agentic account (CLAUDE.md §9, §24).
+
+    Produced by trusted code from the account listing before the session starts; the listing
+    itself never reaches the model or the ledger. `account_ref` is redacted (last four only).
+    `eligible` holds exactly when `reasons` is empty; each reason names a failed condition.
+    `account_type` and `option_level` are recorded as reported, never interpreted.
+    """
+
+    account_ref: NonEmptyStr
+    eligible: bool
+    reasons: tuple[NonEmptyStr, ...] = ()
+    account_type: str | None = None
+    option_level: str | None = None
+    retrieved_at: UtcDatetime
+
+    @model_validator(mode="after")
+    def _check_eligibility(self) -> Self:
+        if _LONG_DIGIT_RUN.search(self.account_ref):
+            raise ValueError("account_ref must be redacted to at most the last four digits")
+        if self.eligible == bool(self.reasons):
+            raise ValueError("eligible must hold exactly when no reason is given")
+        return self

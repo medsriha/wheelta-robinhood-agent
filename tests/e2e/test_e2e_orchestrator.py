@@ -9,16 +9,20 @@ servers and their fixture result mappers (e2e_fakes.py), the clock, and the noti
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
 import pytest
-from e2e_fake_cli import FakeCli, FakeModel, factory
+from e2e_fake_cli import FakeCli, FakeModel, FakeToolFailure, factory, world_upstreams
 from e2e_fakes import (
+    ACCOUNT_NUMBER,
     FIXTURE_MAPPERS,
     FIXTURE_SCOPE_TABLE,
+    OTHER_ACCOUNT_NICKNAME,
+    OTHER_ACCOUNT_NUMBER,
     RAW_MARKER,
     build_world,
     dry_run_script,
@@ -73,6 +77,7 @@ class Harness:
             "notifier": self.notifier,
             "clock": self.clock,
             "transport_factory": factory(self.world, script, self.clis),
+            "upstream_factory": world_upstreams(self.world),
             "install_signals": False,
             "remote_boundary_accepted": True,
             "registries": (VERIFIED_RH, WHEELTA_REGISTRY),
@@ -173,24 +178,102 @@ def test_robinhood_without_token_is_needs_auth_and_no_session(
         assert ledger_evidence.run_records_for_run(c, h.run_id)  # still assembled
 
 
+def test_local_off_mode_still_runs_the_dry_run_session(harness: Callable[..., Harness]) -> None:
+    """ADR-0024: the local-only gate leaves local dry runs untouched."""
+    h = harness()
+    assert h.run() == 0
+    assert len(h.clis) == 1 and h.status() is RunStatus.COMPLETED
+
+
 def test_robinhood_needs_auth_at_connect_sends_no_query(harness: Callable[..., Harness]) -> None:
     h = harness()
     h.world.statuses["robinhood"] = "needs-auth"
     assert h.run() == 1
-    assert len(h.clis) == 1 and h.clis[0].user_messages == []
+    # The proxy's upstream connect is refused before any CLI session is created (ADR-0023).
+    assert h.clis == []
+    statuses = {e["server"]: e["status"] for e in h.events(RunEventType.SOURCE_STATUS)}
+    assert statuses["robinhood"] == "needs-auth"
     assert "robinhood_needs_auth" in h.notifier.alert_kinds()
     assert h.status() is RunStatus.FAILED
 
 
-def test_production_defaults_withhold_every_remote_source(harness: Callable[..., Harness]) -> None:
+def test_production_defaults_proxy_robinhood_and_withhold_unverified_wheelta(
+    harness: Callable[..., Harness],
+) -> None:
+    """Direct delivery is not accepted, so a remote source reaches the model only through the
+    validating proxy (ADR-0023), and only with a verified registry."""
     h = harness()
-    code = h.run(
-        remote_boundary_accepted=False,
-        registries=(ROBINHOOD_REGISTRY, WHEELTA_REGISTRY),
-    )
-    assert code == 1 and h.clis == []
+    h.run(remote_boundary_accepted=False, registries=(ROBINHOOD_REGISTRY, WHEELTA_REGISTRY))
+    assert len(h.clis) == 1
+    (cli,) = h.clis
+    servers = cli.options.mcp_servers
+    assert isinstance(servers, dict)
+    assert {n: c["type"] for n, c in servers.items()} == {"robinhood": "sdk", "wra_local": "sdk"}
     statuses = {e["server"]: e["status"] for e in h.events(RunEventType.SOURCE_STATUS)}
-    assert statuses == {"robinhood": "disabled", "wheelta": "disabled"}
+    assert statuses["robinhood"] == "connected"
+    assert statuses["wheelta"] == "disabled"
+
+
+# -- Agentic-account eligibility (trusted get_accounts check, CLAUDE.md §9) ----------------------
+
+
+def _metadata(h: Harness, key: str) -> list[Any]:
+    return [e[key] for e in h.events(RunEventType.METADATA) if key in e]
+
+
+def test_eligible_account_is_recorded_redacted_and_other_accounts_never_persist(
+    harness: Callable[..., Harness],
+) -> None:
+    h = harness()
+    assert h.run() == 0, h.notifier.alert_kinds()
+    (eligibility,) = _metadata(h, "agentic_eligibility")
+    assert eligibility["eligible"] is True and eligibility["reasons"] == []
+    assert eligibility["account_ref"] == f"****{ACCOUNT_NUMBER[-4:]}"
+    # The listing went through the upstream in trusted code, never through the model.
+    (cli,) = h.clis
+    assert all(t.name != "mcp__robinhood__get_accounts" for t in cli.turns)
+    with h.conn() as c:
+        dump = json.dumps(
+            [
+                c.execute("SELECT payload::text FROM run_events").fetchall(),
+                c.execute("SELECT payload::text FROM results").fetchall(),
+            ]
+        )
+    assert OTHER_ACCOUNT_NUMBER not in dump and OTHER_ACCOUNT_NICKNAME not in dump
+    assert ACCOUNT_NUMBER not in dump
+
+
+def test_ineligible_account_starts_no_session(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    listing = h.world.handlers["robinhood"]["get_accounts"]
+
+    def not_agentic(args: dict[str, Any]) -> dict[str, Any]:
+        response = listing(args)
+        payload = json.loads(response["content"][0]["text"])
+        payload["data"]["accounts"][0]["agentic_allowed"] = False
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    h.world.handlers["robinhood"]["get_accounts"] = not_agentic
+    assert h.run() == 1
+    assert h.clis == []
+    (eligibility,) = _metadata(h, "agentic_eligibility")
+    assert eligibility["eligible"] is False
+    assert eligibility["reasons"] == ["agentic_allowed is false"]
+    statuses = [e for e in h.events(RunEventType.STATUS) if e and "reason" in e]
+    assert statuses[-1]["reason"] == "robinhood_account_not_agentic"
+
+
+def test_failed_eligibility_check_fails_closed(harness: Callable[..., Harness]) -> None:
+    h = harness()
+
+    def broken(args: dict[str, Any]) -> dict[str, Any]:
+        raise FakeToolFailure("transport down")
+
+    h.world.handlers["robinhood"]["get_accounts"] = broken
+    assert h.run() == 1
+    assert h.clis == []
+    assert _metadata(h, "agentic_eligibility") == []
+    assert h.status() is RunStatus.FAILED
 
 
 # -- the dry run ----------------------------------------------------------------------------------

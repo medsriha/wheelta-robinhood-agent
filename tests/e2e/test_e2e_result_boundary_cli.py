@@ -1,11 +1,13 @@
 """Result-boundary acceptance tests against the real Claude Code CLI (DATA_QUALITY.md).
 
-`REMOTE_RESULT_BOUNDARY_ACCEPTED` (agent/session.py) stays False until every test here passes
-against the pinned `claude-agent-sdk` and its bundled CLI. Each test runs a real CLI session
-through our hooks and options (tests/e2e/cli_harness/) against a fake streamable-HTTP MCP
-server and a scripted recording model endpoint, and asserts on the requests the CLI actually
-sent to "the model" (docs/TESTING.md "Result boundary"): a raw payload's sentinel must never
-appear in any model request, and our envelope must be what the model receives.
+`PROXY_RESULT_BOUNDARY_ACCEPTED` (agent/session.py) rests on every test here passing against
+the pinned `claude-agent-sdk` and its bundled CLI (ADR-0023). Each test runs a real CLI session
+through our hooks, options, and the in-process validating proxy (tests/e2e/cli_harness/), with
+a fake streamable-HTTP MCP server as the proxy's upstream and a scripted recording model
+endpoint, and asserts on the requests the CLI actually sent to "the model" (docs/TESTING.md
+"Result boundary"): a raw payload's sentinel must never appear in any model request, and our
+envelope must be what the model receives. Direct delivery (no proxy, ADR-0019) fails five of
+them and is not accepted.
 
 Skipped unless WRA_RUN_REQUIRES_CLI=1 (they spawn the CLI). TCP is allowed to 127.0.0.1 only;
 the CLI's own traffic is confined by `cli_harness.session.local_env` and a blackhole proxy.
@@ -225,24 +227,27 @@ def test_mcp_is_error_result_is_delivered_only_as_an_error_envelope(
     assert statuses(out.recorder, tool_call_id) == [ToolCallStatus.FAILED]
 
 
-def test_transport_failure_reaches_post_tool_use_failure_and_is_recorded(
+def test_transport_failure_is_delivered_only_as_an_error_envelope_and_recorded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A transport error fires PostToolUseFailure; the call has a persisted outcome."""
+    """A transport error upstream: the proxy records a failed outcome and delivers an error
+    envelope whose gap names only the failure class, never the response body."""
     case = Case(
         steps=[ToolUse(QUOTES_TOOL, {"symbols": ["AAPL"]}), FinalText("done")],
         behaviors={QUOTES: TransportFailure()},
     )
     out = run(case, monkeypatch)
     use_id, tool_call_id = only_call(out, QUOTES)
-    assert out.mcp.called(QUOTES) >= 1
+    assert out.mcp.called(QUOTES) == 1  # forwarded once, never retried
     # The 500 body is raw remote output too; it must not be relayed to the model.
     assert_never_sent(out, "upstream exploded")
     outcomes = out.recorder.outcomes_for(tool_call_id)
     assert [o["status"] for o in outcomes] == [ToolCallStatus.FAILED], diagnostics(out)
-    assert outcomes[0]["dedup_key"] == "post_tool_use_failure"
+    assert outcomes[0]["dedup_key"] == "proxy"
     assert outcomes[0]["error_ref"] in out.recorder.results
-    assert tool_result_for(out, use_id) is not None  # the model saw the call end, not hang
+    envelope = delivered_envelope(out, use_id)  # the model saw the call end, not hang
+    assert envelope["kind"] == "error"
+    assert envelope["tool_call_id"] == str(tool_call_id)
 
 
 def test_oversized_result_spilled_to_a_file_is_not_readable_raw(
@@ -280,8 +285,9 @@ def test_hook_exception_interrupts_before_raw_output_reaches_the_model(
     calls = {"n": 0}
 
     def exploding_clock() -> datetime:
-        # PreToolUse reads the clock once; PostToolUse's first statement is the second read,
-        # outside its try block, so the exception escapes the real hook to the SDK.
+        # PreToolUse reads the clock once. Every later read fails: the proxy's (after the
+        # upstream answered) and PostToolUse's first statement, which is outside its try
+        # block, so the exception escapes the real hook to the SDK.
         calls["n"] += 1
         if calls["n"] >= 2:
             raise RuntimeError("harness clock failure")
@@ -293,8 +299,12 @@ def test_hook_exception_interrupts_before_raw_output_reaches_the_model(
         clock=exploding_clock,
     )
     out = run(case, monkeypatch)
-    assert calls["n"] >= 2, diagnostics(out)
+    assert calls["n"] >= 3, diagnostics(out)  # PreToolUse, the proxy, and PostToolUse
     assert_never_sent(out, raw)
+    use_id, _ = only_call(out, QUOTES)
+    # The CLI fell back to the tool output it had: the proxy's static fallback envelope.
+    assert delivered_envelope(out, use_id)["kind"] == "error", diagnostics(out)
+    assert out.run_control.stop_requested
 
 
 def test_hook_timeout_interrupts_before_raw_output_reaches_the_model(
@@ -302,6 +312,30 @@ def test_hook_timeout_interrupts_before_raw_output_reaches_the_model(
 ) -> None:
     """A PostToolUse timeout (HookMatcher.timeout) must not fall back to the raw result."""
     raw = sentinel("hooktimeout")
+    timeout = 3.0
+    case = Case(
+        steps=[ToolUse(QUOTES_TOOL, {"symbols": ["AAPL"]}), FinalText("done")],
+        behaviors={QUOTES: Json({"raw": raw})},
+        # PostToolUse records the delivery; a stalled ledger write there outlasts the timeout.
+        recorder=MemoryRecorder(stall_on={"store_delivered": timeout + 5}),
+        hook_timeout_seconds=timeout,
+    )
+    out = run(case, monkeypatch)
+    assert out.recorder.of("dispatched"), diagnostics(out)
+    assert_never_sent(out, raw)
+    use_id, tool_call_id = only_call(out, QUOTES)
+    # The CLI fell back to the tool output it had, which is the proxy's envelope.
+    envelope = delivered_envelope(out, use_id)
+    assert envelope["tool_call_id"] == str(tool_call_id), diagnostics(out)
+    assert envelope["kind"] == "missing"
+
+
+def test_stalled_validation_in_the_proxy_never_exposes_the_raw_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation stalls inside the proxy (past the hook timeout): the CLI holds no raw
+    result at any point, so nothing raw can reach the model."""
+    raw = sentinel("stalledvalidation")
     inner = BoundaryValidator(redactor=Redactor())
     timeout = 3.0
 
@@ -431,16 +465,42 @@ def test_process_interruption_leaves_every_requested_call_with_an_outcome(
 def test_init_message_and_mcp_status_shapes_match_the_parsers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The init `mcp_servers` list and `get_mcp_status` tool names match observe_statuses."""
-    case = Case(steps=[FinalText("done")], behaviors={})
+    """The init `mcp_servers` list and `get_mcp_status` tool names match observe_statuses.
+
+    In-process servers (the proxy) are absent from `get_mcp_status` until the first query, so
+    the status is read while a tool call is in flight; before the query it lists nothing.
+    """
+    slow = Slow(seconds=3, then=Json({"x": 1}))
+    mid: dict[str, Any] = {}
+
+    async def read_status_mid_call(client: ClaudeSDKClient, out: SessionOutcome) -> None:
+        with anyio.fail_after(30):
+            while not slow.started.is_set():
+                await anyio.sleep(0.05)
+        mid.update(await client.get_mcp_status())
+
+    case = Case(
+        steps=[ToolUse(QUOTES_TOOL, {"symbols": ["AAPL"]}), FinalText("done")],
+        behaviors={QUOTES: slow},
+        during=read_status_mid_call,
+    )
     out = run(case, monkeypatch)
-    assert out.mcp_status is not None, diagnostics(out)
-    observations = observe_statuses(out.mcp_status, [ROBINHOOD_REGISTRY], [SERVER], utc_now())
+    assert out.mcp_status == {"mcpServers": []}, out.mcp_status  # before the first query
+    assert mid, diagnostics(out)
+    observations = observe_statuses(mid, [ROBINHOOD_REGISTRY], [SERVER], utc_now())
     assert len(observations) == 1
     obs = observations[0]
     assert obs.status is SourceStatus.CONNECTED, obs
-    assert obs.discovery is not None and obs.discovery.ok, obs.discovery
-    assert obs.available
+    access = build_tool_access(
+        effective_mode=ExecutionMode.OFF, workspace_writes=False, registries=(ROBINHOOD_REGISTRY,)
+    )
+    # The proxy serves only this run's allowed tools (in-process servers are shown to the
+    # model regardless of disallowed_tools), so the status list lacks every disallowed one.
+    # Discovery for proxied servers uses the upstream's full list instead (agent/session.py).
+    assert obs.discovery is not None and not obs.discovery.unknown, obs.discovery
+    disallowed = {n.removeprefix("mcp__robinhood__") for n in access.disallowed_tools}
+    assert obs.discovery.missing <= disallowed, obs.discovery
+    assert "place_option_order" in obs.discovery.missing
     init = out.init_message()
     assert init is not None, diagnostics(out)
     servers = init.data.get("mcp_servers")
@@ -450,9 +510,6 @@ def test_init_message_and_mcp_status_shapes_match_the_parsers(
     tools = init.data.get("tools")
     assert isinstance(tools, list)
     # The init list is what the model can see: exactly the allowlisted tools (layers 1-2), so
-    # every disallowed tool, order tools included, is absent although the server lists it.
-    access = build_tool_access(
-        effective_mode=ExecutionMode.OFF, workspace_writes=False, registries=(ROBINHOOD_REGISTRY,)
-    )
+    # every disallowed tool, order tools included, is absent although the upstream lists it.
     assert set(tools) == set(access.allowed_tools), set(tools) ^ set(access.allowed_tools)
     assert not set(tools) & set(access.disallowed_tools)

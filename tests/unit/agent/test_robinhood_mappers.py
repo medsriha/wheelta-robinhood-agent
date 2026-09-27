@@ -311,6 +311,18 @@ def test_portfolio_fixture_keeps_unverified_cash_as_gaps() -> None:
     _check_provenance(out, CALL)
 
 
+def test_portfolio_is_agentic_verified_only_after_the_trusted_check() -> None:
+    """`account_eligible` comes from the session's get_accounts check, never the payload."""
+    data = _data("get_portfolio.empty_account.json")
+    request = _request("get_portfolio", _wrapped(data), account_number="****1234")
+    out = map_portfolio(request.model_copy(update={"account_eligible": True}), _ids())
+    (snap,) = out.account_snapshots
+    assert snap.agentic_verified is True
+    assert "agentic_verified" not in {g.field for g in snap.gaps}
+    assert snap.quality is DataQuality.MISSING  # cash fields are still unverified
+    assert len(out.gaps) == 3
+
+
 def test_portfolio_does_not_use_buying_power_as_cash() -> None:
     data = _data("get_portfolio.empty_account.json")
     data["buying_power"]["buying_power"] = "5000.0000"

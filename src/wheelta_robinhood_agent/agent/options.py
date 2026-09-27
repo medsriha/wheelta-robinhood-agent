@@ -6,9 +6,11 @@ Pure: builds configuration only, no I/O. The session:
   `bypassPermissions` (it ignores `allowed_tools`);
 - has built-ins restricted to WebSearch/WebFetch through `tools`;
 - loads no filesystem settings or CLAUDE.md (`setting_sources=[]`) and only the MCP servers
-  given here (`strict_mcp_config=True`): remote HTTP servers plus, optionally, in-process SDK
-  servers named in `LOCAL_SDK_SERVER_NAMES` (`wra_local`: web_cache_lookup and
-  get_decision_facts). No other server type (stdio, SSE) is ever configured;
+  given here (`strict_mcp_config=True`): remote HTTP servers (direct delivery, ADR-0019 local
+  dry runs only) plus in-process SDK servers named in `LOCAL_SDK_SERVER_NAMES` (`wra_local`:
+  web_cache_lookup and get_decision_facts) or `PROXY_SDK_SERVER_NAMES` (the validating proxy
+  for `robinhood` and `wheelta`, ADR-0023). No other server type (stdio, SSE) is ever
+  configured;
 - runs in an explicit scratch directory;
 - uses the pinned model (`Settings.AGENT_MODEL`) and the given hooks (layer 3).
 
@@ -34,11 +36,15 @@ from wheelta_robinhood_agent.agent.tool_access import (
     ToolAccess,
 )
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
+from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
 from wheelta_robinhood_agent.integrations.status import McpHttpServer
+from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
 
 PERMISSION_MODE: Final[Literal["dontAsk"]] = "dontAsk"
 # The only in-process SDK MCP servers a session may carry. Their tools are local Tier R code.
 LOCAL_SDK_SERVER_NAMES: Final = frozenset({LOCAL_SERVER_NAME})
+# In-process validating proxies (agent/proxy.py) for the remote sources, under their own names.
+PROXY_SDK_SERVER_NAMES: Final = frozenset({ROBINHOOD, WHEELTA})
 _REQUIRED_HOOK_EVENTS: tuple[HookEvent, ...] = ("PreToolUse", "PostToolUse", "PostToolUseFailure")
 
 
@@ -74,8 +80,9 @@ def build_agent_options(
     """Assemble the session options. Raises `AgentOptionsError` on any unsafe input.
 
     `max_budget_usd` is a Decimal in our code and converted to the SDK's float only here.
-    `sdk_servers` maps a name in `LOCAL_SDK_SERVER_NAMES` to its `create_sdk_mcp_server`
-    config; the name must match the config's own name and no HTTP server may share it.
+    `sdk_servers` maps a name in `LOCAL_SDK_SERVER_NAMES` or `PROXY_SDK_SERVER_NAMES` to its
+    in-process server config; the name must match the config's own name and no HTTP server
+    may share it.
     """
     if not model.strip():
         raise AgentOptionsError("model must be pinned")
@@ -148,15 +155,17 @@ def assert_safe_options(options: ClaudeAgentOptions) -> None:
 
 
 def _check_server(name: str, config: McpServerConfig) -> None:
-    """Only remote HTTP servers and the named local SDK servers; nothing that spawns a process."""
+    """Only remote HTTP servers and the named in-process SDK servers; nothing that spawns a
+    process."""
     kind = config.get("type")
     if kind == "http":
         if not isinstance(config.get("url"), str):
             raise AgentOptionsError(f"HTTP server {name!r} has no URL")
         return
     if kind == "sdk":
-        if name not in LOCAL_SDK_SERVER_NAMES or config.get("name") != name:
-            raise AgentOptionsError(f"SDK server {name!r} is not an allowed local server")
+        allowed = LOCAL_SDK_SERVER_NAMES | PROXY_SDK_SERVER_NAMES
+        if name not in allowed or config.get("name") != name:
+            raise AgentOptionsError(f"SDK server {name!r} is not an allowed in-process server")
         if config.get("instance") is None:
             raise AgentOptionsError(f"SDK server {name!r} has no instance")
         return

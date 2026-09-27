@@ -4,7 +4,12 @@ Real: `claude-agent-sdk` 0.2.160 with its bundled CLI, `ClaudeSDKClient`, our `b
 (tool access layer 3, recording, result boundary), `build_agent_options` (strict MCP config,
 `setting_sources=[]`, dontAsk, WebSearch/WebFetch only), `BoundaryValidator`, the Robinhood
 registry and account-scope table, and `RunControl`. Doubles: the recorder (in memory, can be
-told to fail), optionally the validator/clock, the model endpoint and the MCP server.
+told to fail or stall), optionally the validator/clock, the model endpoint and the MCP server.
+
+By default (`Case.proxied`) the session is wired as production wires it (ADR-0023): the CLI
+sees the in-process validating proxy (`agent/proxy.py`) under the server name `robinhood`,
+and the proxy forwards to the fake MCP server through `integrations/mcp_upstream.py`.
+`proxied=False` connects the CLI to the fake server directly (the ADR-0019 local path).
 
 Traffic stays on 127.0.0.1: the model endpoint is `ANTHROPIC_BASE_URL`, the MCP server URL is
 local, and every proxy variable points at `BlackholeProxy` (NO_PROXY exempts 127.0.0.1), so a
@@ -31,6 +36,7 @@ from typing import Any
 
 import anyio
 from claude_agent_sdk import ClaudeSDKClient, Message, ResultMessage, SystemMessage
+from claude_agent_sdk.types import McpSdkServerConfig
 from pydantic import JsonValue, SecretStr
 
 from cli_harness.mcp_server import Behavior, FakeMcpServer
@@ -44,12 +50,19 @@ from wheelta_robinhood_agent.agent.hooks import (
     build_hooks,
 )
 from wheelta_robinhood_agent.agent.options import build_agent_options
+from wheelta_robinhood_agent.agent.proxy import (
+    ValidatingProxy,
+    build_proxy_server,
+    upstream_timeout_seconds,
+)
+from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import ResultKind
 from wheelta_robinhood_agent.agent.result_boundary import BoundaryValidator, EvidenceMapper
 from wheelta_robinhood_agent.agent.run_control import RunControl
 from wheelta_robinhood_agent.agent.tool_access import build_tool_access
 from wheelta_robinhood_agent.config.rules import load_rules
 from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolCallStatus
+from wheelta_robinhood_agent.integrations.mcp_upstream import open_http_upstream
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 from wheelta_robinhood_agent.integrations.status import McpHttpServer
 from wheelta_robinhood_agent.observability.redaction import Redactor
@@ -118,15 +131,23 @@ def local_env(model_url: str, proxy_url: str, config_dir: str) -> dict[str, str]
 
 
 class MemoryRecorder:
-    """`ToolEventRecorder` in memory. `fail_on` names methods (or `store_<kind>`) that raise."""
+    """`ToolEventRecorder` in memory. `fail_on` names methods (or `store_<kind>`) that raise;
+    `stall_on` maps names to seconds of blocking sleep (a stalled ledger write)."""
 
-    def __init__(self, fail_on: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        fail_on: frozenset[str] = frozenset(),
+        stall_on: Mapping[str, float] | None = None,
+    ) -> None:
         self.fail_on = fail_on
+        self.stall_on = dict(stall_on or {})
         self.events: list[tuple[str, dict[str, Any]]] = []
         self.results: dict[uuid.UUID, tuple[uuid.UUID, ResultKind, JsonValue]] = {}
         self.ids: dict[str, uuid.UUID] = {}
 
     def _log(self, name: str, **kwargs: Any) -> None:
+        if name in self.stall_on:
+            time.sleep(self.stall_on[name])
         if name in self.fail_on:
             raise RuntimeError(f"harness ledger failure in {name}")
         self.events.append((name, kwargs))
@@ -226,6 +247,8 @@ class Case:
     hook_timeout_seconds: float = 30.0
     mcp_tool_timeout_ms: int = 60_000
     session_seconds: float = 60.0
+    # Production wiring through the validating proxy (module docstring).
+    proxied: bool = True
     # Parent of the session's scratch and CLI config dirs (known before the run starts).
     root: Path = field(default_factory=lambda: Path(tempfile.mkdtemp(prefix="wra-cli-harness-")))
     # Runs alongside the conversation (e.g. a SIGTERM stand-in); gets the client and the case.
@@ -361,14 +384,53 @@ async def _session(case: Case, outcome: SessionOutcome, model_url: str, mcp_url:
         registries=(ROBINHOOD_REGISTRY,),
         hook_timeout_seconds=case.hook_timeout_seconds,
     )
+    upstream_server = McpHttpServer(
+        name=SERVER, url=f"{mcp_url}/mcp", token=SecretStr("harness-token")
+    )
+    if not case.proxied:
+        await _converse(case, outcome, model_url, deps, [upstream_server], {})
+        return
+    dispatch = ProxyDispatch(frozenset({SERVER}))
+    deps = dataclasses.replace(deps, proxy_dispatch=dispatch)
+    async with open_http_upstream(upstream_server, connect_timeout_seconds=15) as upstream:
+        proxy = ValidatingProxy(
+            server=SERVER,
+            upstream=upstream,
+            dispatch=dispatch,
+            recorder=case.recorder,
+            validator=deps.validator,
+            run_control=outcome.run_control,
+            clock=case.clock,
+            upstream_timeout_seconds=upstream_timeout_seconds(case.mcp_tool_timeout_ms),
+        )
+        allowed = build_tool_access(
+            effective_mode=ExecutionMode.OFF,
+            workspace_writes=False,
+            registries=(ROBINHOOD_REGISTRY,),
+        ).allowed_tools
+        server = McpSdkServerConfig(
+            type="sdk",
+            name=SERVER,
+            instance=build_proxy_server(proxy, ROBINHOOD_REGISTRY, allowed),
+        )
+        await _converse(case, outcome, model_url, deps, [], {SERVER: server})
+
+
+async def _converse(
+    case: Case,
+    outcome: SessionOutcome,
+    model_url: str,
+    deps: HookDeps,
+    http_servers: list[McpHttpServer],
+    sdk_servers: dict[str, McpSdkServerConfig],
+) -> None:
     access = build_tool_access(
         effective_mode=ExecutionMode.OFF, workspace_writes=False, registries=(ROBINHOOD_REGISTRY,)
     )
     options = build_agent_options(
         tool_access=access,
-        mcp_servers=[
-            McpHttpServer(name=SERVER, url=f"{mcp_url}/mcp", token=SecretStr("harness-token"))
-        ],
+        mcp_servers=http_servers,
+        sdk_servers=sdk_servers,
         hooks=build_hooks(deps),
         system_prompt=_system_prompt(),
         model=MODEL,

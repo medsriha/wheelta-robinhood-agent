@@ -4,7 +4,9 @@ boot (settings, rules, prompt; fail fast) → logging → slot/run_id → ledger
 single-flight lock (`skipped_concurrent`) → run slot (completed → no-op; interrupted →
 reconcile and finalize without a new session) → preflight (kill switch, NYSE session) →
 Robinhood credential (refresh_token mode only: load, refresh near expiry, persist before use;
-ADR-0021) → session plan (effective mode capped at off; no order tool can be exposed) → prompt v6 →
+ADR-0021) → session plan (effective mode capped at off; no order tool can be exposed) → dry
+runs are local only (ADR-0024: outside APP_ENV=local an off-mode run ends
+`skipped_dry_run_not_local` here, after the credential and its alerts) → prompt v6 →
 agent session → `assemble_run_record` → position notes (ADR-0018) → `run_audit` → persist →
 alerts/heartbeat → exit code.
 
@@ -12,9 +14,10 @@ Contains no trading logic. Everything the run decides is recorded as run events.
 `python -m wheelta_robinhood_agent.orchestrator` calls `main()`.
 
 `OrchestratorDeps` carries the injectable boundaries (clock, database connect, calendar,
-notifier, SDK transport). Its remaining fields (`remote_boundary_accepted`, `registries`,
-`mappers`, `account_scope_table`) are test seams for fake servers; `main()` always uses the
-production values, which withhold every unverified remote tool.
+notifier, SDK transport). Its remaining fields (`remote_boundary_accepted`,
+`upstream_factory`, `registries`, `mappers`, `account_scope_table`) are test seams for fake
+servers; `main()` always uses the production values, which withhold every unverified remote
+tool and deliver remote results only through the validating proxy (ADR-0023).
 """
 
 import contextlib
@@ -59,6 +62,7 @@ from wheelta_robinhood_agent.agent.session import (
     SessionResult,
     SessionStatus,
     TransportFactory,
+    UpstreamFactory,
     available_tools_table,
     plan_session,
     run_session_sync,
@@ -81,6 +85,7 @@ from wheelta_robinhood_agent.config.settings import (
 from wheelta_robinhood_agent.domain.assembly import DecisionsInput, assemble_run_record
 from wheelta_robinhood_agent.domain.decision_output import DecisionOutputParsed
 from wheelta_robinhood_agent.domain.enums import (
+    AppEnv,
     AuditOutcome,
     ExecutionMode,
     RunStatus,
@@ -226,6 +231,7 @@ class OrchestratorDeps:
     scratch_root: Path | None = None
     # Test seams (module docstring): production always uses the defaults.
     remote_boundary_accepted: bool = REMOTE_RESULT_BOUNDARY_ACCEPTED
+    upstream_factory: UpstreamFactory | None = None
     registries: tuple[ToolRegistry, ToolRegistry] = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
     mappers: Mapping[tuple[str, str], EvidenceMapper] = field(
         default_factory=lambda: VERIFIED_MAPPERS
@@ -574,6 +580,10 @@ class _Run:
         )
         return rendered
 
+    def dry_run_outside_local(self, effective_mode: ExecutionMode) -> bool:
+        """ADR-0024: a dry run (effective mode off) never starts a session outside local."""
+        return effective_mode is ExecutionMode.OFF and self.settings.APP_ENV is not AppEnv.LOCAL
+
     def _deadline_check(self) -> None:
         trip_if_deadline_passed(self.control, self.deadline, self.deps.clock)
 
@@ -605,6 +615,12 @@ class _Run:
                     message,
                     {"credential": credential.event_payload()} if credential else None,
                 )
+        if plan.may_start and self.dry_run_outside_local(effective_mode):
+            self.log.info(
+                "dry runs run locally only; no session outside APP_ENV=local",
+                extra={"app_env": self.settings.APP_ENV.value},
+            )
+            return self.finalize(RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL, "dry_run_local_only")
         book = ledger_positions.position_book(self.conn, self.scope_id, as_of=self.deps.clock())
         session: SessionResult | None = None
         prompt: RenderedPrompt | None = None
@@ -638,6 +654,7 @@ class _Run:
             session_budget_seconds=self._session_budget,
             deadline_check=self._deadline_check,
             transport_factory=self.deps.transport_factory,
+            upstream_factory=self.deps.upstream_factory,
             mappers=self.deps.mappers,
             account_scope_table=self.deps.account_scope_table,
             interrupt_grace_seconds=self.deps.interrupt_grace_seconds or INTERRUPT_GRACE_SECONDS,
@@ -660,6 +677,18 @@ class _Run:
     ) -> int:
         if session is not None:
             self.observe_sources(session.observations[len(plan.observations) :])
+            if session.eligibility is not None:
+                # Only the configured account's redacted eligibility is persisted (§9, §24).
+                self.event(
+                    RunEventType.METADATA,
+                    {"agentic_eligibility": session.eligibility.model_dump(mode="json")},
+                )
+                if not session.eligibility.eligible:
+                    unavailable_reason = unavailable_reason or "robinhood_account_not_agentic"
+                    self.log.error(
+                        "configured Robinhood account is not Agentic-eligible; no session",
+                        extra={"reasons": list(session.eligibility.reasons)},
+                    )
             if session.tool_drift:
                 self.alert(
                     AlertKind.TOOL_DRIFT,

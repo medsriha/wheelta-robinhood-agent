@@ -410,11 +410,11 @@ _PORTFOLIO_GAPS: Final = (
         "csp_cash_base_usd",
         "requires available_settled_cash_usd and csp_reserved_cash_usd",
     ),
-    (
-        "agentic_verified",
-        "get_portfolio does not report Agentic eligibility; the hook verifies only the "
-        "account number",
-    ),
+)
+_ELIGIBILITY_GAP: Final = (
+    "agentic_verified",
+    "Agentic eligibility was not verified this run (the trusted get_accounts check did not "
+    "run or did not pass); get_portfolio does not report it",
 )
 
 
@@ -427,23 +427,24 @@ def map_portfolio(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> M
     unsettled funds, but whether it nets reservations is unverified, and `AccountSnapshot`
     has no buying-power field, so it is only schema-checked. `available_settled_cash_usd`,
     `csp_reserved_cash_usd`, and `csp_cash_base_usd` stay None with named gaps. The response
-    proves no Agentic eligibility, so `agentic_verified` is False and the snapshot quality is
-    `missing`. The payload has no timestamp: `as_of` is `retrieved_at`.
+    proves no Agentic eligibility: `agentic_verified` is True only when this run's trusted
+    `get_accounts` check passed (`request.account_eligible`), else False with a gap. The
+    snapshot quality stays `missing` while any cash field is missing. The payload has no
+    timestamp: `as_of` is `retrieved_at`.
     """
     parsed = _Portfolio.model_validate(_unwrap(request.payload))
     account_ref = request.effective_input.get("account_number")
     if not isinstance(account_ref, str) or not account_ref:
         raise ValueError("get_portfolio needs the account_number argument")
-    gaps = tuple(
-        Gap(field=name, kind=DataQuality.MISSING, detail=detail) for name, detail in _PORTFOLIO_GAPS
-    )
+    named = _PORTFOLIO_GAPS if request.account_eligible else (*_PORTFOLIO_GAPS, _ELIGIBILITY_GAP)
+    gaps = tuple(Gap(field=name, kind=DataQuality.MISSING, detail=detail) for name, detail in named)
     snapshot = AccountSnapshot(
         snapshot_id=new_id(),
         as_of=request.retrieved_at,
         retrieved_at=request.retrieved_at,
         tool_call_ids=(request.tool_call_id,),
         account_ref=account_ref,
-        agentic_verified=False,
+        agentic_verified=request.account_eligible,
         account_value_usd=parsed.total_value,
         available_settled_cash_usd=None,
         csp_reserved_cash_usd=None,

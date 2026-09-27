@@ -15,6 +15,12 @@ CLAUDE.md §8 (three-layer tool access), §9 (Tier S rules), §14, §18, §24; d
   replaces the model-visible output (`updatedToolOutput`) with the persisted envelope.
 - `PostToolUseFailure` records the failure. Tier S/X failures are `unknown`, never retried.
 
+Proxied servers (ADR-0023, agent/proxy.py): PreToolUse also registers the dispatched call in
+`proxy_dispatch`; the proxy validates and records the result before the CLI sees it, so
+PostToolUse only records the delivery of the proxy's envelope (and stops the session if the
+CLI reports anything else), and PostToolUseFailure adds no outcome for a call the proxy
+already handled.
+
 Any recording, lookup, or validation failure sets the stop latch, denies or replaces the
 output with an error envelope, and returns `continue_=False`. Raw tool output is never
 passed through for an MCP tool. SDK keys verified against claude-agent-sdk 0.2.160
@@ -48,6 +54,13 @@ from wheelta_robinhood_agent.agent.account_scope import (
     AccountScopeSpec,
     account_scope_for,
     check_account_scope,
+)
+from wheelta_robinhood_agent.agent.proxy_dispatch import (
+    CallState,
+    ProxyCall,
+    ProxyDispatch,
+    delivered_matches,
+    delivered_payload,
 )
 from wheelta_robinhood_agent.agent.recorder import ResultKind, ToolEventRecorder
 from wheelta_robinhood_agent.agent.run_control import RunControl
@@ -267,6 +280,8 @@ class HookDeps:
     # Servers withheld this run (not connected, discovery failed, unverified, or result
     # boundary not accepted): every call to them is denied. Add-only (agent/withholding.py).
     withheld: ServerWithholding | None = None
+    # Servers served through the validating proxy (ADR-0023) and the call handoff to it.
+    proxy_dispatch: ProxyDispatch | None = None
 
     @classmethod
     def from_settings(
@@ -484,6 +499,11 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             return tier, updated, tuple(appended)
         return tier, tool_input, ()
 
+    def proxied(server: str, builtin: bool) -> bool:
+        return (
+            not builtin and deps.proxy_dispatch is not None and deps.proxy_dispatch.proxied(server)
+        )
+
     def deny(reason: str) -> SyncHookJSONOutput:
         return SyncHookJSONOutput(
             hookSpecificOutput=PreToolUseHookSpecificOutput(
@@ -555,6 +575,27 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         except Exception as exc:
             return deny_and_stop(f"recording failed ({type(exc).__name__})", now)
+        if proxied(resolved.server, resolved.builtin):
+            try:
+                cast(ProxyDispatch, deps.proxy_dispatch).register(
+                    use_id,
+                    ProxyCall(
+                        tool_call_id=tool_call_id,
+                        server=resolved.server,
+                        tool=resolved.tool,
+                        tier=tier,
+                        effective_input=effective,
+                    ),
+                )
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    deps.recorder.outcome(
+                        tool_call_id,
+                        ToolCallStatus.FAILED,
+                        observed_at=now,
+                        reason="proxy registration failed",
+                    )
+                return deny_and_stop(f"proxy registration failed ({type(exc).__name__})", now)
         calls[use_id] = _Call(
             tool_call_id=tool_call_id,
             server=resolved.server,
@@ -618,6 +659,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                     ),
                 ),
             )
+        if proxied(call.server, call.builtin):
+            return proxied_post(call, cast(str, use_id), data.get("tool_response"), now)
         try:
             outcome = deps.validator(
                 ValidationRequest(
@@ -729,6 +772,66 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             out["stopReason"] = "built-in tool result failed validation and cannot be replaced"
         return out
 
+    def proxied_post(
+        call: _Call, use_id: str, tool_response: object, now: datetime
+    ) -> SyncHookJSONOutput:
+        """Record delivery of the proxy's envelope; the proxy already validated and recorded
+        the result. Anything but that exact envelope stops the session and is replaced."""
+        dispatch = cast(ProxyDispatch, deps.proxy_dispatch)
+        delivered = dispatch.delivered(use_id)
+        context_text = filters_context(call)
+        try:
+            if delivered is None or not delivered_matches(tool_response, delivered):
+                raise ValueError("the CLI reported a result the proxy did not produce")
+            ref = deps.recorder.store_result(
+                call.tool_call_id,
+                ResultKind.DELIVERED,
+                {
+                    # The model saw our envelope, never the raw result: the proxy replaced it
+                    # before the CLI received anything (run_loader reads only replaced rows).
+                    "replaced": True,
+                    "delivery": "proxy",
+                    "tool_output": delivered_payload(delivered),
+                    "wire_format": "mcp_text_block_json",
+                    "additional_context": context_text,
+                },
+            )
+            deps.recorder.delivered(call.tool_call_id, delivered_result_ref=ref, observed_at=now)
+        except Exception as exc:
+            stop(now)
+            reason = f"proxied delivery check or recording failed ({type(exc).__name__})"
+            if delivered is None:
+                # The proxy never answered, so no outcome exists yet.
+                with contextlib.suppress(Exception):
+                    deps.recorder.outcome(
+                        call.tool_call_id,
+                        unresolved_status(call.tier),
+                        observed_at=now,
+                        dedup_key=_RESULT_DEDUP_KEY,
+                        reason=reason,
+                    )
+            return SyncHookJSONOutput(
+                continue_=False,
+                stopReason=reason,
+                hookSpecificOutput=PostToolUseHookSpecificOutput(
+                    hookEventName="PostToolUse",
+                    updatedToolOutput=delivered
+                    or mcp_tool_output(error_envelope(call, call.server, call.tool, reason, now)),
+                ),
+            )
+        specific = PostToolUseHookSpecificOutput(
+            hookEventName="PostToolUse", updatedToolOutput=delivered
+        )
+        if context_text is not None:
+            specific["additionalContext"] = context_text
+        out = SyncHookJSONOutput(hookSpecificOutput=specific)
+        if deps.run_control.stop_requested:
+            # The proxy cannot end the session itself (e.g. after its own recording failure);
+            # the latch it set ends the session here.
+            out["continue_"] = False
+            out["stopReason"] = "run stop requested"
+        return out
+
     async def post_tool_use_failure(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
@@ -744,12 +847,23 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         status = unresolved_status(call.tier)
         error_text = deps.redactor.redact_text(str(data.get("error", "")))
         interrupted = data.get("is_interrupt") is True
+        # A proxied call the proxy already claimed has (or will get) the proxy's outcome; a
+        # second one would contradict it. An unclaimed call never reached the server.
+        proxy_state = (
+            cast(ProxyDispatch, deps.proxy_dispatch).state(use_id)
+            if proxied(call.server, call.builtin) and isinstance(use_id, str)
+            else None
+        )
+        if proxy_state is CallState.PENDING:
+            status = ToolCallStatus.FAILED
         try:
             error_ref = deps.recorder.store_result(
                 call.tool_call_id,
                 ResultKind.ERROR,
                 {"error": error_text, "is_interrupt": interrupted},
             )
+            if proxy_state in (CallState.CLAIMED, CallState.COMPLETED):
+                return SyncHookJSONOutput()
             deps.recorder.outcome(
                 call.tool_call_id,
                 status,
