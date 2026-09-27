@@ -87,7 +87,12 @@ from wheelta_robinhood_agent.domain.decision_output import (
     DecisionOutputParseResult,
     parse_agent_decision_output,
 )
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, SourceStatus, ToolTier
+from wheelta_robinhood_agent.domain.enums import (
+    ExecutionMode,
+    SourceStatus,
+    ToolCallStatus,
+    ToolTier,
+)
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     SERVER_NAME as ROBINHOOD,
@@ -98,6 +103,7 @@ from wheelta_robinhood_agent.integrations.status import (
     observe_server,
 )
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
+from wheelta_robinhood_agent.ledger import tool_calls as ledger_tool_calls
 from wheelta_robinhood_agent.observability.metrics import RunMetrics
 from wheelta_robinhood_agent.observability.redaction import Redactor
 
@@ -646,8 +652,36 @@ async def run_agent_session(deps: SessionDeps) -> SessionResult:
         with contextlib.suppress(Exception), anyio.move_on_after(DISCONNECT_TIMEOUT_SECONDS):
             await client.disconnect()
     if result.status is not SessionStatus.NOT_STARTED:
+        close_unresolved_calls(deps)
         persist_output(deps, result)
     return result
+
+
+SESSION_ENDED_DEDUP_KEY = "session_ended_without_outcome"
+
+
+def close_unresolved_calls(deps: SessionDeps) -> int:
+    """Record `unknown` for every call dispatched but never resolved when the session ended.
+
+    The real CLI fires no PostToolUseFailure for a call in flight at interrupt (real-CLI
+    acceptance test 10, DATA_QUALITY.md), so the outcome is recorded here rather than waiting
+    for a later recovery. `unknown` is exact: nothing reported what happened, so a financial
+    action is never inferred to have failed (INTERFACES.md). Returns the number closed.
+    """
+    closed = 0
+    for record in ledger_tool_calls.tool_call_records(deps.conn, deps.run_id):
+        if record.dispatched_at is None or record.status is not ToolCallStatus.REQUESTED:
+            continue
+        ledger_tool_calls.append_tool_call_outcome(
+            deps.conn,
+            record.identity.tool_call_id,
+            ToolCallStatus.UNKNOWN,
+            observed_at=deps.clock(),
+            dedup_key=SESSION_ENDED_DEDUP_KEY,
+            reason="session ended before an outcome was reported",
+        )
+        closed += 1
+    return closed
 
 
 def run_session_sync(deps: SessionDeps) -> SessionResult:

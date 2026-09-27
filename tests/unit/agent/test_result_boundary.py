@@ -188,3 +188,22 @@ def test_parse_request_accepts_refs_and_discretionary_inputs() -> None:
 def test_parse_request_rejects_model_supplied_facts_and_bad_inputs(args: Any) -> None:
     with pytest.raises(FactsRequestError):
         parse_request(args)
+
+
+def test_raw_invalid_evidence_drops_account_numbers_inside_text_blocks() -> None:
+    import json as _json
+
+    from wheelta_robinhood_agent.agent.result_boundary import (
+        _drop_account_values,
+        _expand_text_json,
+    )
+
+    other = "987654321"
+    raw = [{"type": "text", "text": _json.dumps({"accounts": [{"account_number": other}]})}]
+    expanded = _expand_text_json(raw)
+    assert _json.dumps(expanded).count(other) == 1  # visible to redaction now
+    cleaned = _drop_account_values(expanded)  # type: ignore[arg-type]
+    assert other not in _json.dumps(cleaned)
+    assert _expand_text_json([{"type": "text", "text": "not json"}]) == [
+        {"type": "text", "text": "not json"}
+    ]

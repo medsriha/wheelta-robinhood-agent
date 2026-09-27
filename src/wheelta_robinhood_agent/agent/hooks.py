@@ -676,10 +676,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             context_text = filters_context(call)
             # Built-in outputs must match the tool's own schema, so a replacement would be
             # rejected (types.py PostToolUseHookSpecificOutput); they are recorded, not replaced.
-            delivered_output = (
-                deps.redactor.redact(data.get("tool_response"))
-                if call.builtin
-                else mcp_tool_output(payload)
+            delivered_output = cast(
+                JsonValue,
+                deps.redactor.redact(data.get("tool_response")) if call.builtin else payload,
             )
             delivered_ref = deps.recorder.store_result(
                 call.tool_call_id,
@@ -687,6 +686,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 {
                     "replaced": not call.builtin,
                     "tool_output": delivered_output,
+                    # The envelope reaches the CLI as mcp_tool_output(envelope): one text block
+                    # holding its sorted-key JSON. Deterministic, so the envelope is the record.
+                    "wire_format": None if call.builtin else "mcp_text_block_json",
                     "additional_context": context_text,
                 },
             )
@@ -717,7 +719,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         specific = PostToolUseHookSpecificOutput(hookEventName="PostToolUse")
         if not call.builtin:
-            specific["updatedToolOutput"] = delivered_output
+            specific["updatedToolOutput"] = mcp_tool_output(payload)
         if context_text is not None:
             specific["additionalContext"] = context_text
         out = SyncHookJSONOutput(hookSpecificOutput=specific)

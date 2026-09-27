@@ -64,6 +64,19 @@ class ToolTurn:
         return self.output.get("data") if isinstance(self.output, dict) else None
 
 
+def _decode_mcp_output(output: Any) -> Any:
+    """MCP replacement output is a text-block list holding the envelope JSON (what the real
+    CLI requires, DATA_QUALITY.md acceptance test 1); decode it to the envelope the model reads."""
+    if (
+        isinstance(output, list)
+        and len(output) == 1
+        and isinstance(output[0], dict)
+        and output[0].get("type") == "text"
+    ):
+        return json.loads(output[0]["text"])
+    return output
+
+
 Script = Callable[["FakeModel"], Awaitable[str | None]]
 
 
@@ -319,7 +332,7 @@ class FakeCli(Transport):
         for out in await self._hook("PostToolUse", name, {**base, "tool_response": response}):
             specific = out.get("hookSpecificOutput") or {}
             if "updatedToolOutput" in specific:
-                visible = specific["updatedToolOutput"]
+                visible = _decode_mcp_output(specific["updatedToolOutput"])
             context = specific.get("additionalContext") or context
             stop = stop or out.get("continue") is False
         return self._deliver(ToolTurn(name, False, output=visible, context=context), stop=stop)

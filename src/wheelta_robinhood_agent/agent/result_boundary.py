@@ -54,7 +54,7 @@ from wheelta_robinhood_agent.domain.facts_compute import (
 from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.run_record import Quote
 from wheelta_robinhood_agent.ledger.ids import new_id
-from wheelta_robinhood_agent.observability.redaction import Redactor
+from wheelta_robinhood_agent.observability.redaction import REDACTED, Redactor, is_account_key
 
 CANDIDATE_REF_PREFIX: Final = "candidate:"
 EVIDENCE_REF_PREFIX: Final = "evidence:"
@@ -273,9 +273,52 @@ class BoundaryValidator:
         self, request: ValidationRequest, kind: EnvelopeKind, gap: str
     ) -> ValidationOutcome:
         """A missing/error envelope; the redacted raw payload is kept as restricted evidence."""
-        raw = self.redactor.redact(request.tool_response)
+        raw = _drop_account_values(self.redactor.redact(_expand_text_json(request.tool_response)))
         outcome = self._envelope(request, kind, gaps=(gap,))
         return outcome.model_copy(update={"raw_redacted": raw if raw is not None else ""})
+
+
+_MAX_EXPAND_DEPTH: Final = 32
+
+
+def _expand_text_json(value: object, depth: int = 0) -> object:
+    """Decode JSON carried inside MCP text blocks so redaction sees its keys.
+
+    MCP results arrive as `[{"type": "text", "text": "<json>"}]`; key-based redaction can't see
+    an account field inside that string (real-CLI acceptance test 9, DATA_QUALITY.md).
+    """
+    if depth > _MAX_EXPAND_DEPTH:
+        return REDACTED
+    if isinstance(value, Mapping):
+        out = {str(k): _expand_text_json(v, depth + 1) for k, v in value.items()}
+        text = out.get("text")
+        if out.get("type") == "text" and isinstance(text, str):
+            try:
+                decoded = json.loads(text)
+            except ValueError:
+                return out
+            if isinstance(decoded, dict | list):
+                out["text"] = _expand_text_json(decoded, depth + 1)
+        return out
+    if isinstance(value, list | tuple):
+        return [_expand_text_json(v, depth + 1) for v in value]
+    return value
+
+
+def _drop_account_values(value: JsonValue) -> JsonValue:
+    """Replace every account-keyed scalar outright (not last-4): restricted raw evidence must
+    not keep another account's identifier (CLAUDE.md §24), and the configured account is
+    already known to trusted code."""
+    if isinstance(value, dict):
+        return {
+            k: REDACTED
+            if is_account_key(k) and not isinstance(v, dict | list)
+            else _drop_account_values(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_drop_account_values(v) for v in value]
+    return value
 
 
 def _check_provenance(evidence: MappedEvidence, tool_call_id: uuid.UUID) -> None:

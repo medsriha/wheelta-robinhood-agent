@@ -154,6 +154,22 @@ class MemoryRecorder:
     def delivered(self, tool_call_id: uuid.UUID, **kwargs: Any) -> None:
         self._log("delivered", tool_call_id=tool_call_id, **kwargs)
 
+    def close_unresolved(self) -> int:
+        """Mirror agent.session.close_unresolved_calls: every dispatched call with no outcome
+        when the session ended gets `unknown` (production does this against the ledger)."""
+        done = {kw["tool_call_id"] for kw in self.of("outcome")}
+        pending = [
+            kw["tool_call_id"] for kw in self.of("dispatched") if kw["tool_call_id"] not in done
+        ]
+        for tool_call_id in pending:
+            self.outcome(
+                tool_call_id,
+                ToolCallStatus.UNKNOWN,
+                dedup_key="session_ended_without_outcome",
+                reason="session ended before an outcome was reported",
+            )
+        return len(pending)
+
     # -- inspection ------------------------------------------------------------------------
 
     def of(self, name: str) -> list[dict[str, Any]]:
@@ -389,6 +405,7 @@ async def _session(case: Case, outcome: SessionOutcome, model_url: str, mcp_url:
         with anyio.move_on_after(20):
             await client.disconnect()
         outcome.elapsed = time.monotonic() - started
+        case.recorder.close_unresolved()
 
 
 async def _wait_connected(client: ClaudeSDKClient) -> Mapping[str, Any]:
