@@ -1,0 +1,19 @@
+# Never ship secrets, local state, or history into the image.
+.env
+.env.*
+!.env.example
+.git
+.venv
+.claude
+.mcp.json
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.hypothesis
+**/__pycache__
+.coverage*
+htmlcov
+docs
+tests
+scripts
+.railway
