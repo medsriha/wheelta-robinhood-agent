@@ -226,7 +226,9 @@ async def open_http_upstream(
         event_hooks={"response": [auth]},
     )
     client = Client(
-        streamable_http_client(str(server.url), http_client=http),
+        # Robinhood answers the session DELETE with 400 (observed 2026-09-27); the session
+        # ends with the connection anyway, so no termination request is sent.
+        streamable_http_client(str(server.url), http_client=http, terminate_on_close=False),
         mode="legacy",
         cache=None,
         read_timeout_seconds=connect_timeout_seconds,
