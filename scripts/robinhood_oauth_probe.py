@@ -5,9 +5,16 @@ https://agent.robinhood.com/.well-known/oauth-authorization-server/mcp/trading) 
 owner's browser, then exercises one `refresh_token` grant and one MCP connection check, and
 reports what it learned. Never trades and never calls a Robinhood tool.
 
-Secrets: tokens are written only to TOKEN_FILE (outside the repo, mode 0600) and are never
-printed or logged. Non-standard response fields (`mfa_code`, `backup_code`, `user_uuid`) are
-discarded, not stored.
+Secrets: tokens are written only to the repo's gitignored `.env` (mode 0600), as the seed-only
+keys ROBINHOOD_OAUTH_CLIENT_ID, ROBINHOOD_OAUTH_ACCESS_TOKEN, ROBINHOOD_OAUTH_REFRESH_TOKEN,
+ROBINHOOD_OAUTH_OBTAINED_AT, and ROBINHOOD_OAUTH_EXPIRES_IN. Those keys are replaced in place
+(or appended); every other `.env` line is kept as-is. Values are never printed or logged.
+Non-standard response fields (`mfa_code`, `backup_code`, `user_uuid`) are discarded.
+
+Then seed the ledger (ADR-0021):
+`uv run python -m wheelta_robinhood_agent.orchestrator.seed_robinhood_credential --env-file .env`.
+Refresh tokens rotate: once any run refreshes, these `.env` values are stale and the ledger row
+is the source of truth; re-seeding needs a fresh run of this probe.
 
 Usage (owner, on a desktop with a browser):  uv run python scripts/robinhood_oauth_probe.py
 """
@@ -15,7 +22,6 @@ Usage (owner, on a desktop with a browser):  uv run python scripts/robinhood_oau
 import base64
 import hashlib
 import http.server
-import json
 import os
 import secrets
 import stat
@@ -32,8 +38,16 @@ import httpx
 
 METADATA_URL = "https://agent.robinhood.com/.well-known/oauth-authorization-server/mcp/trading"
 RESOURCE = "https://agent.robinhood.com/mcp/trading"
-TOKEN_FILE = Path.home() / ".config" / "wheelta-robinhood-agent" / "robinhood_oauth.json"
-KEPT_FIELDS = ("access_token", "refresh_token", "expires_in", "token_type", "scope")
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+KEPT_FIELDS = ("access_token", "refresh_token", "expires_in")
+# Record field → seed-only `.env` key (read by config.settings.CredentialSeedSettings).
+ENV_KEYS = {
+    "client_id": "ROBINHOOD_OAUTH_CLIENT_ID",
+    "access_token": "ROBINHOOD_OAUTH_ACCESS_TOKEN",
+    "refresh_token": "ROBINHOOD_OAUTH_REFRESH_TOKEN",
+    "obtained_at": "ROBINHOOD_OAUTH_OBTAINED_AT",
+    "expires_in": "ROBINHOOD_OAUTH_EXPIRES_IN",
+}
 LOGIN_TIMEOUT_SECONDS = 300
 
 
@@ -47,14 +61,47 @@ def fingerprint(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()[:8]
 
 
+def _env_key(line: str) -> str | None:
+    """The variable a `.env` line assigns (`KEY=...` or `export KEY=...`), else None."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    return stripped.split("=", 1)[0].removeprefix("export ").strip()
+
+
 def save_tokens(record: dict[str, Any]) -> None:
-    TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(TOKEN_FILE.parent, stat.S_IRWXU)
-    tmp = TOKEN_FILE.with_suffix(".tmp")
+    """Replace (or append) the seed-only keys in `.env`, keeping every other line, mode 0600."""
+    values: dict[str, str] = {}
+    for field, key in ENV_KEYS.items():
+        value = str(record[field])
+        if not value or "'" in value or any(c.isspace() for c in value):
+            raise SystemExit(f"Unexpected format for {key}; nothing was saved.")
+        values[key] = f"'{value}'"  # single quotes: python-dotenv keeps the value literal
+    lines = ENV_FILE.read_text().splitlines(keepends=True) if ENV_FILE.exists() else []
+    written: set[str] = set()
+    kept: list[str] = []
+    for line in lines:
+        key = _env_key(line)
+        if key not in values:
+            kept.append(line)
+        elif key not in written:  # replace the first assignment, drop duplicates
+            kept.append(f"{key}={values[key]}\n")
+            written.add(key)
+    missing = [key for key in values if key not in written]
+    if missing:
+        if kept and not kept[-1].endswith("\n"):
+            kept[-1] += "\n"
+        kept.append("# Robinhood OAuth seed values (scripts/robinhood_oauth_probe.py; ADR-0021)\n")
+        kept.extend(f"{key}={values[key]}\n" for key in missing)
+    tmp = ENV_FILE.with_name(".env.probe.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(record, f)
-    os.replace(tmp, TOKEN_FILE)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(kept)
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp, ENV_FILE)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def kept(token_response: dict[str, Any]) -> dict[str, Any]:
@@ -205,7 +252,7 @@ def main() -> None:
         has_refresh = "refresh_token" in first
         out(f"   refresh_token present: {has_refresh}")
         save_tokens({"client_id": client_id, "obtained_at": obtained.isoformat(), **kept(first)})
-        out(f"   Saved to {TOKEN_FILE} (mode 0600; MFA/backup fields discarded).")
+        out(f"   Saved ROBINHOOD_OAUTH_* to {ENV_FILE} (mode 0600; other lines kept).")
         if not has_refresh:
             raise SystemExit("No refresh token issued: headless refresh is not possible.")
 
@@ -230,6 +277,11 @@ def main() -> None:
     out("5. Connecting the Robinhood MCP with the refreshed access token (no tool calls)...")
     out(f"   MCP status: {mcp_connects(record['access_token'])}")
     out("Done. Tokens were never printed.")
+    out(
+        "Next: uv run python -m wheelta_robinhood_agent.orchestrator.seed_robinhood_credential "
+        "--env-file .env  (set APP_ENV, DATABASE_URL, ROBINHOOD_TOKEN_ENCRYPTION_KEY for the "
+        "target environment). One login per environment."
+    )
 
 
 if __name__ == "__main__":

@@ -32,6 +32,11 @@ ALL_VARS = [
     "ROBINHOOD_MCP_ACCESS_TOKEN",
     "ROBINHOOD_MCP_AUTH",
     "ROBINHOOD_TOKEN_ENCRYPTION_KEY",
+    "ROBINHOOD_OAUTH_CLIENT_ID",
+    "ROBINHOOD_OAUTH_ACCESS_TOKEN",
+    "ROBINHOOD_OAUTH_REFRESH_TOKEN",
+    "ROBINHOOD_OAUTH_OBTAINED_AT",
+    "ROBINHOOD_OAUTH_EXPIRES_IN",
     "ROBINHOOD_WORKSPACE_WRITES",
     "ROBINHOOD_WORKSPACE_PREFIX",
     "WHEELTA_MCP_URL",
@@ -257,13 +262,61 @@ def test_key_absent_by_default(env: pytest.MonkeyPatch) -> None:
     assert snapshot["robinhood_token_encryption_key_present"] is False
 
 
-def test_credential_seed_settings_need_only_env_db_and_key(env: pytest.MonkeyPatch) -> None:
+SEED_OAUTH = {
+    "ROBINHOOD_OAUTH_CLIENT_ID": "client-1",
+    "ROBINHOOD_OAUTH_ACCESS_TOKEN": "fake-access-token-value",
+    "ROBINHOOD_OAUTH_REFRESH_TOKEN": "fake-refresh-token-value",
+    "ROBINHOOD_OAUTH_OBTAINED_AT": "2026-09-26T15:00:00+00:00",
+    "ROBINHOOD_OAUTH_EXPIRES_IN": "496235",
+}
+
+
+def test_credential_seed_settings_need_no_agent_secrets(env: pytest.MonkeyPatch) -> None:
     env.delenv("ANTHROPIC_API_KEY")
     env.delenv("WHEELTA_MCP_TOKEN")
+    for name, value in SEED_OAUTH.items():
+        env.setenv(name, value)
     with pytest.raises(SettingsError, match="ROBINHOOD_TOKEN_ENCRYPTION_KEY"):
         load_credential_seed_settings()
     env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", FERNET_KEY)
     env.setenv("APP_ENV", "staging")
     seed = load_credential_seed_settings()
     assert seed.APP_ENV.value == "staging"
-    assert seed.ROBINHOOD_TOKEN_ENCRYPTION_KEY.get_secret_value() == FERNET_KEY
+    assert seed.ROBINHOOD_OAUTH_CLIENT_ID == "client-1"
+    assert seed.access_expires_at.isoformat() == "2026-10-02T08:50:35+00:00"
+    text = repr(seed)
+    for secret in ("fake-access-token-value", "fake-refresh-token-value", FERNET_KEY):
+        assert secret not in text
+
+
+@pytest.mark.parametrize("name", sorted(SEED_OAUTH))
+def test_credential_seed_settings_require_every_oauth_value(
+    env: pytest.MonkeyPatch, name: str
+) -> None:
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", FERNET_KEY)
+    for key, value in SEED_OAUTH.items():
+        if key != name:
+            env.setenv(key, value)
+    with pytest.raises(SettingsError, match=name) as info:
+        load_credential_seed_settings()
+    assert "fake-access-token-value" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "bad"),
+    [
+        ("ROBINHOOD_OAUTH_OBTAINED_AT", "2026-09-26T15:00:00"),
+        ("ROBINHOOD_OAUTH_EXPIRES_IN", "0"),
+        ("ROBINHOOD_OAUTH_ACCESS_TOKEN", " "),
+        ("ROBINHOOD_OAUTH_CLIENT_ID", ""),
+    ],
+)
+def test_credential_seed_settings_reject_malformed_values(
+    env: pytest.MonkeyPatch, name: str, bad: str
+) -> None:
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", FERNET_KEY)
+    for key, value in SEED_OAUTH.items():
+        env.setenv(key, value)
+    env.setenv(name, bad)
+    with pytest.raises(SettingsError, match=name):
+        load_credential_seed_settings()

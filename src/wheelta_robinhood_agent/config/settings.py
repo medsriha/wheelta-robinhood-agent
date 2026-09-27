@@ -5,12 +5,14 @@ never hot-reload; the runtime stop latch (RunControl) is separate (ADR-0010 item
 """
 
 import base64
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from pydantic import (
     AnyHttpUrl,
+    AwareDatetime,
     Field,
     PositiveInt,
     SecretStr,
@@ -287,7 +289,12 @@ def load_database_url() -> SecretStr:
 
 class CredentialSeedSettings(BaseSettings):
     """Only what the Robinhood credential seed command needs (ADR-0021): the environment,
-    the ledger, and the encryption key. No agent secrets are required to seed."""
+    the ledger, the encryption key, and the seed-only ROBINHOOD_OAUTH_* values the probe
+    writes to the gitignored `.env`. No agent secrets are required to seed.
+
+    The ROBINHOOD_OAUTH_* values are a one-time seed source: refresh tokens rotate, so once
+    any run refreshes, these values are stale and the ledger row is the source of truth.
+    """
 
     model_config = SettingsConfigDict(
         extra="ignore", frozen=True, case_sensitive=True, env_file=None, hide_input_in_errors=True
@@ -296,13 +303,29 @@ class CredentialSeedSettings(BaseSettings):
     APP_ENV: AppEnv = AppEnv.LOCAL
     DATABASE_URL: SecretStr
     ROBINHOOD_TOKEN_ENCRYPTION_KEY: SecretStr
+    ROBINHOOD_OAUTH_CLIENT_ID: str = Field(min_length=1)
+    ROBINHOOD_OAUTH_ACCESS_TOKEN: SecretStr
+    ROBINHOOD_OAUTH_REFRESH_TOKEN: SecretStr
+    ROBINHOOD_OAUTH_OBTAINED_AT: AwareDatetime
+    ROBINHOOD_OAUTH_EXPIRES_IN: PositiveInt
 
-    @field_validator("DATABASE_URL")
+    @field_validator(
+        "DATABASE_URL", "ROBINHOOD_OAUTH_ACCESS_TOKEN", "ROBINHOOD_OAUTH_REFRESH_TOKEN"
+    )
     @classmethod
     def _not_blank(cls, value: SecretStr) -> SecretStr:
         if not value.get_secret_value().strip():
             raise ValueError("required; must not be blank")
         return value
+
+    @field_validator("ROBINHOOD_OAUTH_OBTAINED_AT")
+    @classmethod
+    def _utc(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+    @property
+    def access_expires_at(self) -> datetime:
+        return self.ROBINHOOD_OAUTH_OBTAINED_AT + timedelta(seconds=self.ROBINHOOD_OAUTH_EXPIRES_IN)
 
     @field_validator("ROBINHOOD_TOKEN_ENCRYPTION_KEY")
     @classmethod

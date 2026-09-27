@@ -1,6 +1,5 @@
 """oauth_credentials (ADR-0021): insert/latest, append-only, supersede-once, seed command."""
 
-import json
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -92,27 +91,29 @@ def test_rows_are_append_only(conn: Conn) -> None:
             conn.execute(statement)
 
 
-# -- seed command --------------------------------------------------------------------------------
+# -- seed command (fake values only) -------------------------------------------------------------
+
+SEED_VARS = (
+    "APP_ENV", "DATABASE_URL", "ROBINHOOD_TOKEN_ENCRYPTION_KEY", "ROBINHOOD_OAUTH_CLIENT_ID",
+    "ROBINHOOD_OAUTH_ACCESS_TOKEN", "ROBINHOOD_OAUTH_REFRESH_TOKEN",
+    "ROBINHOOD_OAUTH_OBTAINED_AT", "ROBINHOOD_OAUTH_EXPIRES_IN",
+)  # fmt: skip
 
 
-def _token_file(tmp_path: Path, mode: int = 0o600) -> tuple[Path, dict[str, object]]:
-    record: dict[str, object] = {
-        "client_id": "client-seed",
-        "obtained_at": T0.isoformat(),
-        "access_token": "acc-" + secrets.token_urlsafe(24),
-        "refresh_token": "ref-" + secrets.token_urlsafe(24),
-        "expires_in": 496235,
-        "token_type": "Bearer",
-        "scope": "internal",
+def _oauth_values() -> dict[str, str]:
+    return {
+        "ROBINHOOD_OAUTH_CLIENT_ID": "client-seed",
+        "ROBINHOOD_OAUTH_ACCESS_TOKEN": "acc-" + secrets.token_urlsafe(24),
+        "ROBINHOOD_OAUTH_REFRESH_TOKEN": "ref-" + secrets.token_urlsafe(24),
+        "ROBINHOOD_OAUTH_OBTAINED_AT": T0.isoformat(),
+        "ROBINHOOD_OAUTH_EXPIRES_IN": "496235",
     }
-    path = tmp_path / "robinhood_oauth.json"
-    path.write_text(json.dumps(record))
-    os.chmod(path, mode)
-    return path, record
 
 
 @pytest.fixture
 def seed_env(monkeypatch: pytest.MonkeyPatch, ledger_db_url: SecretStr) -> SecretStr:
+    for name in SEED_VARS:
+        monkeypatch.delenv(name, raising=False)
     key = SecretStr(Fernet.generate_key().decode())
     monkeypatch.setenv("APP_ENV", "staging")
     monkeypatch.setenv("DATABASE_URL", ledger_db_url.get_secret_value())
@@ -120,50 +121,69 @@ def seed_env(monkeypatch: pytest.MonkeyPatch, ledger_db_url: SecretStr) -> Secre
     return key
 
 
-def test_seed_inserts_an_encrypted_seed_row(
-    seed_env: SecretStr, conn: Conn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    path, record = _token_file(tmp_path)
-    assert seed_cmd.main([str(path)]) == 0
-    out = capsys.readouterr()
-    for token in (record["access_token"], record["refresh_token"]):
-        assert str(token) not in out.out + out.err
+def _assert_seeded(conn: Conn, key: SecretStr, values: dict[str, str], out: str) -> None:
     stored = latest_credential(conn, AppEnv.STAGING, OAuthProvider.ROBINHOOD)
     assert stored is not None and stored.source is CredentialSource.SEED
     assert stored.client_id == "client-seed"
     assert stored.access_expires_at == T0 + timedelta(seconds=496235)
-    assert str(record["access_token"]).encode() not in stored.ciphertext
-    tokens = TokenVault(seed_env).decrypt(stored.ciphertext)
-    assert tokens.refresh_token.get_secret_value() == record["refresh_token"]
-    assert "staging" in out.out and str(stored.credential_id) in out.out
+    assert values["ROBINHOOD_OAUTH_ACCESS_TOKEN"].encode() not in stored.ciphertext
+    tokens = TokenVault(key).decrypt(stored.ciphertext)
+    assert tokens.access_token.get_secret_value() == values["ROBINHOOD_OAUTH_ACCESS_TOKEN"]
+    assert tokens.refresh_token.get_secret_value() == values["ROBINHOOD_OAUTH_REFRESH_TOKEN"]
+    assert "staging" in out and str(stored.credential_id) in out
 
 
-@pytest.mark.parametrize("mode", [0o640, 0o604, 0o644, 0o700])
-def test_seed_refuses_a_file_broader_than_0600(
-    seed_env: SecretStr, conn: Conn, tmp_path: Path, mode: int, capsys: pytest.CaptureFixture[str]
+def test_seed_from_environment_variables(
+    seed_env: SecretStr, monkeypatch: pytest.MonkeyPatch, conn: Conn,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    values = _oauth_values()
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    assert seed_cmd.main([]) == 0
+    out = capsys.readouterr()
+    for token in (values["ROBINHOOD_OAUTH_ACCESS_TOKEN"], values["ROBINHOOD_OAUTH_REFRESH_TOKEN"]):
+        assert token not in out.out + out.err
+    _assert_seeded(conn, seed_env, values, out.out)
+
+
+def test_seed_from_an_env_file_with_process_env_precedence(
+    seed_env: SecretStr, conn: Conn, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    path, _ = _token_file(tmp_path, mode)
-    assert seed_cmd.main([str(path)]) == 1
-    assert "chmod 600" in capsys.readouterr().err
+    values = _oauth_values()
+    env_file = tmp_path / ".env"
+    lines = [f"{k}={v}" for k, v in values.items()]
+    env_file.write_text("\n".join(["APP_ENV=local", "UNRELATED=1", *lines]) + "\n")
+    os.chmod(env_file, 0o600)
+    assert seed_cmd.main(["--env-file", str(env_file)]) == 0
+    out = capsys.readouterr()
+    for token in (values["ROBINHOOD_OAUTH_ACCESS_TOKEN"], values["ROBINHOOD_OAUTH_REFRESH_TOKEN"]):
+        assert token not in out.out + out.err
+    _assert_seeded(conn, seed_env, values, out.out)  # APP_ENV=staging from the shell wins
+    assert latest_credential(conn, AppEnv.LOCAL, OAuthProvider.ROBINHOOD) is None
+
+
+def test_seed_rejects_missing_or_malformed_values_without_echo(
+    seed_env: SecretStr, monkeypatch: pytest.MonkeyPatch, conn: Conn,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    values = _oauth_values()
+    values["ROBINHOOD_OAUTH_OBTAINED_AT"] = "2026-09-26T15:00:00"  # naive: rejected
+    del values["ROBINHOOD_OAUTH_REFRESH_TOKEN"]
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    assert seed_cmd.main([]) == 1
+    err = capsys.readouterr().err
+    assert "ROBINHOOD_OAUTH_REFRESH_TOKEN" in err and "ROBINHOOD_OAUTH_OBTAINED_AT" in err
+    assert values["ROBINHOOD_OAUTH_ACCESS_TOKEN"] not in err
     assert latest_credential(conn, AppEnv.STAGING, OAuthProvider.ROBINHOOD) is None
 
 
-def test_seed_rejects_a_malformed_file_without_echo(
-    seed_env: SecretStr, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    path = tmp_path / "bad.json"
-    path.write_text(json.dumps({"access_token": "leaky-token-value", "client_id": "c"}))
-    os.chmod(path, 0o600)
-    assert seed_cmd.main([str(path)]) == 1
-    err = capsys.readouterr().err
-    assert "not a valid token file" in err and "leaky-token-value" not in err
-
-
 def test_seed_requires_the_encryption_key(
-    seed_env: SecretStr, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:  # fmt: skip
+    seed_env: SecretStr, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     monkeypatch.delenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY")
-    path, _ = _token_file(tmp_path)
-    assert seed_cmd.main([str(path)]) == 1
+    for name, value in _oauth_values().items():
+        monkeypatch.setenv(name, value)
+    assert seed_cmd.main([]) == 1
     assert "ROBINHOOD_TOKEN_ENCRYPTION_KEY" in capsys.readouterr().err
