@@ -16,7 +16,7 @@ exact server-config dict shape (taken from `.mcp.json.example`). Confirm against
 
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, Self
 
 from pydantic import (
     AnyHttpUrl,
@@ -133,21 +133,32 @@ class McpHttpServer(BaseModel):
 
     name: str
     url: AnyHttpUrl
-    token: SecretStr
+    token: SecretStr | None = None
+    # ADR-0018: no header; the Claude Code CLI uses the OAuth login it stored for this
+    # server name. Must be chosen explicitly; a server never silently loses its token.
+    uses_stored_cli_login: bool = False
+
+    @model_validator(mode="after")
+    def _exactly_one_credential_source(self) -> Self:
+        if (self.token is None) == (not self.uses_stored_cli_login):
+            raise ValueError("set exactly one of token or uses_stored_cli_login")
+        return self
 
     @field_validator("token")
     @classmethod
-    def _header_safe(cls, value: SecretStr) -> SecretStr:
+    def _header_safe(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
         secret = value.get_secret_value()
         if not secret or any(c.isspace() or not c.isprintable() for c in secret):
             raise ValueError("bearer token must be non-empty printable text without whitespace")
         return value
 
     def to_sdk_config(self) -> dict[str, object]:
-        """`{"type": "http", "url": ..., "headers": {"Authorization": "Bearer <token>"}}`."""
+        """`{"type": "http", "url": ..., "headers": {"Authorization": "Bearer <token>"}}`, or
+        without `headers` when the CLI's stored login is used (ADR-0018)."""
         transport: Literal["http"] = "http"
-        return {
-            "type": transport,
-            "url": str(self.url),
-            "headers": {"Authorization": f"Bearer {self.token.get_secret_value()}"},
-        }
+        config: dict[str, object] = {"type": transport, "url": str(self.url)}
+        if self.token is not None:
+            config["headers"] = {"Authorization": f"Bearer {self.token.get_secret_value()}"}
+        return config

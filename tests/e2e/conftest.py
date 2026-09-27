@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from e2e_support import RecordingNotifier
 from pydantic import SecretStr
+from pytest_socket import disable_socket
 
 from wheelta_robinhood_agent.config.settings import Settings
 
@@ -31,7 +32,19 @@ _spec.loader.exec_module(_ledger)
 
 pg_server = _ledger.pg_server
 ledger_db_url = _ledger.ledger_db_url
-_allow_unix_sockets_only = _ledger._allow_unix_sockets_only
+
+
+@pytest.fixture(autouse=True)
+def _allow_unix_sockets_only(request: pytest.FixtureRequest) -> None:
+    """Overrides the ledger fixture of the same name: AF_UNIX only, TCP/UDP blocked.
+
+    Exception: a test marked `allow_hosts` (the real-CLI harness, 127.0.0.1 only) keeps
+    pytest-socket's host allowlist, which guards `connect` rather than socket creation, so its
+    local fake servers can listen. Nothing here widens the allowlist beyond the marker's hosts.
+    """
+    if request.node.get_closest_marker("allow_hosts") is not None:
+        return
+    disable_socket(allow_unix_socket=True)
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

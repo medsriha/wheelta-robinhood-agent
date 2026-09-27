@@ -1,0 +1,16 @@
+{
+  "provenance": {
+    "tool": "get_option_orders",
+    "arguments": {
+      "account_number": "ACCOUNT_REDACTED"
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-26",
+    "captured_via": "Claude Code session (read-only call, owner-approved)",
+    "scrubbing": "account_number replaced with ACCOUNT_REDACTED; the tool's `guide` prose dropped",
+    "note": "Agentic account was unfunded and empty at capture time"
+  },
+  "data": {
+    "orders": []
+  }
+}

@@ -370,6 +370,15 @@ def _required_str(tool_input: Mapping[str, object], arg: str) -> str:
     return value
 
 
+def mcp_tool_output(envelope: Mapping[str, Any]) -> list[dict[str, str]]:
+    """The replacement output for an MCP tool: one text block holding the envelope as JSON.
+
+    The CLI expects MCP tool output as a content-block list; a bare dict crashes it and the
+    model receives the crash text instead (real-CLI acceptance test 1, DATA_QUALITY.md).
+    """
+    return [{"type": "text", "text": json.dumps(envelope, sort_keys=True)}]
+
+
 def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     """Build the PreToolUse, PostToolUse, and PostToolUseFailure hooks for one session."""
     calls: dict[str, _Call] = {}
@@ -604,7 +613,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 stopReason=reason,
                 hookSpecificOutput=PostToolUseHookSpecificOutput(
                     hookEventName="PostToolUse",
-                    updatedToolOutput=error_envelope(None, BUILTIN_SERVER, name, reason, now),
+                    updatedToolOutput=mcp_tool_output(
+                        error_envelope(None, BUILTIN_SERVER, name, reason, now)
+                    ),
                 ),
             )
         try:
@@ -666,7 +677,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             # Built-in outputs must match the tool's own schema, so a replacement would be
             # rejected (types.py PostToolUseHookSpecificOutput); they are recorded, not replaced.
             delivered_output = (
-                deps.redactor.redact(data.get("tool_response")) if call.builtin else payload
+                deps.redactor.redact(data.get("tool_response"))
+                if call.builtin
+                else mcp_tool_output(payload)
             )
             delivered_ref = deps.recorder.store_result(
                 call.tool_call_id,
@@ -697,12 +710,14 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 stopReason=reason,
                 hookSpecificOutput=PostToolUseHookSpecificOutput(
                     hookEventName="PostToolUse",
-                    updatedToolOutput=error_envelope(call, call.server, call.tool, reason, now),
+                    updatedToolOutput=mcp_tool_output(
+                        error_envelope(call, call.server, call.tool, reason, now)
+                    ),
                 ),
             )
         specific = PostToolUseHookSpecificOutput(hookEventName="PostToolUse")
         if not call.builtin:
-            specific["updatedToolOutput"] = payload
+            specific["updatedToolOutput"] = delivered_output
         if context_text is not None:
             specific["additionalContext"] = context_text
         out = SyncHookJSONOutput(hookSpecificOutput=specific)

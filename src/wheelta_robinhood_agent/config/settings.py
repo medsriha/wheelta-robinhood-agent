@@ -15,6 +15,7 @@ from pydantic import (
     SecretStr,
     ValidationError,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -26,6 +27,16 @@ PHASE_EXECUTION_CEILING = ExecutionMode.OFF
 
 # The cron interval is hourly; the run budget must leave room before the next fire.
 _CRON_INTERVAL_SECONDS = 3600
+
+
+class RobinhoodMcpAuth(StrEnum):
+    """How the agent authenticates to the Robinhood MCP (ADR-0018)."""
+
+    # Bearer token from ROBINHOOD_MCP_ACCESS_TOKEN (how a deployed run would work; ADR-0004).
+    TOKEN = "token"  # noqa: S105 - a mode name, not a credential
+    # Local development only: the Claude Code CLI reuses the OAuth login it stored for the
+    # `robinhood` server (`/mcp`). No token passes through our code.
+    CLAUDE_CODE_LOGIN = "claude_code_login"
 
 
 class LogLevel(StrEnum):
@@ -64,6 +75,7 @@ class Settings(BaseSettings):
     ROBINHOOD_MCP_URL: AnyHttpUrl = AnyHttpUrl("https://agent.robinhood.com/mcp/trading")
     # Mechanism unresolved (ADR-0004). Absent means Robinhood is unavailable (needs-auth).
     ROBINHOOD_MCP_ACCESS_TOKEN: SecretStr | None = None
+    ROBINHOOD_MCP_AUTH: RobinhoodMcpAuth = RobinhoodMcpAuth.TOKEN
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER: SecretStr
     ROBINHOOD_WORKSPACE_WRITES: bool = True
     ROBINHOOD_WORKSPACE_PREFIX: str = Field(default="WRA · ", min_length=1)
@@ -98,6 +110,19 @@ class Settings(BaseSettings):
         if not value.get_secret_value().strip():
             raise ValueError("required; must not be blank")
         return value
+
+    @model_validator(mode="after")
+    def _claude_code_login_is_local_only(self) -> "Settings":
+        """ADR-0018: reusing the Claude Code login is a local-development path only, and it
+        excludes a configured token so there is never doubt about which credential is used."""
+        if self.ROBINHOOD_MCP_AUTH is RobinhoodMcpAuth.CLAUDE_CODE_LOGIN:
+            if self.APP_ENV is not AppEnv.LOCAL:
+                raise ValueError("ROBINHOOD_MCP_AUTH=claude_code_login requires APP_ENV=local")
+            if self.ROBINHOOD_MCP_ACCESS_TOKEN is not None:
+                raise ValueError(
+                    "ROBINHOOD_MCP_AUTH=claude_code_login excludes ROBINHOOD_MCP_ACCESS_TOKEN"
+                )
+        return self
 
     @property
     def requested_execution_mode(self) -> ExecutionMode:
@@ -134,6 +159,7 @@ class Settings(BaseSettings):
             "mcp_tool_timeout_ms": self.MCP_TOOL_TIMEOUT,
             "robinhood_mcp_url": str(self.ROBINHOOD_MCP_URL),
             "robinhood_token_present": self.ROBINHOOD_MCP_ACCESS_TOKEN is not None,
+            "robinhood_mcp_auth": self.ROBINHOOD_MCP_AUTH.value,
             "robinhood_account_last4": self.account_last4,
             "robinhood_workspace_writes": self.ROBINHOOD_WORKSPACE_WRITES,
             "robinhood_workspace_prefix": self.ROBINHOOD_WORKSPACE_PREFIX,

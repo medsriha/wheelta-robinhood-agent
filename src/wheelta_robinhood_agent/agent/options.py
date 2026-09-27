@@ -48,6 +48,8 @@ class AgentOptionsError(ValueError):
 
 def _sdk_server(server: McpHttpServer) -> McpHttpServerConfig:
     config = server.to_sdk_config()
+    if "headers" not in config:  # the CLI's stored login (ADR-0018)
+        return McpHttpServerConfig(type="http", url=str(config["url"]))
     return McpHttpServerConfig(
         type="http",
         url=str(config["url"]),

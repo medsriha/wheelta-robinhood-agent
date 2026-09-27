@@ -1,0 +1,37 @@
+{
+  "provenance": {
+    "tool": "get_option_instruments",
+    "arguments": {
+      "chain_id": "c277b118-58d9-4060-8dc5-a3b5898955cb",
+      "expiration_dates": "2026-10-16",
+      "type": "put",
+      "strike_price": "740.0000"
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-26",
+    "captured_via": "Claude Code session (read-only call, owner-approved)",
+    "scrubbing": "public market data; Robinhood internal hostnames replaced; the tool's `guide` prose dropped"
+  },
+  "data": {
+    "instruments": [
+      {
+        "id": "d17decae-92f6-430e-b4c0-3772e5dd27ab",
+        "chain_id": "c277b118-58d9-4060-8dc5-a3b5898955cb",
+        "chain_symbol": "SPY",
+        "underlying_type": "equity",
+        "expiration_date": "2026-10-16",
+        "sellout_datetime": "2026-10-16T19:45:00+00:00",
+        "strike_price": "740.0000",
+        "type": "put",
+        "state": "active",
+        "tradability": "tradable",
+        "trade_value_multiplier": "100.0000",
+        "min_ticks": {
+          "above_tick": "0.01",
+          "below_tick": "0.01",
+          "cutoff_price": "0.00"
+        }
+      }
+    ]
+  }
+}

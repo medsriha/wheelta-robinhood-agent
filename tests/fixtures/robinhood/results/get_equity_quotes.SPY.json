@@ -1,0 +1,43 @@
+{
+  "provenance": {
+    "tool": "get_equity_quotes",
+    "arguments": {
+      "symbols": [
+        "SPY"
+      ]
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-26",
+    "captured_via": "Claude Code session (read-only call, owner-approved)",
+    "scrubbing": "public market data; Robinhood internal hostnames replaced; the tool's `guide` prose dropped"
+  },
+  "data": {
+    "results": [
+      {
+        "quote": {
+          "symbol": "SPY",
+          "last_trade_price": "771.300000",
+          "venue_last_trade_time": "2026-09-25T19:59:59.969143521Z",
+          "last_non_reg_trade_price": "772.040000",
+          "venue_last_non_reg_trade_time": "2026-09-25T23:59:34.099542326Z",
+          "adjusted_previous_close": "767.180000",
+          "previous_close": "767.180000",
+          "previous_close_date": "2026-09-24",
+          "bid_price": "760.010000",
+          "venue_bid_time": "2026-09-26T00:00:00.235232473Z",
+          "ask_price": "772.400000",
+          "venue_ask_time": "2026-09-26T00:00:00.235232473Z",
+          "has_traded": true,
+          "state": "active"
+        },
+        "close": {
+          "symbol": "SPY",
+          "date": "2026-09-24",
+          "price": "767.18",
+          "interpolated": false,
+          "source": "sip-list-exchange-close"
+        }
+      }
+    ]
+  }
+}

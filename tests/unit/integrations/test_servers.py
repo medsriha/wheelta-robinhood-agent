@@ -75,3 +75,24 @@ def test_token_never_in_validation_error(bad: str) -> None:
         McpHttpServer(name="robinhood", url="https://example.com/mcp", token=SecretStr(bad))  # type: ignore[arg-type]
     assert RH_SECRET not in str(info.value)
     assert RH_SECRET not in repr(info.value)
+
+
+def test_stored_cli_login_server_has_no_headers() -> None:
+    from pydantic import AnyHttpUrl
+
+    from wheelta_robinhood_agent.integrations.status import McpHttpServer
+
+    url = AnyHttpUrl("https://agent.robinhood.com/mcp/trading")
+    server = McpHttpServer(name="robinhood", url=url, uses_stored_cli_login=True)
+    assert server.to_sdk_config() == {"type": "http", "url": str(url)}
+    with pytest.raises(ValueError):
+        McpHttpServer(name="robinhood", url=url)  # neither credential source
+    with pytest.raises(ValueError):
+        McpHttpServer(name="robinhood", url=url, token=SecretStr("t"), uses_stored_cli_login=True)
+
+
+def test_robinhood_claude_code_login_mode_builds_a_tokenless_server() -> None:
+    out = build_robinhood_server(_settings(ROBINHOOD_MCP_AUTH="claude_code_login"), NOW)
+    assert isinstance(out, McpHttpServer)
+    assert out.uses_stored_cli_login and out.token is None
+    assert "headers" not in out.to_sdk_config()

@@ -1,0 +1,55 @@
+{
+  "provenance": {
+    "tool": "get_option_quotes",
+    "arguments": {
+      "instrument_ids": [
+        "d17decae-92f6-430e-b4c0-3772e5dd27ab"
+      ]
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-26",
+    "captured_via": "Claude Code session (read-only call, owner-approved)",
+    "scrubbing": "public market data; Robinhood internal hostnames replaced; the tool's `guide` prose dropped"
+  },
+  "data": {
+    "results": [
+      {
+        "quote": {
+          "instrument_id": "d17decae-92f6-430e-b4c0-3772e5dd27ab",
+          "ask_price": "1.800000",
+          "ask_size": 1,
+          "bid_price": "1.790000",
+          "bid_size": 168,
+          "break_even_price": "738.200000",
+          "adjusted_mark_price": "1.800000",
+          "mark_price": "1.795000",
+          "high_fill_rate_buy_price": "1.796000",
+          "low_fill_rate_buy_price": "1.791000",
+          "high_fill_rate_sell_price": "1.793000",
+          "low_fill_rate_sell_price": "1.798000",
+          "previous_close_price": "2.740000",
+          "previous_close_date": "2026-09-24",
+          "implied_volatility": "0.163391",
+          "delta": "-0.122280",
+          "gamma": "0.006899",
+          "rho": "-0.051526",
+          "theta": "-0.139924",
+          "vega": "0.364017",
+          "open_interest": 45801,
+          "volume": 9439,
+          "chance_of_profit_long": "0.116943",
+          "chance_of_profit_short": "0.883057",
+          "updated_at": "2026-09-25T20:14:59.909071917Z"
+        },
+        "close": {
+          "instrument_id": "d17decae-92f6-430e-b4c0-3772e5dd27ab",
+          "symbol": "SPY",
+          "date": "2026-09-24",
+          "price": "2.74",
+          "interpolated": false,
+          "source": "ddb-market-snapshot"
+        }
+      }
+    ]
+  }
+}

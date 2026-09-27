@@ -1,0 +1,73 @@
+{
+  "provenance": {
+    "tool": "get_option_chains",
+    "arguments": {
+      "underlying_symbol": "SPY"
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-26",
+    "captured_via": "Claude Code session (read-only call, owner-approved)",
+    "scrubbing": "public market data; Robinhood internal hostnames replaced; the tool's `guide` prose dropped"
+  },
+  "data": {
+    "chains": [
+      {
+        "id": "c277b118-58d9-4060-8dc5-a3b5898955cb",
+        "symbol": "SPY",
+        "can_open_position": true,
+        "cash_component": null,
+        "expiration_dates": [
+          "2026-09-28",
+          "2026-09-29",
+          "2026-09-30",
+          "2026-10-01",
+          "2026-10-02",
+          "2026-10-05",
+          "2026-10-06",
+          "2026-10-07",
+          "2026-10-08",
+          "2026-10-09",
+          "2026-10-12",
+          "2026-10-16",
+          "2026-10-23",
+          "2026-10-30",
+          "2026-11-06",
+          "2026-11-20",
+          "2026-11-30",
+          "2026-12-18",
+          "2026-12-31",
+          "2027-01-15",
+          "2027-01-29",
+          "2027-02-26",
+          "2027-03-19",
+          "2027-03-31",
+          "2027-06-17",
+          "2027-06-30",
+          "2027-09-17",
+          "2027-09-30",
+          "2027-12-17",
+          "2028-01-21",
+          "2028-06-16",
+          "2028-12-15",
+          "2029-01-19"
+        ],
+        "trade_value_multiplier": "100.0000",
+        "underlying_instruments": [
+          {
+            "instrument": "INTERNAL_URL_REDACTED/instruments/8f92e76f-1e0e-4478-8580-16a6ffcfaef5/",
+            "symbol": ""
+          }
+        ],
+        "min_ticks": {
+          "above_tick": "0.01",
+          "below_tick": "0.01",
+          "cutoff_price": "0.00"
+        },
+        "late_close_state": "enabled",
+        "extended_hours_state": "disabled",
+        "settle_on_open": false,
+        "sellout_time_to_expiration": 1800
+      }
+    ]
+  }
+}

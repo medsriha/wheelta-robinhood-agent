@@ -164,3 +164,25 @@ def test_load_database_url_alone(env: pytest.MonkeyPatch) -> None:
     env.delenv("DATABASE_URL")
     with pytest.raises(SettingsError, match="DATABASE_URL"):
         load_database_url()
+
+
+def test_claude_code_login_mode_is_local_only(env: pytest.MonkeyPatch) -> None:
+    env.setenv("ROBINHOOD_MCP_AUTH", "claude_code_login")
+    s = load_settings()
+    assert s.config_snapshot()["robinhood_mcp_auth"] == "claude_code_login"
+    env.setenv("APP_ENV", "staging")
+    with pytest.raises(SettingsError, match="requires APP_ENV=local"):
+        load_settings()
+
+
+def test_claude_code_login_mode_excludes_a_token(env: pytest.MonkeyPatch) -> None:
+    env.setenv("ROBINHOOD_MCP_AUTH", "claude_code_login")
+    env.setenv("ROBINHOOD_MCP_ACCESS_TOKEN", "rh-token")
+    with pytest.raises(SettingsError, match="excludes ROBINHOOD_MCP_ACCESS_TOKEN"):
+        load_settings()
+
+
+def test_unknown_robinhood_auth_mode_fails(env: pytest.MonkeyPatch) -> None:
+    env.setenv("ROBINHOOD_MCP_AUTH", "browser_cookies")
+    with pytest.raises(SettingsError, match="ROBINHOOD_MCP_AUTH"):
+        load_settings()
