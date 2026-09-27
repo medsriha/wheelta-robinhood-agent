@@ -28,11 +28,11 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 5
-status = "draft"
-adr = "ADR-0015"
-signed_off_by = "TBD"
-signed_off_on = "TBD"
+version = 6
+status = "signed_off"
+adr = "ADR-0020"
+signed_off_by = "medsriha (account owner)"
+signed_off_on = "2026-09-26"
 
 [conventions]
 value_conventions = [
@@ -62,23 +62,24 @@ notes = [
   "max_total_csp_collateral_ratio is a fraction of the pre-order CSP cash base: available settled cash plus cash already reserved for existing CSP positions and working CSP orders. See definitions.cash_accounting.",
   "min_cash_reserve_usd is the available settled cash that must remain after the new CSP reservation. Do not subtract existing reservations twice.",
   "max_correlated_exposure is measured with wheelta_correlations against current holdings.",
+  "Avoid concentration. No underlying may take more than limits.max_collateral_per_underlying_ratio of account value in CSP collateral. max_sector_concentration_ratio and max_correlated_exposure are agent_discretion: spread positions across sectors and across weakly correlated underlyings (check wheelta_correlations against current holdings), prefer a new underlying over adding to an existing one when candidates are otherwise comparable, and state the resulting sector and correlation exposure in the rationale.",
   "cc_max_lot_coverage_ratio is the fraction of a share lot that calls may cover, at most 1.00.",
   "cc_min_strike_vs_cost_basis is compared with the tax-lot cost basis.",
   "All available settled cash may be used; there are no dollar caps.",
   "max_new_positions_per_run and max_new_positions_per_day count new position lineages. A roll's replacement leg continues its existing lineage and does not count; rolls are limited by management.max_rolls_per_position.",
   "cc_min_strike_vs_cost_basis is agent_discretion: a strike below the lot's cost basis locks in a loss on the shares if they are called away. Choose one only when the premium and your thesis justify it, and state the cost basis, strike, and premium in the rationale.",
 ]
-# Owner, 2026-09-25: reuse all available cash; no dollar, per-underlying, sector, or
-# correlation caps. The count caps below are the only brake on a runaway or injected run.
+# Owner, 2026-09-25: reuse all available cash, no dollar caps. Owner, 2026-09-26 (ADR-0020):
+# avoid concentration: 20% per underlying; sector and correlation at the agent's discretion.
 max_contracts_per_order = 10
 max_new_positions_per_run = 5
 max_new_positions_per_day = 10
 max_collateral_per_underlying_usd = "none"
-max_collateral_per_underlying_ratio = "1.00"
+max_collateral_per_underlying_ratio = "0.20" # owner, 2026-09-26: avoid concentration
 max_total_csp_collateral_ratio = "1.00"
 min_cash_reserve_usd = "0.00"
-max_sector_concentration_ratio = "none"
-max_correlated_exposure = "none"
+max_sector_concentration_ratio = "agent_discretion"
+max_correlated_exposure = "agent_discretion"
 cc_max_lot_coverage_ratio = "1.00"
 cc_min_strike_vs_cost_basis = "agent_discretion"
 

@@ -4,6 +4,7 @@ from wheelta_robinhood_agent.config.settings import (
     PHASE_EXECUTION_CEILING,
     Settings,
     SettingsError,
+    load_credential_seed_settings,
     load_database_url,
     load_settings,
 )
@@ -29,6 +30,8 @@ ALL_VARS = [
     "MCP_TOOL_TIMEOUT",
     "ROBINHOOD_MCP_URL",
     "ROBINHOOD_MCP_ACCESS_TOKEN",
+    "ROBINHOOD_MCP_AUTH",
+    "ROBINHOOD_TOKEN_ENCRYPTION_KEY",
     "ROBINHOOD_WORKSPACE_WRITES",
     "ROBINHOOD_WORKSPACE_PREFIX",
     "WHEELTA_MCP_URL",
@@ -186,3 +189,81 @@ def test_unknown_robinhood_auth_mode_fails(env: pytest.MonkeyPatch) -> None:
     env.setenv("ROBINHOOD_MCP_AUTH", "browser_cookies")
     with pytest.raises(SettingsError, match="ROBINHOOD_MCP_AUTH"):
         load_settings()
+
+
+def test_local_remote_risk_acceptance(env: pytest.MonkeyPatch) -> None:
+    assert load_settings().remote_result_risk_accepted is False
+    env.setenv("LOCAL_ACCEPT_REMOTE_RESULT_RISK", "true")
+    assert load_settings().remote_result_risk_accepted is True
+    env.setenv("APP_ENV", "production")
+    with pytest.raises(SettingsError, match="requires APP_ENV=local"):
+        load_settings()
+
+
+# -- ROBINHOOD_MCP_AUTH=refresh_token (ADR-0021) ---------------------------------------------------
+
+FERNET_KEY = "a" * 43 + "="  # urlsafe base64 of 32 bytes; a test key, not a real one
+
+
+@pytest.mark.parametrize("app_env", ["local", "staging", "production"])
+def test_refresh_token_mode_is_allowed_in_every_env(env: pytest.MonkeyPatch, app_env: str) -> None:
+    env.setenv("APP_ENV", app_env)
+    env.setenv("ROBINHOOD_MCP_AUTH", "refresh_token")
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", FERNET_KEY)
+    s = load_settings()
+    snapshot = s.config_snapshot()
+    assert snapshot["robinhood_mcp_auth"] == "refresh_token"
+    assert snapshot["robinhood_token_encryption_key_present"] is True
+    assert FERNET_KEY not in repr(snapshot)
+    assert FERNET_KEY not in repr(s)
+
+
+def test_refresh_token_mode_requires_the_key(env: pytest.MonkeyPatch) -> None:
+    env.setenv("ROBINHOOD_MCP_AUTH", "refresh_token")
+    with pytest.raises(SettingsError, match="requires ROBINHOOD_TOKEN_ENCRYPTION_KEY"):
+        load_settings()
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", "")
+    with pytest.raises(SettingsError, match="requires ROBINHOOD_TOKEN_ENCRYPTION_KEY"):
+        load_settings()
+
+
+def test_refresh_token_mode_excludes_a_static_token(env: pytest.MonkeyPatch) -> None:
+    env.setenv("ROBINHOOD_MCP_AUTH", "refresh_token")
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", FERNET_KEY)
+    env.setenv("ROBINHOOD_MCP_ACCESS_TOKEN", "rh-token")
+    with pytest.raises(SettingsError, match="excludes ROBINHOOD_MCP_ACCESS_TOKEN"):
+        load_settings()
+
+
+@pytest.mark.parametrize("mode", ["token", "claude_code_login"])
+def test_key_is_rejected_in_other_modes(env: pytest.MonkeyPatch, mode: str) -> None:
+    env.setenv("ROBINHOOD_MCP_AUTH", mode)
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", FERNET_KEY)
+    with pytest.raises(SettingsError, match="only valid with ROBINHOOD_MCP_AUTH=refresh_token"):
+        load_settings()
+
+
+@pytest.mark.parametrize("bad", ["not-a-key", "a" * 44, "YWJj"])
+def test_malformed_key_fails_without_echo(env: pytest.MonkeyPatch, bad: str) -> None:
+    env.setenv("ROBINHOOD_MCP_AUTH", "refresh_token")
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", bad)
+    with pytest.raises(SettingsError, match="Fernet key") as info:
+        load_settings()
+    assert bad not in str(info.value)
+
+
+def test_key_absent_by_default(env: pytest.MonkeyPatch) -> None:
+    snapshot = load_settings().config_snapshot()
+    assert snapshot["robinhood_token_encryption_key_present"] is False
+
+
+def test_credential_seed_settings_need_only_env_db_and_key(env: pytest.MonkeyPatch) -> None:
+    env.delenv("ANTHROPIC_API_KEY")
+    env.delenv("WHEELTA_MCP_TOKEN")
+    with pytest.raises(SettingsError, match="ROBINHOOD_TOKEN_ENCRYPTION_KEY"):
+        load_credential_seed_settings()
+    env.setenv("ROBINHOOD_TOKEN_ENCRYPTION_KEY", FERNET_KEY)
+    env.setenv("APP_ENV", "staging")
+    seed = load_credential_seed_settings()
+    assert seed.APP_ENV.value == "staging"
+    assert seed.ROBINHOOD_TOKEN_ENCRYPTION_KEY.get_secret_value() == FERNET_KEY

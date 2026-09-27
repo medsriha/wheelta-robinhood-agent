@@ -24,7 +24,7 @@ def _patch(old: str, new: str) -> bytes:
 
 def test_real_file_loads() -> None:
     loaded = load_rules()
-    assert loaded.version == loaded.rules.meta.version == 5
+    assert loaded.version == loaded.rules.meta.version == 6
     assert len(loaded.sha256) == 64
     r = loaded.rules
     assert r.limits.max_contracts_per_order == 10
@@ -34,7 +34,9 @@ def test_real_file_loads() -> None:
     assert isinstance(r.filters.min_abs_delta, Decimal)
     assert r.scope.leveraged_inverse_etfs_allowed is False
     assert [rule.id for rule in r.management.rules] == [1, 2, 3, 4, 5, 6, 7]
-    assert r.meta.signed_off_by == "TBD"
+    assert r.meta.signed_off_on == "2026-09-26"
+    assert r.limits.max_collateral_per_underlying_ratio == Decimal("0.20")
+    assert r.limits.max_sector_concentration_ratio is RuleMarker.AGENT_DISCRETION
     assert r.management.close_quantity is RuleMarker.AGENT_DISCRETION
     assert "365" in r.definitions.annualization
 
@@ -85,7 +87,7 @@ def test_tbd_loads_as_unset() -> None:
             'underlying_denylist = ["brk.b"]',
             "scope.underlying_denylist",
         ),
-        ("version = 5", 'version = "5"', "meta.version"),
+        ("version = 6", 'version = "6"', "meta.version"),
         ('time_in_force = "day"', "time_in_force = 1", "orders.time_in_force"),
     ],
 )

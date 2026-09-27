@@ -10,7 +10,7 @@ LEDGER_TABLES = [
     "workspace_events",
     "results", "citations", "account_snapshots", "agent_outputs", "decision_facts",
     "agent_decisions", "assembled_run_records", "audit_findings", "alerts_sent",
-    "web_cache_entries", "web_cache_entry_tickers",
+    "web_cache_entries", "web_cache_entry_tickers", "oauth_credentials",
 ]  # fmt: skip
 
 Conn = psycopg.Connection[tuple[object, ...]]
@@ -99,6 +99,9 @@ VALUES (gen_random_uuid(), '00000000-0000-0000-0000-000000000001',
         '00000000-0000-0000-0000-000000000002', 'WebSearch', 'aapl', 'AAPL', '{}', now());
 INSERT INTO web_cache_entry_tickers (entry_id, ticker)
 SELECT entry_id, 'AAPL' FROM web_cache_entries;
+INSERT INTO oauth_credentials (credential_id, environment, provider, client_id, ciphertext,
+                               access_expires_at, obtained_at, source)
+VALUES (gen_random_uuid(), 'local', 'robinhood', 'client-1', '\\x01', now(), now(), 'seed');
 """
 
 

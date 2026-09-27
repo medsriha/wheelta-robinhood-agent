@@ -1,8 +1,8 @@
 """Fake Robinhood/Wheelta servers, fixture result mappers, and scripted agents for e2e runs.
 
-The fake broker's payload shapes are INVENTED for these tests (the real Robinhood schemas are
-unverified). The mappers below are fixture mappers for these fake shapes only; production
-`VERIFIED_MAPPERS` stays empty. Prices are decimal strings, never floats.
+The fake broker's payload shapes are INVENTED for these tests. The mappers below are fixture
+mappers for these fake shapes only; production uses `VERIFIED_MAPPERS` (agent/robinhood_mappers.py,
+built from real captured responses). Prices are decimal strings, never floats.
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def build_world(as_of: datetime) -> FakeWorld:
             {
                 "as_of": stamp,
                 "agentic": True,
-                "account_value": "50000.00",
+                "account_value": "150000.00",
                 "settled_cash": "30000.00",
                 "csp_reserved": "0.00",
             }

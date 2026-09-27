@@ -22,7 +22,7 @@ EXPECTED_TABLES = {
     "workspace_events",
     "results", "citations", "account_snapshots", "agent_outputs", "decision_facts",
     "agent_decisions", "assembled_run_records", "audit_findings", "alerts_sent",
-    "web_cache_entries", "web_cache_entry_tickers",
+    "web_cache_entries", "web_cache_entry_tickers", "oauth_credentials",
 }  # fmt: skip
 
 

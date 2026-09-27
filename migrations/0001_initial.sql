@@ -435,6 +435,30 @@ CREATE TABLE web_cache_entry_tickers (
 
 CREATE INDEX web_cache_entry_tickers_ticker_idx ON web_cache_entry_tickers (ticker);
 
+-- Robinhood OAuth credentials for headless refresh (ADR-0021). Each row is one encrypted
+-- {access_token, refresh_token} pair (Fernet, key ROBINHOOD_TOKEN_ENCRYPTION_KEY; the ledger
+-- stores only ciphertext). The current credential is the latest row for (environment,
+-- provider). Refresh tokens rotate, so a refresh appends a row that supersedes the one it
+-- consumed; the unique constraint stops two refreshes from both superseding the same row.
+CREATE TABLE oauth_credentials (
+    credential_id            uuid        PRIMARY KEY,
+    environment              text        NOT NULL
+                                         CHECK (environment IN ('local', 'staging', 'production')),
+    provider                 text        NOT NULL CHECK (provider = 'robinhood'),
+    client_id                text        NOT NULL CHECK (length(client_id) > 0),
+    ciphertext               bytea       NOT NULL CHECK (length(ciphertext) > 0),
+    access_expires_at        timestamptz NOT NULL,
+    obtained_at              timestamptz NOT NULL,
+    source                   text        NOT NULL CHECK (source IN ('seed', 'refresh')),
+    supersedes_credential_id uuid        REFERENCES oauth_credentials (credential_id),
+    recorded_at              timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT oauth_credentials_supersedes_key UNIQUE (supersedes_credential_id),
+    CHECK ((source = 'refresh') = (supersedes_credential_id IS NOT NULL))
+);
+
+CREATE INDEX oauth_credentials_current_idx
+    ON oauth_credentials (environment, provider, recorded_at DESC, credential_id DESC);
+
 CREATE FUNCTION ledger_reject_mutation() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -454,7 +478,7 @@ BEGIN
         'position_events', 'workspace_events',
         'results', 'citations', 'account_snapshots', 'agent_outputs', 'decision_facts',
         'agent_decisions', 'assembled_run_records', 'audit_findings', 'alerts_sent',
-        'web_cache_entries', 'web_cache_entry_tickers'
+        'web_cache_entries', 'web_cache_entry_tickers', 'oauth_credentials'
     ] LOOP
         EXECUTE format(
             'CREATE TRIGGER %I BEFORE UPDATE OR DELETE ON %I '

@@ -48,8 +48,9 @@ def _text(value: object) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value)}]}
 
 
-def test_no_verified_mappers_exist() -> None:
-    assert dict(VERIFIED_MAPPERS) == {}
+def test_only_captured_robinhood_tools_have_verified_mappers() -> None:
+    # The exact set is pinned in test_robinhood_mappers.py; no Wheelta mapping is verified.
+    assert all(server == "robinhood" for server, _ in VERIFIED_MAPPERS)
 
 
 @pytest.mark.parametrize(
@@ -82,7 +83,7 @@ def test_extract_rejects_unknown_shapes(response: object) -> None:
 
 def test_unmapped_remote_result_is_missing_and_raw_is_restricted() -> None:
     outcome = BoundaryValidator(Redactor())(
-        _req("robinhood", "get_equity_quotes", _text({"p": "1"}))
+        _req("robinhood", "get_equity_fundamentals", _text({"p": "1"}))
     )
     assert outcome.envelope.kind is EnvelopeKind.MISSING
     assert outcome.envelope.data is None

@@ -41,6 +41,8 @@ class AlertKind(StrEnum):
 
     ORDER_ACTIVITY = "order_activity"
     ROBINHOOD_NEEDS_AUTH = "robinhood_needs_auth"
+    # ADR-0021: a refresh succeeded but the rotated pair could not be stored.
+    ROBINHOOD_CREDENTIAL_UNSAVED = "robinhood_credential_unsaved"
     REPEATED_SOURCE_FAILURE = "repeated_source_failure"
     SCHEMA_DRIFT = "schema_drift"
     TOOL_DRIFT = "tool_drift"
@@ -65,6 +67,7 @@ class AlertSpec(BaseModel):
 ALERT_SPECS: Mapping[AlertKind, AlertSpec] = {
     AlertKind.ORDER_ACTIVITY: AlertSpec(severity=AlertSeverity.INFO, runbook="R11"),
     AlertKind.ROBINHOOD_NEEDS_AUTH: AlertSpec(severity=AlertSeverity.ERROR, runbook="R2"),
+    AlertKind.ROBINHOOD_CREDENTIAL_UNSAVED: AlertSpec(severity=AlertSeverity.ERROR, runbook="R17"),
     AlertKind.REPEATED_SOURCE_FAILURE: AlertSpec(severity=AlertSeverity.WARNING, runbook="R15"),
     AlertKind.SCHEMA_DRIFT: AlertSpec(severity=AlertSeverity.WARNING, runbook="R6"),
     AlertKind.TOOL_DRIFT: AlertSpec(severity=AlertSeverity.ERROR, runbook="R5"),

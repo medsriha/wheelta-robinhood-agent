@@ -211,7 +211,8 @@ def test_dry_run_produces_a_dry_run_proposal_and_audit(harness: Callable[..., Ha
     (attempt,) = leg.attempts
     assert attempt.status is AttemptStatus.NOT_PLACED
     assert ReasonCode.DRY_RUN in attempt.reason_codes
-    assert attempt.requested_quantity == 2  # min(cash 30000, cap 10) / (150 x 100)
+    # min(cash 30000, 20% of 150000 = 30000, cap 10 contracts) / (150 x 100) = 2
+    assert attempt.requested_quantity == 2
     assert attempt.place_tool_call_id is None and attempt.broker_order_id is None
     assert facts and facts[0].facts.initial_quantity == 2
     outcomes = {(f.check_id.value, f.outcome.value) for f in findings}

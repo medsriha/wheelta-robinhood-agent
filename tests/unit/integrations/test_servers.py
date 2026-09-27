@@ -96,3 +96,29 @@ def test_robinhood_claude_code_login_mode_builds_a_tokenless_server() -> None:
     assert isinstance(out, McpHttpServer)
     assert out.uses_stored_cli_login and out.token is None
     assert "headers" not in out.to_sdk_config()
+
+
+FERNET_KEY = "a" * 43 + "="  # test key shape only
+
+
+def test_refresh_token_mode_uses_the_resolved_access_token() -> None:
+    settings = _settings(
+        ROBINHOOD_MCP_AUTH="refresh_token", ROBINHOOD_TOKEN_ENCRYPTION_KEY=FERNET_KEY
+    )
+    server = build_robinhood_server(settings, NOW, SecretStr(RH_SECRET))
+    assert isinstance(server, McpHttpServer)
+    assert server.to_sdk_config()["headers"] == {"Authorization": f"Bearer {RH_SECRET}"}
+    assert RH_SECRET not in repr(server)
+
+
+def test_refresh_token_mode_without_a_resolved_token_is_needs_auth() -> None:
+    settings = _settings(
+        ROBINHOOD_MCP_AUTH="refresh_token", ROBINHOOD_TOKEN_ENCRYPTION_KEY=FERNET_KEY
+    )
+    obs = build_robinhood_server(settings, NOW)
+    assert isinstance(obs, SourceObservation) and obs.status is SourceStatus.NEEDS_AUTH
+
+
+def test_resolved_token_is_refused_outside_refresh_token_mode() -> None:
+    with pytest.raises(ValueError, match="only accepted with ROBINHOOD_MCP_AUTH=refresh_token"):
+        build_robinhood_server(_settings(), NOW, SecretStr(RH_SECRET))

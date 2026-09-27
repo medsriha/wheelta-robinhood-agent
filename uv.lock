@@ -1848,6 +1848,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "cryptography" },
     { name = "exchange-calendars" },
     { name = "httpx" },
     { name = "psycopg", extra = ["binary"] },
@@ -1868,6 +1869,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", specifier = "==0.2.160" },
+    { name = "cryptography", specifier = ">=50.0.1" },
     { name = "exchange-calendars", specifier = ">=4.5" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },

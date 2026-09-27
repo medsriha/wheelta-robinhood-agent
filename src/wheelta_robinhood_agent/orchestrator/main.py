@@ -3,7 +3,8 @@
 boot (settings, rules, prompt; fail fast) → logging → slot/run_id → ledger connection →
 single-flight lock (`skipped_concurrent`) → run slot (completed → no-op; interrupted →
 reconcile and finalize without a new session) → preflight (kill switch, NYSE session) →
-session plan (effective mode capped at off; no order tool can be exposed) → prompt v6 →
+Robinhood credential (refresh_token mode only: load, refresh near expiry, persist before use;
+ADR-0021) → session plan (effective mode capped at off; no order tool can be exposed) → prompt v6 →
 agent session → `assemble_run_record` → position notes (ADR-0018) → `run_audit` → persist →
 alerts/heartbeat → exit code.
 
@@ -72,6 +73,7 @@ from wheelta_robinhood_agent.config.prompts import (
 from wheelta_robinhood_agent.config.rules import LoadedRules, RulesError, load_rules
 from wheelta_robinhood_agent.config.settings import (
     PHASE_EXECUTION_CEILING,
+    RobinhoodMcpAuth,
     Settings,
     SettingsError,
     load_settings,
@@ -102,10 +104,12 @@ from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
 from wheelta_robinhood_agent.integrations.robinhood.server import build_robinhood_server
+from wheelta_robinhood_agent.integrations.robinhood.token_vault import TokenVault
 from wheelta_robinhood_agent.integrations.status import SourceObservation
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.server import build_wheelta_server
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
+from wheelta_robinhood_agent.ledger import oauth_credentials as ledger_credentials
 from wheelta_robinhood_agent.ledger import orders as ledger_orders
 from wheelta_robinhood_agent.ledger import positions as ledger_positions
 from wheelta_robinhood_agent.ledger.db import connect
@@ -143,6 +147,14 @@ from wheelta_robinhood_agent.orchestrator.market_session import (
     evaluate_market_session,
 )
 from wheelta_robinhood_agent.orchestrator.preflight import PreflightSkip, decide_preflight
+from wheelta_robinhood_agent.orchestrator.robinhood_credential import (
+    CredentialInserter,
+    CredentialResolution,
+    CredentialStatus,
+    OAuthRefresher,
+    refresh_via_http,
+    resolve_robinhood_credential,
+)
 from wheelta_robinhood_agent.orchestrator.signals import (
     RunDeadline,
     install_stop_signal_handlers,
@@ -221,6 +233,9 @@ class OrchestratorDeps:
     account_scope_table: Mapping[str, AccountScopeSpec] = field(
         default_factory=lambda: ROBINHOOD_ACCOUNT_SCOPE
     )
+    # ADR-0021 (ROBINHOOD_MCP_AUTH=refresh_token): the OAuth refresh and the credential insert.
+    oauth_refresher: OAuthRefresher = refresh_via_http
+    insert_credential: CredentialInserter = ledger_credentials.insert_credential
     connect_budget_seconds: float | None = None
     interrupt_grace_seconds: float | None = None
     status_poll_interval: float | None = None
@@ -460,7 +475,43 @@ class _Run:
             if restore is not None:
                 restore()
 
-    def _plan(self, effective_mode: ExecutionMode) -> SessionPlan:
+    def _robinhood_credential(self) -> CredentialResolution | None:
+        """ADR-0021: in refresh_token mode, the access token for this run (refreshed and
+        persisted first if near expiry). None in the other modes. Recorded without secrets;
+        every token seen is added to the run's redactor."""
+        settings = self.settings
+        if settings.ROBINHOOD_MCP_AUTH is not RobinhoodMcpAuth.REFRESH_TOKEN:
+            return None
+        key = settings.ROBINHOOD_TOKEN_ENCRYPTION_KEY
+        if key is None:  # Settings rejects this; kept so the type is narrowed without assert
+            raise SessionPlanError("refresh_token mode without an encryption key")
+        resolution = resolve_robinhood_credential(
+            self.conn,
+            environment=settings.APP_ENV,
+            vault=TokenVault(key),
+            clock=self.deps.clock,
+            refresher=self.deps.oauth_refresher,
+            insert=self.deps.insert_credential,
+        )
+        self.redactor = Redactor(
+            account_number=settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+            secrets=(*settings_secrets(settings), *resolution.secrets),
+        )
+        self.event(
+            RunEventType.METADATA,
+            {"robinhood_credential": resolution.event_payload()},
+            key="metadata:robinhood_credential",
+        )
+        log = self.log.bind(stage="robinhood_auth")
+        if resolution.usable:
+            log.info("robinhood credential resolved", extra=resolution.event_payload())
+        else:
+            log.error("robinhood credential unavailable", extra=resolution.event_payload())
+        return resolution
+
+    def _plan(
+        self, effective_mode: ExecutionMode, robinhood_token: SecretStr | None = None
+    ) -> SessionPlan:
         rh_registry, wt_registry = self.deps.registries
         now = self.deps.clock()
         plan = plan_session(
@@ -468,12 +519,16 @@ class _Run:
             workspace_writes=self.settings.ROBINHOOD_WORKSPACE_WRITES,
             sources=(
                 RemoteSource(
-                    rh_registry, build_robinhood_server(self.settings, now), required=True
+                    rh_registry,
+                    build_robinhood_server(self.settings, now, robinhood_token),
+                    required=True,
                 ),
                 RemoteSource(wt_registry, build_wheelta_server(self.settings)),
             ),
             observed_at=now,
-            remote_boundary_accepted=self.deps.remote_boundary_accepted,
+            remote_boundary_accepted=(
+                self.deps.remote_boundary_accepted or self.settings.remote_result_risk_accepted
+            ),
         )
         self.event(
             RunEventType.METADATA,
@@ -527,13 +582,28 @@ class _Run:
         return max(remaining - FINALIZE_RESERVE_SECONDS, 0.0)
 
     def _agent_run(self, effective_mode: ExecutionMode) -> int:
-        plan = self._plan(effective_mode)
-        if ROBINHOOD in plan.withheld:
+        credential = self._robinhood_credential()
+        plan = self._plan(effective_mode, credential.access_token if credential else None)
+        unavailable_reason: str | None = None
+        if credential is not None and credential.status is CredentialStatus.PERSIST_FAILED:
+            unavailable_reason = "robinhood_credential_unsaved"
+            self.alert(
+                AlertKind.ROBINHOOD_CREDENTIAL_UNSAVED,
+                credential.operator_message or "rotated Robinhood credential not saved",
+                {"credential": credential.event_payload()},
+            )
+        elif ROBINHOOD in plan.withheld:
             obs = next((o for o in plan.observations if o.server == ROBINHOOD), None)
             if obs is not None and obs.status is SourceStatus.NEEDS_AUTH:
+                message = (
+                    credential.operator_message
+                    if credential is not None and credential.operator_message
+                    else "Robinhood needs authentication; no trading session was started"
+                )
                 self.alert(
                     AlertKind.ROBINHOOD_NEEDS_AUTH,
-                    "Robinhood needs authentication; no trading session was started (ADR-0004)",
+                    message,
+                    {"credential": credential.event_payload()} if credential else None,
                 )
         book = ledger_positions.position_book(self.conn, self.scope_id, as_of=self.deps.clock())
         session: SessionResult | None = None
@@ -546,7 +616,7 @@ class _Run:
                 "required source unavailable; no session",
                 extra={"withheld": dict(plan.withheld)},
             )
-        return self._finish(plan, book, prompt, session)
+        return self._finish(plan, book, prompt, session, unavailable_reason)
 
     def _session(self, plan: SessionPlan, prompt: RenderedPrompt) -> SessionResult:
         scratch = Path(tempfile.mkdtemp(prefix="wra-agent-", dir=self.deps.scratch_root))
@@ -586,6 +656,7 @@ class _Run:
         book: PositionBook,
         prompt: RenderedPrompt | None,
         session: SessionResult | None,
+        unavailable_reason: str | None = None,
     ) -> int:
         if session is not None:
             self.observe_sources(session.observations[len(plan.observations) :])
@@ -612,6 +683,8 @@ class _Run:
         record = self._assemble(meta, book, decisions, output_id)
         audit_ok = self._audit(meta, book, decisions, record)
         status, reason = self._status(plan, session, decisions)
+        if unavailable_reason is not None and reason == "required_source_unavailable":
+            reason = unavailable_reason
         if not audit_ok and status is RunStatus.COMPLETED:
             status, reason = RunStatus.FAILED, "audit_failed"
         return self.finalize(status, reason)

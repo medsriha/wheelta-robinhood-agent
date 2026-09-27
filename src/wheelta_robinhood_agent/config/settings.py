@@ -4,6 +4,7 @@
 never hot-reload; the runtime stop latch (RunControl) is separate (ADR-0010 item 9).
 """
 
+import base64
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ PHASE_EXECUTION_CEILING = ExecutionMode.OFF
 
 # The cron interval is hourly; the run budget must leave room before the next fire.
 _CRON_INTERVAL_SECONDS = 3600
+_FERNET_KEY_BYTES = 32
 
 
 class RobinhoodMcpAuth(StrEnum):
@@ -37,6 +39,9 @@ class RobinhoodMcpAuth(StrEnum):
     # Local development only: the Claude Code CLI reuses the OAuth login it stored for the
     # `robinhood` server (`/mcp`). No token passes through our code.
     CLAUDE_CODE_LOGIN = "claude_code_login"
+    # ADR-0021: the orchestrator keeps an encrypted, rotating OAuth token pair in the ledger
+    # and refreshes it headlessly. Needs ROBINHOOD_TOKEN_ENCRYPTION_KEY and a seeded pair.
+    REFRESH_TOKEN = "refresh_token"  # noqa: S105 - a mode name, not a credential
 
 
 class LogLevel(StrEnum):
@@ -73,9 +78,16 @@ class Settings(BaseSettings):
     MCP_TOOL_TIMEOUT: PositiveInt = 60000
 
     ROBINHOOD_MCP_URL: AnyHttpUrl = AnyHttpUrl("https://agent.robinhood.com/mcp/trading")
-    # Mechanism unresolved (ADR-0004). Absent means Robinhood is unavailable (needs-auth).
+    # ROBINHOOD_MCP_AUTH=token only. Absent means Robinhood is unavailable (needs-auth).
     ROBINHOOD_MCP_ACCESS_TOKEN: SecretStr | None = None
     ROBINHOOD_MCP_AUTH: RobinhoodMcpAuth = RobinhoodMcpAuth.TOKEN
+    # ADR-0021: Fernet key (urlsafe base64 of 32 bytes) for the ledger's oauth_credentials.
+    # Required with ROBINHOOD_MCP_AUTH=refresh_token and rejected in every other mode.
+    ROBINHOOD_TOKEN_ENCRYPTION_KEY: SecretStr | None = None
+    # ADR-0019 (owner-approved 2026-09-26): for local dry runs only, the owner accepts that the
+    # CLI may pass unvalidated remote error/oversized/fallback text to the model
+    # (DATA_QUALITY.md real-CLI acceptance tests 3-7).
+    LOCAL_ACCEPT_REMOTE_RESULT_RISK: bool = False
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER: SecretStr
     ROBINHOOD_WORKSPACE_WRITES: bool = True
     ROBINHOOD_WORKSPACE_PREFIX: str = Field(default="WRA · ", min_length=1)
@@ -96,7 +108,11 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
-        "ROBINHOOD_MCP_ACCESS_TOKEN", "HEARTBEAT_URL", "ALERT_WEBHOOK_URL", mode="before"
+        "ROBINHOOD_MCP_ACCESS_TOKEN",
+        "ROBINHOOD_TOKEN_ENCRYPTION_KEY",
+        "HEARTBEAT_URL",
+        "ALERT_WEBHOOK_URL",
+        mode="before",
     )
     @classmethod
     def _blank_is_absent(cls, value: object) -> object:
@@ -123,6 +139,44 @@ class Settings(BaseSettings):
                     "ROBINHOOD_MCP_AUTH=claude_code_login excludes ROBINHOOD_MCP_ACCESS_TOKEN"
                 )
         return self
+
+    @field_validator("ROBINHOOD_TOKEN_ENCRYPTION_KEY")
+    @classmethod
+    def _fernet_key_shape(cls, value: SecretStr | None) -> SecretStr | None:
+        return None if value is None else validate_fernet_key(value)
+
+    @model_validator(mode="after")
+    def _refresh_token_mode_credentials(self) -> "Settings":
+        """ADR-0021: refresh_token mode needs the encryption key and excludes a static token,
+        and the key is meaningless (so rejected) in the other modes."""
+        refresh = self.ROBINHOOD_MCP_AUTH is RobinhoodMcpAuth.REFRESH_TOKEN
+        if refresh and self.ROBINHOOD_TOKEN_ENCRYPTION_KEY is None:
+            raise ValueError(
+                "ROBINHOOD_MCP_AUTH=refresh_token requires ROBINHOOD_TOKEN_ENCRYPTION_KEY"
+            )
+        if refresh and self.ROBINHOOD_MCP_ACCESS_TOKEN is not None:
+            raise ValueError("ROBINHOOD_MCP_AUTH=refresh_token excludes ROBINHOOD_MCP_ACCESS_TOKEN")
+        if not refresh and self.ROBINHOOD_TOKEN_ENCRYPTION_KEY is not None:
+            raise ValueError(
+                "ROBINHOOD_TOKEN_ENCRYPTION_KEY is only valid with ROBINHOOD_MCP_AUTH=refresh_token"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _remote_risk_acceptance_is_local_only(self) -> "Settings":
+        if self.LOCAL_ACCEPT_REMOTE_RESULT_RISK and self.APP_ENV is not AppEnv.LOCAL:
+            raise ValueError("LOCAL_ACCEPT_REMOTE_RESULT_RISK=true requires APP_ENV=local")
+        return self
+
+    @property
+    def remote_result_risk_accepted(self) -> bool:
+        """ADR-0019: remote tools may reach the model before the result boundary is fully
+        accepted only on a local dry run the owner explicitly opted into."""
+        return (
+            self.LOCAL_ACCEPT_REMOTE_RESULT_RISK
+            and self.APP_ENV is AppEnv.LOCAL
+            and self.effective_execution_mode is ExecutionMode.OFF
+        )
 
     @property
     def requested_execution_mode(self) -> ExecutionMode:
@@ -160,6 +214,10 @@ class Settings(BaseSettings):
             "robinhood_mcp_url": str(self.ROBINHOOD_MCP_URL),
             "robinhood_token_present": self.ROBINHOOD_MCP_ACCESS_TOKEN is not None,
             "robinhood_mcp_auth": self.ROBINHOOD_MCP_AUTH.value,
+            "robinhood_token_encryption_key_present": (
+                self.ROBINHOOD_TOKEN_ENCRYPTION_KEY is not None
+            ),
+            "local_accept_remote_result_risk": self.LOCAL_ACCEPT_REMOTE_RESULT_RISK,
             "robinhood_account_last4": self.account_last4,
             "robinhood_workspace_writes": self.ROBINHOOD_WORKSPACE_WRITES,
             "robinhood_workspace_prefix": self.ROBINHOOD_WORKSPACE_PREFIX,
@@ -167,6 +225,17 @@ class Settings(BaseSettings):
             "heartbeat_configured": self.HEARTBEAT_URL is not None,
             "alerts_configured": self.ALERT_WEBHOOK_URL is not None,
         }
+
+
+def validate_fernet_key(value: SecretStr) -> SecretStr:
+    """A Fernet key is urlsafe base64 of exactly 32 bytes. Checked without echoing it."""
+    try:
+        raw = base64.urlsafe_b64decode(value.get_secret_value().encode("ascii"))
+    except (ValueError, UnicodeEncodeError):
+        raise ValueError("must be a Fernet key (urlsafe base64 of 32 bytes)") from None
+    if len(raw) != _FERNET_KEY_BYTES:
+        raise ValueError("must be a Fernet key (urlsafe base64 of 32 bytes)")
+    return value
 
 
 def load_settings(env_file: Path | None = None) -> Settings:
@@ -208,6 +277,43 @@ def load_database_url() -> SecretStr:
     """Load DATABASE_URL alone, failing fast without echoing the value."""
     try:
         return DatabaseSettings().DATABASE_URL
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or '<settings>'}: {err['msg']}"
+            for err in exc.errors()
+        )
+        raise SettingsError(f"invalid configuration: {problems}") from None
+
+
+class CredentialSeedSettings(BaseSettings):
+    """Only what the Robinhood credential seed command needs (ADR-0021): the environment,
+    the ledger, and the encryption key. No agent secrets are required to seed."""
+
+    model_config = SettingsConfigDict(
+        extra="ignore", frozen=True, case_sensitive=True, env_file=None, hide_input_in_errors=True
+    )
+
+    APP_ENV: AppEnv = AppEnv.LOCAL
+    DATABASE_URL: SecretStr
+    ROBINHOOD_TOKEN_ENCRYPTION_KEY: SecretStr
+
+    @field_validator("DATABASE_URL")
+    @classmethod
+    def _not_blank(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("required; must not be blank")
+        return value
+
+    @field_validator("ROBINHOOD_TOKEN_ENCRYPTION_KEY")
+    @classmethod
+    def _fernet_key_shape(cls, value: SecretStr) -> SecretStr:
+        return validate_fernet_key(value)
+
+
+def load_credential_seed_settings(env_file: Path | None = None) -> CredentialSeedSettings:
+    """Load the seed command's settings, failing fast without echoing any value."""
+    try:
+        return CredentialSeedSettings(_env_file=env_file)
     except ValidationError as exc:
         problems = "; ".join(
             f"{'.'.join(str(p) for p in err['loc']) or '<settings>'}: {err['msg']}"

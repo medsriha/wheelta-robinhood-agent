@@ -23,3 +23,7 @@ class DedupConflict(LedgerError):
 
 class UnknownEntity(LedgerError):
     """The referenced identity row does not exist."""
+
+
+class CredentialConflict(LedgerError):
+    """Another credential row already supersedes the one this insert claims to supersede."""

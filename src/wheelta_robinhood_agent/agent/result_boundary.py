@@ -15,9 +15,9 @@ docs/DATA_QUALITY.md "Delivery and failure contract"; CLAUDE.md §2.3-2.4, §8, 
   stored as restricted `raw_invalid` evidence: **no mapping means no data, never a guess**.
   MCP `isError` results become `error` envelopes.
 
-Every Robinhood/Wheelta result mapping is UNVERIFIED until our own `tools/list` and scrubbed
-result fixtures are captured (CLAUDE.md §9), so `VERIFIED_MAPPERS` is empty. Tests inject
-fixture mappers for fake servers only.
+`VERIFIED_MAPPERS` holds only the Robinhood tools whose results were captured as scrubbed
+fixtures (ADR-0017; `robinhood_mappers.py`). Every other Robinhood/Wheelta result stays
+`missing`. Tests inject fixture mappers for fake servers.
 
 The shape of `tool_response` for MCP tools in the PostToolUse hook input is itself unverified
 against the pinned CLI; `extract_mcp_payload` accepts the documented MCP `CallToolResult`
@@ -30,9 +30,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Final, Protocol
+from typing import Any, Final
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, JsonValue, ValidationError
+from pydantic import JsonValue, ValidationError
 
 from wheelta_robinhood_agent.agent.hooks import (
     BUILTIN_SERVER,
@@ -41,18 +41,23 @@ from wheelta_robinhood_agent.agent.hooks import (
     ValidationOutcome,
     ValidationRequest,
 )
-from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
-from wheelta_robinhood_agent.domain.account import AccountSnapshot
-from wheelta_robinhood_agent.domain.base import NonEmptyStr, Ref
-from wheelta_robinhood_agent.domain.enums import CandidateOrigin
-from wheelta_robinhood_agent.domain.facts_compute import (
-    OpenOrdersRead,
-    OptionInstrument,
-    PositionsRead,
-    UnderlyingQuote,
+from wheelta_robinhood_agent.agent.mapped_evidence import (  # re-exported
+    CandidateEvidence as CandidateEvidence,
 )
-from wheelta_robinhood_agent.domain.options import OccSymbol
-from wheelta_robinhood_agent.domain.run_record import Quote
+from wheelta_robinhood_agent.agent.mapped_evidence import (
+    EvidenceMapper as EvidenceMapper,
+)
+from wheelta_robinhood_agent.agent.mapped_evidence import (
+    MappedEvidence as MappedEvidence,
+)
+from wheelta_robinhood_agent.agent.mapped_evidence import (
+    MappingRequest as MappingRequest,
+)
+from wheelta_robinhood_agent.agent.robinhood_mappers import ROBINHOOD_MAPPERS
+from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
+from wheelta_robinhood_agent.integrations.robinhood.registry import (
+    SERVER_NAME as ROBINHOOD_SERVER,
+)
 from wheelta_robinhood_agent.ledger.ids import new_id
 from wheelta_robinhood_agent.observability.redaction import REDACTED, Redactor, is_account_key
 
@@ -67,81 +72,11 @@ def evidence_ref_for(tool_call_id: uuid.UUID) -> str:
     return f"{EVIDENCE_REF_PREFIX}{tool_call_id}"
 
 
-class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-class CandidateEvidence(_Model):
-    """A code-issued candidate reference and the instrument it names (OUTPUT_ASSEMBLY.md).
-
-    The model may select `candidate_ref`; it can never mint one from a ticker string.
-    """
-
-    candidate_ref: Ref
-    origin: CandidateOrigin
-    underlying: NonEmptyStr
-    instrument_evidence_id: uuid.UUID
-    broker_instrument_id: NonEmptyStr
-    occ_symbol: OccSymbol
-
-
-class MappedEvidence(_Model):
-    """Normalized, typed evidence produced from one validated tool result."""
-
-    instruments: tuple[OptionInstrument, ...] = ()
-    option_quotes: tuple[Quote, ...] = ()
-    underlying_quotes: tuple[UnderlyingQuote, ...] = ()
-    account_snapshots: tuple[AccountSnapshot, ...] = ()
-    positions: tuple[PositionsRead, ...] = ()
-    open_orders: tuple[OpenOrdersRead, ...] = ()
-    candidates: tuple[CandidateEvidence, ...] = ()
-    gaps: tuple[str, ...] = ()
-
-    def evidence_ids(self) -> tuple[uuid.UUID, ...]:
-        return (
-            *(i.evidence_id for i in self.instruments),
-            *(q.quote_id for q in self.option_quotes),
-            *(u.evidence_id for u in self.underlying_quotes),
-            *(a.snapshot_id for a in self.account_snapshots),
-            *(p.evidence_id for p in self.positions),
-            *(o.evidence_id for o in self.open_orders),
-        )
-
-    def source_tool_call_ids(self) -> tuple[uuid.UUID, ...]:
-        return (
-            *(t for i in self.instruments for t in i.source_tool_call_ids),
-            *(t for q in self.option_quotes for t in q.source_tool_call_ids),
-            *(t for u in self.underlying_quotes for t in u.source_tool_call_ids),
-            *(t for a in self.account_snapshots for t in a.tool_call_ids),
-            *(t for p in self.positions for t in p.source_tool_call_ids),
-            *(t for o in self.open_orders for t in o.source_tool_call_ids),
-        )
-
-
-class MappingRequest(_Model):
-    """Input to an `EvidenceMapper`: the parsed (redacted) payload of one successful call."""
-
-    tool_call_id: uuid.UUID
-    server: str
-    tool: str
-    effective_input: dict[str, JsonValue]
-    payload: JsonValue
-    retrieved_at: AwareDatetime
-
-
-class EvidenceMapper(Protocol):
-    """Map one tool's verified result schema to typed evidence. Raise on any schema mismatch.
-
-    `new_id` issues evidence IDs and candidate refs, so every identity is code-issued.
-    """
-
-    def __call__(
-        self, request: MappingRequest, new_id: Callable[[], uuid.UUID]
-    ) -> MappedEvidence: ...
-
-
-# (server, tool) -> mapper. Empty until result schemas are captured and verified (CLAUDE.md §9).
-VERIFIED_MAPPERS: Mapping[tuple[str, str], EvidenceMapper] = MappingProxyType({})
+# (server, tool) -> mapper. Only tools whose result shapes were captured and verified
+# (ADR-0017 fixtures, tests/fixtures/robinhood/results/; robinhood_mappers.py).
+VERIFIED_MAPPERS: Mapping[tuple[str, str], EvidenceMapper] = MappingProxyType(
+    {(ROBINHOOD_SERVER, tool): mapper for tool, mapper in ROBINHOOD_MAPPERS.items()}
+)
 
 
 class PayloadError(ValueError):

@@ -76,7 +76,17 @@ from wheelta_robinhood_agent.domain.tool_calls import (
 )
 
 T0 = datetime(2026, 9, 25, 15, 0, tzinfo=UTC)
-RULES: TradingRules = load_rules().rules
+_REAL_RULES: TradingRules = load_rules().rules
+# Scenario baseline: the real rules with the per-underlying cap pinned at 1.00, so scenarios
+# about other checks aren't turned into per-underlying violations by the owner's 20% cap
+# (ADR-0020). The per-underlying tests set the cap explicitly via rules_with(...).
+RULES: TradingRules = _REAL_RULES.model_copy(
+    update={
+        "limits": _REAL_RULES.limits.model_copy(
+            update={"max_collateral_per_underlying_ratio": Decimal("1.00")}
+        )
+    }
+)
 RUN_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 PUT = OccSymbol.parse("AAPL  261016P00050000")  # strike 50 -> 5000 collateral per contract
