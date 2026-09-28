@@ -143,8 +143,13 @@ def test_order_tools_are_never_allowed_and_live_is_refused() -> None:
 def test_tool_table_lists_only_allowed_verified_tools_and_withheld_sources() -> None:
     table = available_tools_table(_plan())
     assert f"`mcp__{LOCAL_SERVER_NAME}__{FACTS_TOOL_NAME}`" in table
-    assert f"`mcp__{LOCAL_SERVER_NAME}__{WEB_CACHE_TOOL_NAME}`" in table
+    # web_cache_lookup is a Mignon tool: the orchestrator's table omits it.
+    assert f"`mcp__{LOCAL_SERVER_NAME}__{WEB_CACHE_TOOL_NAME}`" not in table
+    assert f"`mcp__{LOCAL_SERVER_NAME}__{WEB_CACHE_TOOL_NAME}`" in available_tools_table(
+        _plan(), Role.COMPANY
+    )
     assert "`mcp__robinhood__get_option_quotes`" in table
+    assert "robinhood tool" not in table  # no placeholder purposes
     assert "place_option_order" not in table
     assert "mcp__wheelta__" not in table
     assert "- wheelta: tool registry unverified" in table
@@ -260,15 +265,31 @@ def test_local_server_must_match_its_registry() -> None:
         build_local_server([tool(WEB_CACHE_TOOL_NAME, "d", {"type": "object"})(_noop)])
 
 
-def test_orchestrator_table_lists_its_tools_and_each_mignon() -> None:
+def test_orchestrator_table_lists_its_tools_then_mignon_types_and_models_once() -> None:
     plan = _plan()
-    table = available_tools_table(plan)
-    head = table.split("Mignon `")[0]
+    models = ("claude-haiku-4-5", "claude-opus-4-8")
+    table = available_tools_table(plan, mignon_models=models)
+    head, roster = table.split("Mignon types")
     assert "| `Agent` | D |" in head
     assert "`mcp__robinhood__get_option_positions`" in head
-    assert "WebSearch" not in head and "wheelta_board_query" not in head
     for mignon in MignonType:
-        assert f"Mignon `{mignon.value}`" in table
+        assert roster.count(f"- `{mignon.value}`:") == 1
+    for model in models:
+        assert roster.count(f"- `{model}`:") == 1
+    # A Mignon's tools are its own prompt's business, never the orchestrator's table.
+    assert "WebSearch" not in table and "get_option_chains" not in table
+    assert "$1/$5" in roster
+
+
+def test_tools_with_unverified_account_scope_are_not_offered() -> None:
+    """The hook would deny every call (CLAUDE.md §18); the plan disallows them up front."""
+    plan = _plan()
+    allowed, disallowed = set(plan.tool_access.allowed_tools), plan.tool_access.disallowed_tools
+    for tool in ("get_scans", "get_watchlists", "get_alerts", "get_option_watchlist"):
+        name = f"mcp__robinhood__{tool}"
+        assert name not in allowed and name in disallowed
+        assert name not in available_tools_table(plan)
+    assert "mcp__robinhood__get_option_positions" in allowed  # verified scope
 
 
 def test_mignon_table_lists_only_its_role() -> None:

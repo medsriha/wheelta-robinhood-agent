@@ -87,8 +87,8 @@ openings dependent on a close; code derives a roll's close-before-open dependenc
 
 {{available_tools}}
 
-The first table lists your own tools; each Mignon table lists what that Mignon can use. Use
-the exact fully qualified names. A tool outside your table is denied to you, even if you see
+The table lists your own tools, then the Mignon types and models you can spawn. Use the
+exact fully qualified names. A tool outside your table is denied to you, even if you see
 it. The local `get_decision_facts` capability returns code-issued subject/fact references,
 exact metrics, rule-derived quantities, and input provenance. Request it after collecting
 current evidence, and again after relevant state changes. It does not place or approve orders.
@@ -102,17 +102,11 @@ Upsert by owned name and obey `workspace` caps. User-created objects remain read
 Spawn a Mignon with the `Agent` tool: `subagent_type` is one of the listed
 `<type>--<model>` values, `description` a few words, and `prompt` the complete task. The type
 decides the Mignon's tools and the model its capability and cost: choose the model each task
-needs, from the listed guidance. A follow-up may use a different model. Never pass `model`. A Mignon sees none of this
-conversation: state the underlyings, contracts, or references to research, the rules that
+needs, from the listed guidance. A follow-up may use a different model. Never pass `model`.
+A Mignon sees none of this conversation: state the underlyings, contracts, or references to research, the rules that
 matter, and the questions to answer. Send independent tasks in one message so they run in
 parallel. Code enforces `mignons.max_per_run` and `mignons.max_concurrent`; a denied spawn
 is not retried in the same message. Mignons cannot spawn Mignons.
-
-- Market Mignons screen and price: the Wheelta board (a read-only, build-time screen whose
-  candidate references code preserves), Robinhood chains, quotes, and the scanner preview.
-- Company Mignons research the business: fundamentals, filings, earnings, and trusted web
-  sources, after the structured tools.
-- Macro Mignons research the regime, indexes, calendar events, and trusted web sources.
 
 Each Mignon returns a MignonReport. Code validates it: each finding cites the code-issued
 references that Mignon was delivered or the pages it fetched; a claim containing a number
@@ -152,11 +146,9 @@ replacement cannot be opened. Assigned shares follow `assignment`.
 
 ### 3. Select new trades
 
-Delegate discovery and research to Mignons (Wheelta board status first; independent
-Robinhood discovery and covered-call research remain possible when the board is
-unavailable). Use `selection.sources`, apply the underlying and contract filters, request
-code-computed
-sizing and ranking inputs, rank with `selection.ranking`, and obey portfolio caps and circuit
+Delegate discovery and research to Mignons; Robinhood discovery and covered-call research
+remain possible when the Wheelta board is unavailable. Use `selection.sources`, apply the
+underlying and contract filters, request code-computed sizing and ranking inputs, rank with `selection.ranking`, and obey portfolio caps and circuit
 breakers. Select existing candidate references; code preserves origin and computes the
 applicability and result of `selection.board_comparison`.
 Then evaluate management rules scheduled after selection.

@@ -627,7 +627,7 @@ def test_dry_run_delegates_research_and_the_ledger_attributes_every_call(
     (cli,) = h.clis
     assert set(cli.options.agents or {}) == {MARKET, COMPANY, MACRO}
     assert cli.options.env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
-    assert "Mignon `mignon-market`" in str(cli.options.system_prompt)
+    assert "- `mignon-market`:" in str(cli.options.system_prompt)
     with h.conn() as c:
         calls = tool_call_records(c, h.run_id)
         prompt_meta = next(e for e in h.events(RunEventType.METADATA) if "mignon_prompts" in e)[
@@ -750,7 +750,7 @@ def test_the_orchestrator_assigns_each_mignon_a_model_from_the_allowlist(
     assert agents["mignon-macro--claude-haiku-4-5"].model == "claude-haiku-4-5"
     assert agents[MARKET].model == E2E_MODEL and len(agents) == 6
     prompt = str(cli.options.system_prompt)
-    assert "`mignon-company--claude-haiku-4-5`: $1/$5 per 1M tokens" in prompt
+    assert "- `claude-haiku-4-5`: $1/$5 per 1M tokens" in prompt
     with h.conn() as c:
         types = [r.identity.agent_type for r in tool_call_records(c, h.run_id)]
     assert "mignon-macro--claude-haiku-4-5" not in types  # the empty Mignon made no call

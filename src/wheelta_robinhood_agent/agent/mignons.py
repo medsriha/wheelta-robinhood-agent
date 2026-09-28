@@ -309,9 +309,12 @@ def build_agent_definitions(
         if not tools:
             continue
         for model in models:
-            guidance = MODEL_GUIDANCE.get(model, "no guidance recorded")
+            # The CLI lists every definition's description (and tools) to the orchestrator;
+            # the type and model guidance are in its prompt once, so this stays a pointer.
             definitions[agent_name(mignon, model)] = AgentDefinition(
-                description=f"{MIGNON_DESCRIPTIONS[mignon]} Model: {model} ({guidance}).",
+                description=(
+                    f"{mignon.value} on {model}: see Mignon types and Models in your tool table."
+                ),
                 prompt=prompts[mignon],
                 tools=list(tools),
                 model=model,

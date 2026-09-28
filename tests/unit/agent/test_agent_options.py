@@ -285,4 +285,4 @@ def test_each_mignon_type_is_offered_once_per_allowed_model() -> None:
         assert d.model == name.split("--", 1)[1]
     haiku = o.agents["mignon-company--claude-haiku-4-5"]
     assert haiku.tools == o.agents["mignon-company--claude-opus-4-8"].tools
-    assert "$1/$5" in haiku.description
+    assert haiku.description.startswith("mignon-company on claude-haiku-4-5")

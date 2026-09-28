@@ -57,7 +57,9 @@ from claude_agent_sdk.types import McpSdkServerConfig
 
 from wheelta_robinhood_agent.agent.account_scope import (
     ROBINHOOD_ACCOUNT_SCOPE,
+    AccountScope,
     AccountScopeSpec,
+    account_scope_for,
 )
 from wheelta_robinhood_agent.agent.facts_tool import (
     FACTS_TOOL_NAME,
@@ -77,7 +79,6 @@ from wheelta_robinhood_agent.agent.mignons import (
     MODEL_GUIDANCE,
     ROLE_TOOLS,
     Role,
-    agent_name,
     mignon_limits,
 )
 from wheelta_robinhood_agent.agent.options import build_agent_options
@@ -236,6 +237,7 @@ def plan_session(
     proxy_accepted: bool = PROXY_RESULT_BOUNDARY_ACCEPTED,
     local_registry: ToolRegistry = LOCAL_REGISTRY,
     mignons: bool = True,
+    account_scope_table: Mapping[str, AccountScopeSpec] = ROBINHOOD_ACCOUNT_SCOPE,
 ) -> SessionPlan:
     """Decide the exposed servers and tools before connecting (fail closed).
 
@@ -285,6 +287,15 @@ def plan_session(
             names = {registry.qualified(t.name) for t in registry.tools}
             disallowed |= names
             allowed -= names
+        # The hook denies every call to a tool whose account scope is unverified (CLAUDE.md
+        # §18), so it is not offered either: the proxy then never serves its schema.
+        for spec in registry.tools:
+            scope = account_scope_for(registry.server, spec.name, account_scope_table)
+            if scope.scope is AccountScope.UNVERIFIED:
+                name = registry.qualified(spec.name)
+                if name in allowed:
+                    allowed.discard(name)
+                    disallowed.add(name)
     access = ToolAccess(
         effective_mode=effective_mode,
         allowed_tools=tuple(sorted(allowed)),
@@ -333,7 +344,7 @@ def _role_rows(plan: SessionPlan, role: Role) -> list[str]:
         for spec in registry.tools:
             qualified = registry.qualified(spec.name)
             if qualified in allowed:
-                purpose = _TOOL_PURPOSES.get(qualified, f"{registry.server} tool")
+                purpose = _TOOL_PURPOSES.get(qualified, "")
                 rows.append(f"| `{qualified}` | {spec.tier.value} | {purpose} |")
     return rows
 
@@ -355,21 +366,21 @@ def available_tools_table(
 
     Only allowed tools of verified registries (plus allowed built-ins) are listed; withheld
     sources are named separately so the model does not look for them. The orchestrator's
-    table also lists each Mignon type it can spawn this run, one `subagent_type` per model in
-    `mignon_models` (with that model's guidance), and the type's tools.
+    table then lists the Mignon types it can spawn this run and the models in
+    `mignon_models` with their guidance, each once. A Mignon's own tools are not listed
+    there: the orchestrator cannot call them, and each Mignon's prompt carries its table.
     """
     lines = ["| Tool | Tier | Purpose |", "|---|---|---|", *_role_rows(plan, role)]
     if role is Role.ORCHESTRATOR and DELEGATION_TOOL in plan.tool_access.allowed_tools:
-        for mignon in MignonType:
-            rows = _role_rows(plan, Role(mignon.value))
-            if not rows:
-                continue
-            lines.extend(["", f"Mignon `{mignon.value}`: {MIGNON_DESCRIPTIONS[mignon]}", ""])
-            lines.append("Spawn it as one of these `subagent_type` values:")
-            for model in mignon_models:
-                guidance = MODEL_GUIDANCE.get(model, "no guidance recorded")
-                lines.append(f"- `{agent_name(mignon, model)}`: {guidance}")
-            lines.extend(["", "| Tool | Tier | Purpose |", "|---|---|---|", *rows])
+        types = [m for m in MignonType if _role_rows(plan, Role(m.value))]
+        if types and mignon_models:
+            lines.extend(["", "Mignon types (spawn as `subagent_type` = `<type>--<model>`):"])
+            lines.extend(f"- `{m.value}`: {MIGNON_DESCRIPTIONS[m]}" for m in types)
+            lines.extend(["", "Models:"])
+            lines.extend(
+                f"- `{model}`: {MODEL_GUIDANCE.get(model, 'no guidance recorded')}"
+                for model in mignon_models
+            )
     lines.extend(_withheld_lines(plan))
     return "\n".join(lines)
 
