@@ -967,3 +967,31 @@ def test_web_capture_skipped_for_mcp_and_invalid_results() -> None:
     s2.pre("WebSearch", {"query": "q"}, **COMPANY)
     s2.post("WebSearch", {})
     assert captured == []
+
+
+# -- ADR-0030: account placeholder on a direct (unproxied) server ------------------------------
+
+
+def test_direct_server_gets_the_placeholder_substituted_via_updated_input() -> None:
+    from wheelta_robinhood_agent.agent.account_scope import (
+        AGENTIC_ACCOUNT_PLACEHOLDER,
+        ROBINHOOD_ACCOUNT_SCOPE,
+    )
+
+    s = Session(make_deps(account_scope_table=ROBINHOOD_ACCOUNT_SCOPE))
+    placeholder = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+    out = s.pre(RH + "get_portfolio", placeholder)
+    assert out["hookSpecificOutput"]["updatedInput"] == {"account_number": ACCOUNT}
+    # The ledger keeps the redacted form: the placeholder as sent, the number masked.
+    assert s.rec.event("requested")["arguments_redacted"] == placeholder
+    dispatched = s.rec.event("dispatched")["effective_arguments_redacted"]
+    assert dispatched["account_number"] != ACCOUNT
+    assert dispatched["account_number"].endswith(ACCOUNT[-4:])
+
+
+def test_full_number_needs_no_substitution() -> None:
+    from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
+
+    s = Session(make_deps(account_scope_table=ROBINHOOD_ACCOUNT_SCOPE))
+    out = s.pre(RH + "get_portfolio", {"account_number": ACCOUNT})
+    assert "hookSpecificOutput" not in out

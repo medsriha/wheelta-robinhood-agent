@@ -43,6 +43,7 @@ from e2e_support import (
     RecordingNotifier,
 )
 
+from wheelta_robinhood_agent.agent.account_scope import AGENTIC_ACCOUNT_PLACEHOLDER
 from wheelta_robinhood_agent.agent.session import plan_session
 from wheelta_robinhood_agent.config.prompts import load_prompt
 from wheelta_robinhood_agent.config.rules import load_rules
@@ -926,9 +927,10 @@ def test_roles_are_enforced_both_ways(harness: Callable[..., Harness]) -> None:
 
     h = harness()
     assert h.run(script) == 0, h.notifier.alert_kinds()
-    assert ("mcp__robinhood__get_option_positions", {"account_number": ACCOUNT_NUMBER}) in (
-        h.world.calls
-    )  # only the orchestrator's own read reached the broker
+    assert (
+        "mcp__robinhood__get_option_positions",
+        {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER},
+    ) in h.world.calls  # only the orchestrator's own read reached the broker
     positions_calls = [n for n, _ in h.world.calls if n.endswith("get_option_positions")]
     assert len(positions_calls) == 1
 
@@ -1108,3 +1110,59 @@ def test_a_failed_delivery_is_recorded_as_failed(harness: Callable[..., Harness]
     (row,) = _summary_rows(h)
     assert row.delivery_status is ledger_evidence.DeliveryStatus.FAILED
     assert row.payload["error"] == "http_503"
+
+
+# -- account placeholder (ADR-0030) ---------------------------------------------------------------
+
+
+def test_account_placeholder_reaches_the_broker_as_the_configured_number(
+    harness: Callable[..., Harness],
+) -> None:
+    h = harness()
+    assert h.run() == 0, h.notifier.alert_kinds()
+    account_reads = [
+        (tool, args)
+        for server, tool, args in h.world.upstream_calls
+        if server == "robinhood" and "account_number" in args
+    ]
+    assert {t for t, _ in account_reads} == {
+        "get_portfolio",
+        "get_option_positions",
+        "get_option_orders",
+    }
+    assert all(a["account_number"] == ACCOUNT_NUMBER for _, a in account_reads)
+    # The model sent only the placeholder and never received the number back.
+    (cli,) = h.clis
+    model_sent = [args for name, args in h.world.calls if name == "mcp__robinhood__get_portfolio"]
+    assert model_sent == [{"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}]
+    assert all(ACCOUNT_NUMBER not in json.dumps(t.output, default=str) for t in cli.turns)
+    with h.conn() as c:
+        dump = json.dumps(
+            [
+                c.execute("SELECT arguments_redacted::text FROM tool_calls").fetchall(),
+                c.execute(
+                    "SELECT effective_arguments_redacted::text, payload::text FROM tool_call_events"
+                ).fetchall(),
+            ]
+        )
+        (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
+    assert ACCOUNT_NUMBER not in dump
+    assert stored.record.decisions  # account state was available, so the run decided
+
+
+def test_another_account_number_is_still_denied(harness: Callable[..., Harness]) -> None:
+    async def script(model: FakeModel) -> str | None:
+        other = await model.call(
+            "mcp__robinhood__get_portfolio", {"account_number": OTHER_ACCOUNT_NUMBER}
+        )
+        assert other.denied and "does not match" in (other.reason or "")
+        last_four = await model.call(
+            "mcp__robinhood__get_portfolio", {"account_number": ACCOUNT_NUMBER[-4:]}
+        )
+        assert last_four.denied
+        return await dry_run_script(model)
+
+    h = harness()
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    sent = [a for _, t, a in h.world.upstream_calls if t == "get_portfolio"]
+    assert sent == [{"account_number": ACCOUNT_NUMBER}]

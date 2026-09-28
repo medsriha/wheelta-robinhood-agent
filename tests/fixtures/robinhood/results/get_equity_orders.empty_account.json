@@ -1,0 +1,16 @@
+{
+  "provenance": {
+    "tool": "get_equity_orders",
+    "arguments": {
+      "account_number": "ACCOUNT_REDACTED"
+    },
+    "server": "robinhood-trading",
+    "captured_on": "2026-09-28",
+    "captured_via": "project upstream client, read-only (owner-approved)",
+    "scrubbing": "account_number replaced with ACCOUNT_REDACTED; `guide` dropped",
+    "note": "Agentic account had no equity orders at capture time"
+  },
+  "data": {
+    "orders": []
+  }
+}

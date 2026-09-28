@@ -124,6 +124,14 @@ class DecisionAction(StrEnum):
     HOLD = "HOLD"
 
 
+class PositionsCoverage(StrEnum):
+    """Which holdings a positions read attests completely (ADR-0031): Robinhood reports shares
+    (`get_equity_positions`) and options (`get_option_positions`) in separate tools."""
+
+    SHARES = "shares"
+    OPTIONS = "options"
+
+
 class OrderSide(StrEnum):
     """The only two order sides the agent may use (CLAUDE.md §18)."""
 

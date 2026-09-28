@@ -12,12 +12,16 @@ unchanged. Its `tools/call` handler:
    which the pinned CLI sends on every MCP `tools/call` (verified in the bundled CLI 2.1.283
    and by the real-CLI tests). A call without a matching, dispatched PreToolUse record, or
    whose name or arguments differ from the dispatched ones, is never forwarded.
-2. Forwards the dispatched arguments through `integrations/mcp_upstream.py` within
+2. Forwards the dispatched arguments (with the account placeholder replaced by the configured
+   number when the hook resolved one, ADR-0030) through `integrations/mcp_upstream.py` within
    `upstream_timeout_seconds` (below the CLI's `MCP_TOOL_TIMEOUT`, so the proxy answers
    first). No retry, in any tier (CLAUDE.md §14).
 3. Validates the result with the injected `ResultValidator` (the same `BoundaryValidator`
    used for direct delivery), records `raw_invalid` / `validated` or `error` and the
-   outcome, and returns the envelope as one text block (`mcp_tool_output`).
+   outcome, and returns the envelope as one text block (`mcp_tool_output`). An envelope
+   longer than `MAX_DELIVERED_CHARS` is not delivered: the CLI would rewrite it and the
+   delivery check would stop the run. It becomes an `error` envelope naming its size, and
+   is not recorded as validated evidence, because the model never saw it.
 
 Whatever happens, the CLI receives only text our code produced: an upstream failure becomes
 an `error` envelope with a fixed gap text, and any exception in the handler becomes a static
@@ -60,8 +64,13 @@ TOOL_USE_ID_META: Final = "claudecode/toolUseId"
 PROXY_TIMEOUT_MARGIN_SECONDS: Final = 10.0
 PROXY_SERVER_VERSION: Final = "1"
 PROXY_DEDUP_KEY: Final = "proxy"
+# The CLI rewrites MCP output above its token limit (MAX_MCP_OUTPUT_TOKENS, default 25,000),
+# and the PostToolUse delivery check then stops the run (dry run 2026-09-28, a 102 KB scan
+# envelope). JSON averages about 3 characters per token, so this keeps a margin below it.
+MAX_DELIVERED_CHARS: Final = 60_000
 
 __all__ = [
+    "MAX_DELIVERED_CHARS",
     "PROXY_DEDUP_KEY",
     "PROXY_TIMEOUT_MARGIN_SECONDS",
     "TOOL_USE_ID_META",
@@ -170,9 +179,10 @@ class ValidatingProxy:
             return self._not_forwarded(call, "tool or arguments differ from the dispatched call")
         if call.tier in (ToolTier.S, ToolTier.X) and self.run_control.stop_requested:
             return self._not_forwarded(call, "run stop requested")
+        sent = call.upstream_input if call.upstream_input is not None else arguments
         try:
             result = await self.upstream.call_tool(
-                call.tool, arguments, timeout_seconds=self.upstream_timeout_seconds
+                call.tool, sent, timeout_seconds=self.upstream_timeout_seconds
             )
         except UpstreamError as exc:
             return self._failed(call, str(exc))
@@ -183,7 +193,7 @@ class ValidatingProxy:
                 server=call.server,
                 tool=call.tool,
                 tier=call.tier,
-                effective_input=call.effective_input,
+                effective_input=sent,
                 tool_response=result.response,
                 retrieved_at=now,
             )
@@ -200,6 +210,13 @@ class ValidatingProxy:
                 call.tool_call_id, ResultKind.RAW_INVALID, outcome.raw_redacted
             )
         payload = envelope.model_dump(mode="json")
+        size = len(mcp_tool_output(payload)[0]["text"])
+        if size > MAX_DELIVERED_CHARS:
+            return self._failed(
+                call,
+                f"result too large to deliver ({size} characters; limit {MAX_DELIVERED_CHARS})"
+                "; request less data",
+            )
         valid = envelope.kind is EnvelopeKind.VALIDATED
         ref = self.recorder.store_result(
             call.tool_call_id, ResultKind.VALIDATED if valid else ResultKind.ERROR, payload
@@ -235,7 +252,8 @@ class ValidatingProxy:
         return mcp_tool_output(envelope)
 
     def _failed(self, call: ProxyCall, gap: str) -> list[dict[str, str]]:
-        """The upstream exchange failed after dispatch: S/X outcomes are unknown."""
+        """The upstream exchange failed, or its result cannot be delivered, after dispatch:
+        S/X outcomes are unknown."""
         now = self.clock()
         output = self._error_output(call, gap, now)
         ref = self.recorder.store_result(

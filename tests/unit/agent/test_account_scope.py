@@ -2,6 +2,7 @@ import pytest
 from pydantic import SecretStr
 
 from wheelta_robinhood_agent.agent.account_scope import (
+    AGENTIC_ACCOUNT_PLACEHOLDER,
     NOT_SCOPED,
     ROBINHOOD_ACCOUNT_SCOPE,
     UNVERIFIED,
@@ -9,6 +10,7 @@ from wheelta_robinhood_agent.agent.account_scope import (
     AccountScopeSpec,
     account_scope_for,
     check_account_scope,
+    resolve_account_argument,
 )
 from wheelta_robinhood_agent.domain.enums import ToolTier
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
@@ -118,3 +120,37 @@ def test_verified_full_match_passes() -> None:
 )
 def test_verified_mismatch_is_denied(tool_input: dict[str, object]) -> None:
     assert check_account_scope(VERIFIED, tool_input, ACCOUNT) is not None
+
+
+# -- ADR-0030: the agent passes a placeholder; code substitutes the configured number ------------
+
+
+def test_placeholder_passes_and_resolves_to_the_configured_number() -> None:
+    tool_input = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER, "limit": 5}
+    assert check_account_scope(VERIFIED, tool_input, ACCOUNT) is None
+    resolved = resolve_account_argument(VERIFIED, tool_input, ACCOUNT)
+    assert resolved == {"account_number": "5QR12345678", "limit": 5}
+    assert tool_input["account_number"] == AGENTIC_ACCOUNT_PLACEHOLDER  # input left unchanged
+
+
+def test_nothing_to_resolve_without_the_placeholder() -> None:
+    assert resolve_account_argument(VERIFIED, {"account_number": "5QR12345678"}, ACCOUNT) is None
+    assert resolve_account_argument(NOT_SCOPED, {"symbol": "AAPL"}, ACCOUNT) is None
+    # A placeholder under a non-account key, or on an unscoped tool, is never substituted.
+    assert (
+        resolve_account_argument(NOT_SCOPED, {"note": AGENTIC_ACCOUNT_PLACEHOLDER}, ACCOUNT) is None
+    )
+
+
+@pytest.mark.parametrize("value", ["agentic_account", "AGENTIC_ACCOUNT ", "****5678", "AGENTIC"])
+def test_near_placeholders_are_denied(value: str) -> None:
+    assert check_account_scope(VERIFIED, {"account_number": value}, ACCOUNT) is not None
+
+
+def test_placeholder_is_not_account_shaped_so_it_stays_readable_in_the_ledger() -> None:
+    from wheelta_robinhood_agent.observability.redaction import Redactor
+
+    redacted = Redactor(account_number=ACCOUNT).redact_mapping(
+        {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+    )
+    assert redacted == {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}

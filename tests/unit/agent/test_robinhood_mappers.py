@@ -31,7 +31,12 @@ from wheelta_robinhood_agent.agent.robinhood_mappers import (
     map_portfolio,
     parse_broker_timestamp,
 )
-from wheelta_robinhood_agent.domain.enums import DataQuality, OptionRight, ToolTier
+from wheelta_robinhood_agent.domain.enums import (
+    DataQuality,
+    OptionRight,
+    PositionsCoverage,
+    ToolTier,
+)
 from wheelta_robinhood_agent.observability.redaction import Redactor
 
 FIXTURES = Path(__file__).parents[2] / "fixtures" / "robinhood" / "results"
@@ -76,6 +81,8 @@ def test_verified_mappers_are_exactly_the_mapped_tools() -> None:
         ("robinhood", "get_option_quotes"),
         ("robinhood", "get_portfolio"),
         ("robinhood", "get_option_orders"),
+        ("robinhood", "get_option_positions"),
+        ("robinhood", "get_equity_positions"),
     }
 
 
@@ -287,27 +294,37 @@ def test_option_quote_duplicate_and_empty() -> None:
 # ---------------------------------------------------------------------------- get_portfolio
 
 
-def test_portfolio_fixture_keeps_unverified_cash_as_gaps() -> None:
-    data = _data("get_portfolio.empty_account.json")
+@pytest.mark.parametrize(
+    ("fixture", "cash"),
+    [
+        ("get_portfolio.empty_account.json", Decimal("0")),
+        ("get_portfolio.funded_no_positions.json", Decimal("20000")),
+    ],
+)
+def test_portfolio_cash_is_available_settled_cash_and_reservation_stays_a_gap(
+    fixture: str, cash: Decimal
+) -> None:
+    """ADR-0031 (owner): `cash` counts as available settled cash; the reservation is derived
+    later from positions and orders, so the snapshot keeps it as a gap."""
+    data = _data(fixture)
     out = map_portfolio(
         _request("get_portfolio", _wrapped(data), account_number="****1234"), _ids()
     )
     (snap,) = out.account_snapshots
     assert snap.account_ref == "****1234"
-    assert snap.account_value_usd == Decimal("0")
-    assert snap.available_settled_cash_usd is None
+    assert snap.account_value_usd == cash
+    assert snap.available_settled_cash_usd == cash
     assert snap.csp_reserved_cash_usd is None
     assert snap.csp_cash_base_usd is None
     assert snap.agentic_verified is False
     assert snap.quality is DataQuality.MISSING
     assert snap.as_of == snap.retrieved_at == RETRIEVED
     assert {g.field for g in snap.gaps} == {
-        "available_settled_cash_usd",
         "csp_reserved_cash_usd",
         "csp_cash_base_usd",
         "agentic_verified",
     }
-    assert len(out.gaps) == 4
+    assert len(out.gaps) == 3
     _check_provenance(out, CALL)
 
 
@@ -319,18 +336,30 @@ def test_portfolio_is_agentic_verified_only_after_the_trusted_check() -> None:
     (snap,) = out.account_snapshots
     assert snap.agentic_verified is True
     assert "agentic_verified" not in {g.field for g in snap.gaps}
-    assert snap.quality is DataQuality.MISSING  # cash fields are still unverified
-    assert len(out.gaps) == 3
+    assert snap.quality is DataQuality.MISSING  # the reservation is still a gap
+    assert len(out.gaps) == 2
 
 
-def test_portfolio_does_not_use_buying_power_as_cash() -> None:
+def test_portfolio_uses_cash_not_buying_power() -> None:
     data = _data("get_portfolio.empty_account.json")
     data["buying_power"]["buying_power"] = "5000.0000"
+    data["cash"] = "1200.50"
     data["total_value"] = "5000.00"
     out = map_portfolio(_request("get_portfolio", data, account_number="****1234"), _ids())
     (snap,) = out.account_snapshots
     assert snap.account_value_usd == Decimal("5000.00")
-    assert snap.available_settled_cash_usd is None
+    assert snap.available_settled_cash_usd == Decimal("1200.50")
+
+
+@pytest.mark.parametrize("cash", ["-1", None])
+def test_portfolio_without_valid_cash_raises(cash: str | None) -> None:
+    data = _data("get_portfolio.funded_no_positions.json")
+    if cash is None:
+        data.pop("cash")
+    else:
+        data["cash"] = cash
+    with pytest.raises(ValidationError):
+        map_portfolio(_request("get_portfolio", data, account_number="****1234"), _ids())
 
 
 @pytest.mark.parametrize(
@@ -422,6 +451,8 @@ def _validate(tool: str, payload: Any, **effective_input: Any) -> Any:
         ("get_option_quotes", "get_option_quotes.SPY_20261016_P740.json", {}),
         ("get_portfolio", "get_portfolio.empty_account.json", {"account_number": "****1234"}),
         ("get_option_orders", "get_option_orders.empty_account.json", {}),
+        ("get_option_positions", "get_option_positions.empty_account.json", {}),
+        ("get_equity_positions", "get_equity_positions.empty_account.json", {}),
     ],
 )
 def test_boundary_validates_real_fixtures(
@@ -437,8 +468,7 @@ def test_boundary_validates_real_fixtures(
     ("tool", "fixture"),
     [
         ("get_option_chains", "get_option_chains.SPY.json"),
-        ("get_option_positions", "get_option_positions.empty_account.json"),
-        ("get_equity_positions", "get_equity_positions.empty_account.json"),
+        ("get_equity_orders", "get_equity_orders.empty_account.json"),
     ],
 )
 def test_boundary_keeps_unregistered_tools_missing(tool: str, fixture: str) -> None:
@@ -450,3 +480,23 @@ def test_boundary_turns_non_empty_orders_into_missing() -> None:
     envelope = _validate("get_option_orders", {"orders": [{"id": "x"}]})
     assert envelope.kind is EnvelopeKind.MISSING
     assert envelope.data is None
+
+
+@pytest.mark.parametrize(
+    ("tool", "mapper", "covers"),
+    [
+        ("get_equity_positions", map_equity_positions, PositionsCoverage.SHARES),
+        ("get_option_positions", map_option_positions, PositionsCoverage.OPTIONS),
+    ],
+)
+def test_positions_reads_cover_only_their_own_kind(tool: str, mapper: Any, covers: Any) -> None:
+    """ADR-0031: each tool attests one half; neither alone is a complete read."""
+    out = mapper(_request(tool, _wrapped({"positions": []})), _ids())
+    (read,) = out.positions
+    assert read.covers == {covers} and not read.complete
+
+
+@pytest.mark.parametrize("tool", ["get_equity_positions", "get_option_positions"])
+def test_non_empty_positions_stay_missing_until_captured(tool: str) -> None:
+    envelope = _validate(tool, {"positions": [{"symbol": "AAPL", "quantity": "100"}]})
+    assert envelope.kind is EnvelopeKind.MISSING

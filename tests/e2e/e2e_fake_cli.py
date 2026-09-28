@@ -74,6 +74,8 @@ class FakeWorld:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     # Servers the proxy opened an upstream to (with their credentials), in order.
     upstream_servers: list[McpHttpServer] = field(default_factory=list)
+    # What the proxy actually sent upstream: (server, tool, arguments), in order (ADR-0030).
+    upstream_calls: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
 
 
 @dataclass
@@ -574,6 +576,7 @@ class WorldUpstream:
         self, name: str, arguments: Mapping[str, Any], *, timeout_seconds: float
     ) -> UpstreamResult:
         self.calls.append((name, dict(arguments)))
+        self._world.upstream_calls.append((self._server, name, dict(arguments)))
         handler = self._world.handlers.get(self._server, {}).get(name)
         if handler is None:
             raise UpstreamUnavailable(f"{name}: MCP error -32602")

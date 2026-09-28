@@ -1,0 +1,34 @@
+{
+  "provenance": {
+    "tool": "get_portfolio",
+    "arguments": {
+      "account_number": "ACCOUNT_REDACTED"
+    },
+    "server": "robinhood-trading",
+    "captured_on": "2026-09-28",
+    "captured_via": "project upstream client, read-only (owner-approved)",
+    "scrubbing": "account_number replaced with ACCOUNT_REDACTED; `guide` dropped",
+    "note": "Agentic account funded with cash; no positions or orders at capture time"
+  },
+  "data": {
+    "buying_power": {
+      "buying_power": "20000.0000",
+      "display_currency": "USD",
+      "unleveraged_buying_power": "20000.0000"
+    },
+    "cash": "20000",
+    "crypto_buying_power": {
+      "buying_power": "20000.0000"
+    },
+    "crypto_value": "0",
+    "currency": "USD",
+    "equity_value": "0",
+    "event_contracts_value": "0",
+    "fixed_income_value": "0",
+    "futures_value": "0",
+    "mutual_funds_value": "0",
+    "options_value": "0",
+    "pending_deposits": "0",
+    "total_value": "20000"
+  }
+}

@@ -355,7 +355,8 @@ def test_audit_findings_round_trip_with_correction(conn: Conn, run_id: uuid.UUID
 
 
 def test_alerts_are_recorded_per_attempt(conn: Conn, run_id: uuid.UUID) -> None:
-    for status in (DeliveryStatus.FAILED, DeliveryStatus.SENT):
+    # Distinct attempt times: rows with equal times are ordered by a random alert_id.
+    for i, status in enumerate((DeliveryStatus.FAILED, DeliveryStatus.SENT)):
         record_alert_sent(
             conn,
             run_id=run_id,
@@ -363,7 +364,7 @@ def test_alerts_are_recorded_per_attempt(conn: Conn, run_id: uuid.UUID) -> None:
             dedup_key="order:B-1",
             payload={"order": "B-1"},
             delivery_status=status,
-            attempted_at=T0,
+            attempted_at=T0 + timedelta(seconds=i),
         )
     alerts = alerts_for_run(conn, run_id)
     assert [a.delivery_status for a in alerts] == [DeliveryStatus.FAILED, DeliveryStatus.SENT]

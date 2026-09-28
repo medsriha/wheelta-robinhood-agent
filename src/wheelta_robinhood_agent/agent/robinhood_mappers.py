@@ -28,10 +28,11 @@ Tools deliberately NOT registered:
   identity come from `get_option_instruments` (per instrument), and quotes from
   `get_option_quotes`. `MappedEvidence` has no field for expiration lists, and a `validated`
   envelope with no evidence would claim a check it did not do, so the result stays `missing`.
-- `get_option_positions` / `get_equity_positions`: `map_option_positions` and
-  `map_equity_positions` exist but are not registered. `PositionsRead` is one complete read of
-  both share holdings and short options ("absence of a holding means zero"); either tool alone
-  attests only one half, so its read would assert zero holdings of the other kind.
+
+Positions (ADR-0031): `get_equity_positions` and `get_option_positions` each yield a
+`PositionsRead` that covers only its own kind (shares or options); the facts service combines
+the two halves of one run into a complete read. Only the empty shape is captured, so any
+non-empty list still raises until a real holding is captured.
 """
 
 import re
@@ -50,7 +51,7 @@ from wheelta_robinhood_agent.agent.mapped_evidence import (
     MappingRequest,
 )
 from wheelta_robinhood_agent.domain.account import AccountSnapshot
-from wheelta_robinhood_agent.domain.enums import DataQuality, OptionRight
+from wheelta_robinhood_agent.domain.enums import DataQuality, OptionRight, PositionsCoverage
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.facts_compute import (
     OpenOrdersRead,
@@ -392,16 +393,12 @@ class _BuyingPower(_External):
 
 class _Portfolio(_External):
     total_value: DecStr
+    cash: DecStr
     currency: Literal["USD"]
     buying_power: _BuyingPower
 
 
 _PORTFOLIO_GAPS: Final = (
-    (
-        "available_settled_cash_usd",
-        "get_portfolio reports buying_power, which excludes unsettled funds, but its treatment "
-        "of other reservations is unverified; it is not settled cash",
-    ),
     (
         "csp_reserved_cash_usd",
         "get_portfolio reports no cash reserved for short puts or working orders",
@@ -423,10 +420,10 @@ def map_portfolio(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> M
 
     `total_value` -> `account_value_usd` (USD only; any other currency raises). `account_ref`
     is the redacted `account_number` argument (the hook has already required the full
-    configured number). `buying_power.buying_power` is NOT available settled cash: it excludes
-    unsettled funds, but whether it nets reservations is unverified, and `AccountSnapshot`
-    has no buying-power field, so it is only schema-checked. `available_settled_cash_usd`,
-    `csp_reserved_cash_usd`, and `csp_cash_base_usd` stay None with named gaps. The response
+    configured number). `cash` -> `available_settled_cash_usd` (owner decision, ADR-0031;
+    a negative value raises). `buying_power` is only schema-checked. `csp_reserved_cash_usd`
+    and `csp_cash_base_usd` stay None with named gaps: the portfolio reports no reservation,
+    and the facts derive it from positions and orders reads. The response
     proves no Agentic eligibility: `agentic_verified` is True only when this run's trusted
     `get_accounts` check passed (`request.account_eligible`), else False with a gap. The
     snapshot quality stays `missing` while any cash field is missing. The payload has no
@@ -446,7 +443,7 @@ def map_portfolio(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> M
         account_ref=account_ref,
         agentic_verified=request.account_eligible,
         account_value_usd=parsed.total_value,
-        available_settled_cash_usd=None,
+        available_settled_cash_usd=parsed.cash,
         csp_reserved_cash_usd=None,
         csp_cash_base_usd=None,
         positions_ref=None,
@@ -496,13 +493,16 @@ def map_option_orders(request: MappingRequest, new_id: Callable[[], uuid.UUID]) 
     return MappedEvidence(open_orders=(read,))
 
 
-def _empty_positions(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> MappedEvidence:
+def _empty_positions(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID], covers: PositionsCoverage
+) -> MappedEvidence:
     parsed = _PositionList.model_validate(_unwrap(request.payload))
     _require_empty(parsed.positions, request.tool)
     read = PositionsRead(
         evidence_id=new_id(),
         as_of=request.retrieved_at,
         source_tool_call_ids=(request.tool_call_id,),
+        covers=frozenset({covers}),
     )
     return MappedEvidence(positions=(read,))
 
@@ -510,21 +510,21 @@ def _empty_positions(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -
 def map_option_positions(
     request: MappingRequest, new_id: Callable[[], uuid.UUID]
 ) -> MappedEvidence:
-    """`get_option_positions` -> an empty `PositionsRead` (NOT registered; module docstring).
+    """`get_option_positions` -> an empty options-only `PositionsRead` (ADR-0031).
 
     Only `{"positions": []}` was captured; any non-empty list or extra key raises.
     """
-    return _empty_positions(request, new_id)
+    return _empty_positions(request, new_id, PositionsCoverage.OPTIONS)
 
 
 def map_equity_positions(
     request: MappingRequest, new_id: Callable[[], uuid.UUID]
 ) -> MappedEvidence:
-    """`get_equity_positions` -> an empty `PositionsRead` (NOT registered; module docstring).
+    """`get_equity_positions` -> an empty shares-only `PositionsRead` (ADR-0031).
 
     Only `{"positions": []}` was captured; any non-empty list or extra key raises.
     """
-    return _empty_positions(request, new_id)
+    return _empty_positions(request, new_id, PositionsCoverage.SHARES)
 
 
 # Tool name -> mapper; `result_boundary.VERIFIED_MAPPERS` keys these by the Robinhood server.
@@ -535,5 +535,7 @@ ROBINHOOD_MAPPERS: Mapping[str, EvidenceMapper] = MappingProxyType(
         "get_option_quotes": map_option_quotes,
         "get_portfolio": map_portfolio,
         "get_option_orders": map_option_orders,
+        "get_option_positions": map_option_positions,
+        "get_equity_positions": map_equity_positions,
     }
 )

@@ -63,6 +63,7 @@ from wheelta_robinhood_agent.agent.account_scope import (
     AccountScopeSpec,
     account_scope_for,
     check_account_scope,
+    resolve_account_argument,
 )
 from wheelta_robinhood_agent.agent.mignons import (
     AGENT_INPUT_KEYS,
@@ -165,6 +166,7 @@ def _unverified(kind: WorkspaceKind, action: WorkspaceAction) -> WorkspaceTarget
 
 _W, _S, _A = WorkspaceKind.WATCHLIST, WorkspaceKind.SCAN, WorkspaceKind.ALERT
 _CREATE, _MUTATE, _ADD = WorkspaceAction.CREATE, WorkspaceAction.MUTATE, WorkspaceAction.ADD_ITEM
+
 
 def _verified(
     kind: WorkspaceKind,
@@ -592,8 +594,11 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
 
     def decide(
         resolved: _Resolved, tool_input: dict[str, Any], data: Mapping[str, Any]
-    ) -> tuple[ToolTier, dict[str, Any], tuple[JsonValue, ...]]:
-        """Raise `_Denied` or return (tier, effective input, appended filters)."""
+    ) -> tuple[ToolTier, dict[str, Any], tuple[JsonValue, ...], dict[str, Any] | None]:
+        """Raise `_Denied` or return (tier, effective input, appended filters, upstream input).
+
+        The upstream input is the effective input with the account placeholder replaced by the
+        configured number (ADR-0030), or None when nothing was replaced."""
         tier = resolved.tier
         if tier is None:
             raise _Denied(
@@ -628,11 +633,13 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 raise _Denied("kill switch engaged")
             if deps.run_control.stop_requested:
                 raise _Denied("run stop requested")
+        upstream: dict[str, Any] | None = None
         if not resolved.builtin:
             scope = account_scope_for(resolved.server, resolved.tool, deps.account_scope_table)
             reason = check_account_scope(scope, tool_input, deps.account_number)
             if reason is not None:
                 raise _Denied(reason)
+            upstream = resolve_account_argument(scope, tool_input, deps.account_number)
         if tier is ToolTier.S:
             check_workspace(resolved.tool, tool_input)
         if resolved.server == WHEELTA and resolved.tool == BOARD_QUERY_TOOL:
@@ -643,8 +650,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             original = tool_input.get(FILTERS_ARG)
             n_agent = len(original) if isinstance(original, list) else 0
             appended = cast(list[JsonValue], updated[FILTERS_ARG])[n_agent:]
-            return tier, updated, tuple(appended)
-        return tier, tool_input, ()
+            return tier, updated, tuple(appended), None
+        return tier, tool_input, (), upstream
 
     def proxied(server: str, builtin: bool) -> bool:
         return (
@@ -700,7 +707,10 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 raise _Denied("tool_use_id mismatch")
             if not isinstance(raw_input, dict):
                 raise _Denied("tool input is not an object")
-            tier, effective, appended = decide(resolved, tool_input, data)
+            tier, effective, appended, upstream = decide(resolved, tool_input, data)
+            if upstream is not None and not proxied(resolved.server, resolved.builtin):
+                # A direct server receives the substituted input itself (ADR-0030).
+                effective, upstream = upstream, None
         except _Denied as denied:
             reason = str(denied)
             try:
@@ -737,6 +747,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                         tool=resolved.tool,
                         tier=tier,
                         effective_input=effective,
+                        upstream_input=upstream,
                     ),
                 )
             except Exception as exc:

@@ -17,6 +17,7 @@ from typing import Any
 from e2e_fake_cli import FakeModel, FakeWorld
 
 from wheelta_robinhood_agent.agent.account_scope import (
+    AGENTIC_ACCOUNT_PLACEHOLDER,
     ROBINHOOD_ACCOUNT_SCOPE,
     AccountScopeSpec,
 )
@@ -359,7 +360,8 @@ async def research(model: FakeModel) -> tuple[str, str]:
     refs = [r for f in turn.data["report"]["findings"] for r in f["refs"]]
     candidate_ref = next(r for r in refs if r.startswith("candidate:"))
     await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": [INSTRUMENT_ID]})
-    account = {"account_number": ACCOUNT_NUMBER}
+    # ADR-0030: the agent passes the placeholder; code substitutes the configured number.
+    account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
     await model.call("mcp__robinhood__get_portfolio", account)
     await model.call("mcp__robinhood__get_option_positions", account)
     await model.call("mcp__robinhood__get_option_orders", account)

@@ -19,7 +19,7 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # ADR-0028: the orchestrator prompt (v7 plus the agent-chosen next run); paired with
 # AgentDecisionOutput v6.
 ACTIVE_PROMPT_ID = "wheel_agent"
-ACTIVE_PROMPT_VERSION = 8
+ACTIVE_PROMPT_VERSION = 9
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1.
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {

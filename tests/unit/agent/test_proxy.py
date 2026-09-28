@@ -384,3 +384,63 @@ def test_delivered_matches_requires_the_exact_blocks() -> None:
     assert not delivered_matches([{"type": "text", "text": "b"}], blocks)
     assert not delivered_matches([{"type": "image"}], blocks)
     assert not delivered_matches([], blocks)
+
+
+# ---- ADR-0030: the account placeholder -------------------------------------------------------
+
+PORTFOLIO = "mcp__robinhood__get_portfolio"
+
+
+def test_placeholder_is_substituted_only_on_the_upstream_call() -> None:
+    from test_hooks import ACCOUNT, FakeValidator
+
+    from wheelta_robinhood_agent.agent.account_scope import (
+        AGENTIC_ACCOUNT_PLACEHOLDER,
+        ROBINHOOD_ACCOUNT_SCOPE,
+    )
+
+    validator = FakeValidator()
+    r = rig(validator=validator, account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
+    placeholder = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+    out = r.session.pre(PORTFOLIO, placeholder)
+    # The CLI keeps the placeholder: no updatedInput, and the dispatch still matches it.
+    assert "hookSpecificOutput" not in out
+    blocks = r.call("get_portfolio", placeholder)
+    assert r.upstream.calls == [("get_portfolio", {"account_number": ACCOUNT}, 50.0)]
+    # The validator sees the real argument (mappers redact it to the last four).
+    assert validator.requests[-1].effective_input == {"account_number": ACCOUNT}
+    assert ACCOUNT not in json.dumps(blocks)
+    assert r.rec.event("requested")["arguments_redacted"] == placeholder
+    assert r.rec.event("dispatched")["effective_arguments_redacted"] == placeholder
+
+
+# ---- oversized envelopes ---------------------------------------------------------------------
+
+
+def test_an_oversized_envelope_is_an_error_and_the_run_continues() -> None:
+    from test_hooks import FakeValidator
+
+    from wheelta_robinhood_agent.agent.proxy import MAX_DELIVERED_CHARS
+
+    class Big(FakeValidator):
+        def __call__(self, request: Any) -> Any:
+            outcome = super().__call__(request)
+            data = {"rows": ["x" * 100] * (MAX_DELIVERED_CHARS // 100 + 1)}
+            return outcome.model_copy(
+                update={"envelope": outcome.envelope.model_copy(update={"data": data})}
+            )
+
+    r = rig(validator=Big())
+    r.session.pre(QUOTES, {"symbols": ["AAPL"]})
+    blocks = r.call()
+    envelope = wire(blocks)
+    assert envelope["kind"] == "error"
+    assert "too large to deliver" in envelope["gaps"][0]
+    assert len(blocks[0]["text"]) < MAX_DELIVERED_CHARS
+    (outcome,) = outcomes(r)
+    assert outcome["status"] is ToolCallStatus.FAILED
+    assert not r.session.deps.run_control.stop_requested
+    assert "store_validated" not in r.rec.names()  # never recorded as validated evidence
+    # PostToolUse accepts exactly the delivered error envelope: no stop.
+    out = r.session.post(QUOTES, blocks)
+    assert "continue_" not in out

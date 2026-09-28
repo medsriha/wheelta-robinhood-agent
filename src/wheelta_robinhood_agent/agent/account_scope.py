@@ -15,6 +15,11 @@ captured. A Robinhood tool missing from the table is `UNVERIFIED` (fail closed).
 Account discovery (`get_accounts`) is trusted-code-only (CLAUDE.md §9): the model never
 calls it, so it stays `UNVERIFIED` here. Matching is on the full account number only;
 last-four display digits are never identity.
+
+ADR-0030: the model never sees the full number. It passes `AGENTIC_ACCOUNT_PLACEHOLDER` as
+the account argument, and trusted code substitutes the configured number only on the call
+sent upstream (`resolve_account_argument`: the validating proxy's upstream call, or the
+hook's `updatedInput` for a direct server). The full number itself is still accepted.
 """
 
 import hashlib
@@ -30,6 +35,10 @@ from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
 from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
 from wheelta_robinhood_agent.observability.redaction import is_account_key
+
+# ADR-0030: the account argument the agent passes; not account-shaped, so it stays readable
+# in redacted ledger rows. Code replaces it with the configured number before the call leaves.
+AGENTIC_ACCOUNT_PLACEHOLDER = "AGENTIC_ACCOUNT"
 
 
 class AccountScope(StrEnum):
@@ -143,9 +152,9 @@ def check_account_scope(
       identifier (the schema would then be wrong about the tool; fail closed).
     - UNVERIFIED: always denied (CLAUDE.md §18).
     - LOGIN_SCOPED: allowed (ADR-0026), unless an argument looks like an account identifier.
-    - VERIFIED: the account argument must be present, a string, and equal to the full
-      configured account number (constant-time compare). A missing argument is denied: the
-      broker's default account is never assumed.
+    - VERIFIED: the account argument must be present, a string, and either the placeholder
+      (ADR-0030) or equal to the full configured account number (constant-time compare). A
+      missing argument is denied: the broker's default account is never assumed.
     """
     if spec.scope is AccountScope.UNVERIFIED:
         return "account scope unverified for this tool; withheld until tools/list is captured"
@@ -159,10 +168,28 @@ def check_account_scope(
     value = tool_input.get(arg)
     if not isinstance(value, str) or not value:
         return f"account argument {arg!r} missing; the default account is never assumed"
+    if value == AGENTIC_ACCOUNT_PLACEHOLDER:
+        return None
     expected = account_number.get_secret_value()
     if not hmac.compare_digest(value.encode(), expected.encode()):
         return "account argument does not match the configured Agentic account"
     return None
+
+
+def resolve_account_argument(
+    spec: AccountScopeSpec,
+    tool_input: Mapping[str, object],
+    account_number: SecretStr,
+) -> dict[str, object] | None:
+    """The upstream arguments with the placeholder replaced by the configured account number,
+    or None when nothing is replaced (ADR-0030). Call only after `check_account_scope` passed.
+    """
+    if spec.scope is not AccountScope.VERIFIED:
+        return None
+    arg = str(spec.account_arg)
+    if tool_input.get(arg) != AGENTIC_ACCOUNT_PLACEHOLDER:
+        return None
+    return {**tool_input, arg: account_number.get_secret_value()}
 
 
 # scrypt parameters for `account_scope_id`. Never change them: every ledger row keyed by the

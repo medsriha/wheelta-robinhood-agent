@@ -45,7 +45,7 @@ from wheelta_robinhood_agent.agent.result_boundary import (
 )
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
 from wheelta_robinhood_agent.domain.account import AccountSnapshot
-from wheelta_robinhood_agent.domain.enums import DataQuality
+from wheelta_robinhood_agent.domain.enums import DataQuality, PositionsCoverage
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.facts import DecisionFacts, FactsPurpose
 from wheelta_robinhood_agent.domain.facts_compute import (
@@ -55,6 +55,7 @@ from wheelta_robinhood_agent.domain.facts_compute import (
     OptionInstrument,
     PositionsRead,
     UnderlyingQuote,
+    combine_positions,
     compute_decision_facts,
 )
 from wheelta_robinhood_agent.domain.facts_rules import FactsRules
@@ -184,7 +185,19 @@ class RunEvidence:
         return latest
 
     def positions(self) -> PositionsRead | None:
-        latest: PositionsRead | None = self._latest([p for e in self.items for p in e.positions])
+        """The latest complete positions read: a read covering both kinds, or the latest
+        shares-only and options-only reads of this run combined (ADR-0031), whichever is
+        newer. A lone half is returned as is, so the facts record which half is missing."""
+        reads = [p for e in self.items for p in e.positions]
+        complete = [p for p in reads if p.complete]
+        shares = [p for p in reads if p.covers == {PositionsCoverage.SHARES}]
+        options = [p for p in reads if p.covers == {PositionsCoverage.OPTIONS}]
+        candidates: list[PositionsRead] = complete[-1:]
+        if shares and options:
+            candidates.append(combine_positions(shares[-1], options[-1]))
+        if candidates:
+            return max(candidates, key=lambda p: p.as_of)
+        latest: PositionsRead | None = self._latest(reads)
         return latest
 
     def open_orders(self) -> OpenOrdersRead | None:

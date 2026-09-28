@@ -20,6 +20,7 @@ from wheelta_robinhood_agent.domain.enums import (
     CandidateOrigin,
     DataQuality,
     OrderSide,
+    PositionsCoverage,
     StrategyKind,
 )
 from wheelta_robinhood_agent.domain.evidence import Gap, SourcedValue
@@ -35,6 +36,7 @@ from wheelta_robinhood_agent.domain.facts_compute import (
     ShortOptionHolding,
     UnderlyingQuote,
     WorkingOrder,
+    combine_positions,
     compute_decision_facts,
 )
 from wheelta_robinhood_agent.domain.facts_rules import FactsRuleMarker, FactsRules
@@ -47,6 +49,7 @@ T0 = datetime(2026, 9, 25, 15, 0, tzinfo=UTC)  # 11:00 ET, Friday
 PUT = OccSymbol.parse("XYZ   261015P00050000")  # expires 2026-10-15: DTE 20 from T0
 CALL = OccSymbol.parse("XYZ   261015C00050000")
 OTHER_PUT = OccSymbol.parse("XYZ   261120P00045000")
+OTHER_CALL = OccSymbol.parse("XYZ   261120C00055000")
 TC = UUID(int=900)  # a source tool call id
 
 
@@ -438,17 +441,92 @@ def test_missing_account_value_is_a_gap() -> None:
     assert "account_value_usd" in gap_kinds(f)
 
 
+def test_missing_settled_cash_is_a_gap() -> None:
+    f = facts(open_inputs(account=snapshot(c=None)))
+    assert f.initial_quantity is None
+    assert "available_settled_cash_usd" in gap_kinds(f)
+
+
+# -- ADR-0031: CSP reservation derived from complete positions and orders reads --------------
+
+
+def test_reservation_is_zero_without_short_puts_or_working_puts() -> None:
+    derived = facts(open_inputs(account=snapshot(r=None)))
+    reported = facts(open_inputs(account=snapshot(r="0")))
+    assert "csp_reserved_cash_usd" not in gap_kinds(derived)
+    assert derived.initial_quantity == reported.initial_quantity is not None
+
+
 @pytest.mark.parametrize(
-    ("acct", "name"),
+    "kw",
     [
-        (snapshot(c=None), "available_settled_cash_usd"),
-        (snapshot(r=None), "csp_reserved_cash_usd"),
+        {"positions": positions(shorts=(short(OTHER_PUT, qty=1, inst="inst-9"),))},
+        {"open_orders": orders(working())},
     ],
 )
-def test_missing_cash_fields_are_gaps(acct: AccountSnapshot, name: str) -> None:
-    f = facts(open_inputs(account=acct))
+def test_reservation_is_unavailable_when_puts_are_held_or_working(kw: dict[str, Any]) -> None:
+    f = facts(open_inputs(account=snapshot(r=None), **kw))
     assert f.initial_quantity is None
-    assert name in gap_kinds(f)
+    assert "csp_reserved_cash_usd" in gap_kinds(f)
+
+
+def test_working_calls_and_closing_orders_reserve_no_csp_cash() -> None:
+    call = working(OTHER_CALL, inst="inst-c")
+    close = working(OTHER_PUT, side=OrderSide.BUY_TO_CLOSE, inst="inst-b")
+    f = facts(open_inputs(account=snapshot(r=None), open_orders=orders(call, close)))
+    assert "csp_reserved_cash_usd" not in gap_kinds(f)
+
+
+@pytest.mark.parametrize("kw", [{"positions": None}, {"open_orders": None}])
+def test_reservation_needs_both_reads(kw: dict[str, Any]) -> None:
+    f = facts(open_inputs(account=snapshot(r=None), **kw))
+    assert f.initial_quantity is None
+    assert "csp_reserved_cash_usd" in gap_kinds(f)
+
+
+def test_a_partial_positions_read_is_not_complete() -> None:
+    shares_only = positions().model_copy(update={"covers": frozenset({PositionsCoverage.SHARES})})
+    f = facts(open_inputs(positions=shares_only))
+    assert f.initial_quantity is None
+    assert "positions" in gap_kinds(f)
+
+
+def test_combine_positions_joins_two_halves() -> None:
+    shares = PositionsRead(
+        evidence_id=uid(50),
+        as_of=T0 - timedelta(seconds=10),
+        source_tool_call_ids=(uid(60),),
+        share_holdings=(ShareHolding(symbol="XYZ", quantity=100),),
+        covers=frozenset({PositionsCoverage.SHARES}),
+    )
+    options = PositionsRead(
+        evidence_id=uid(51),
+        as_of=T0 - timedelta(seconds=40),
+        source_tool_call_ids=(uid(61),),
+        short_options=(short(),),
+        covers=frozenset({PositionsCoverage.OPTIONS}),
+    )
+    both = combine_positions(shares, options)
+    assert both.complete and both.as_of == options.as_of  # judged on the older half
+    assert both.share_holdings == shares.share_holdings
+    assert both.short_options == options.short_options
+    assert both.source_tool_call_ids == (uid(60), uid(61))
+    assert combine_positions(shares, options).evidence_id == both.evidence_id  # deterministic
+    with pytest.raises(ValueError, match="shares-only"):
+        combine_positions(options, shares)
+
+
+def test_a_read_cannot_hold_what_it_does_not_cover() -> None:
+    with pytest.raises(ValidationError, match="does not cover shares"):
+        PositionsRead(
+            evidence_id=uid(52),
+            as_of=T0,
+            source_tool_call_ids=(TC,),
+            share_holdings=(ShareHolding(symbol="XYZ", quantity=1),),
+            covers=frozenset({PositionsCoverage.OPTIONS}),
+        )
+    with pytest.raises(ValidationError, match="must cover"):
+        PositionsRead(evidence_id=uid(53), as_of=T0, source_tool_call_ids=(TC,), covers=frozenset())
 
 
 def test_account_snapshot_problems() -> None:

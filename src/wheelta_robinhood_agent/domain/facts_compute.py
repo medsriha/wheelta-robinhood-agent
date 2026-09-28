@@ -17,6 +17,10 @@ Rules applied (each formula id below is stamped at version "1"):
   per-underlying USD cap and ratio x account value, each minus existing CSP collateral on the
   underlying; (C - reserve); (total_ratio x B - R), with C = available settled cash, R = CSP
   reserved cash, B = C + R (definitions.cash_accounting; VALIDATION.md "CSP accounting").
+  When the snapshot does not report R, it is derived from complete positions and orders
+  reads: zero if no short put or working sell-to-open put exists, otherwise unavailable
+  (whether the broker's cash nets that collateral is unverified; ADR-0031). Positions count
+  only when a read covers both shares and options.
 - `cc_capacity`: floor((owned shares x coverage ratio - shares already covered by short
   calls and working sell-to-open calls) / multiplier), plus the order cap (selection.sizing).
 - `close_capacity`: short quantity minus working buy-to-close quantity on the contract, and,
@@ -60,6 +64,7 @@ from wheelta_robinhood_agent.domain.enums import (
     DataQuality,
     OptionRight,
     OrderSide,
+    PositionsCoverage,
     StrategyKind,
 )
 from wheelta_robinhood_agent.domain.evidence import Derivation, Gap, SourcedValue
@@ -162,11 +167,50 @@ class ShortOptionHolding(DomainModel):
     multiplier: PosCount | None
 
 
+_ALL_COVERAGE = frozenset(PositionsCoverage)
+
+
 class PositionsRead(_Observation):
-    """One complete, account-scoped positions read: absence of a holding means zero."""
+    """A complete, account-scoped positions read for what it `covers`: absence of a covered
+    holding means zero (ADR-0031). A read covering both kinds is what facts require; a
+    shares-only or options-only read carries only its own kind of holding."""
 
     share_holdings: tuple[ShareHolding, ...] = ()
     short_options: tuple[ShortOptionHolding, ...] = ()
+    covers: frozenset[PositionsCoverage] = _ALL_COVERAGE
+
+    @model_validator(mode="after")
+    def _check_coverage(self) -> Self:
+        if not self.covers:
+            raise ValueError("a positions read must cover shares, options, or both")
+        if self.share_holdings and PositionsCoverage.SHARES not in self.covers:
+            raise ValueError("share holdings on a read that does not cover shares")
+        if self.short_options and PositionsCoverage.OPTIONS not in self.covers:
+            raise ValueError("short options on a read that does not cover options")
+        return self
+
+    @property
+    def complete(self) -> bool:
+        return self.covers == _ALL_COVERAGE
+
+
+def combine_positions(shares: PositionsRead, options: PositionsRead) -> PositionsRead:
+    """One complete read from a shares-only and an options-only read (ADR-0031).
+
+    `as_of` is the older of the two, so freshness is judged on the stalest half. The id is
+    derived from both input ids, so combining the same reads always gives the same id.
+    """
+    if shares.covers != {PositionsCoverage.SHARES} or options.covers != {PositionsCoverage.OPTIONS}:
+        raise ValueError("combine a shares-only read with an options-only read")
+    return PositionsRead(
+        evidence_id=uuid5(shares.evidence_id, str(options.evidence_id)),
+        as_of=min(shares.as_of, options.as_of),
+        source_tool_call_ids=tuple(
+            dict.fromkeys((*shares.source_tool_call_ids, *options.source_tool_call_ids))
+        ),
+        share_holdings=shares.share_holdings,
+        short_options=options.short_options,
+    )
 
 
 class WorkingOrder(DomainModel):
@@ -452,15 +496,49 @@ class _Computation:
             "account_value_usd": acct.account_value_usd,
         }
         value = values[field]
+        if value is None and field == "csp_reserved_cash_usd":
+            return self.derived_csp_reservation()
         if value is None:
             self.gap(field, DataQuality.MISSING, "the account snapshot does not establish it")
         return value
+
+    def derived_csp_reservation(self) -> Decimal | None:
+        """CSP reserved cash from this run's complete positions and orders reads (ADR-0031).
+
+        Zero when the account holds no short puts and has no working sell-to-open puts: then
+        nothing is reserved and `available_settled_cash_usd` needs no netting. Otherwise None
+        with a gap: whether the broker's `cash` already nets that collateral is unverified.
+        """
+        field = "csp_reserved_cash_usd"
+        pos, orders = self.positions, self.orders
+        if pos is None or orders is None:
+            self.gap(field, DataQuality.MISSING, "needs complete positions and open-orders reads")
+            return None
+        puts = [h for h in pos.short_options if h.occ_symbol.right is OptionRight.PUT]
+        working = [
+            o
+            for o in orders.orders
+            if o.occ_symbol.right is OptionRight.PUT and o.side is OrderSide.SELL_TO_OPEN
+        ]
+        if any(h.short_quantity for h in puts) or any(o.unfilled_quantity for o in working):
+            self.gap(
+                field,
+                DataQuality.MISSING,
+                "short puts or working sell-to-open puts exist; whether the broker's cash "
+                "already nets their collateral is unverified",
+            )
+            return None
+        return _ZERO
 
     @cached_property
     def positions(self) -> PositionsRead | None:
         read = self.i.positions
         if read is None:
             self.missing("positions")
+            return None
+        if not read.complete:
+            covered = ", ".join(sorted(c.value for c in read.covers))
+            self.gap("positions", DataQuality.MISSING, f"the read covers only {covered}")
             return None
         age = self.r.account_state_max_age_seconds
         return read if self.fresh("positions", read.as_of, age, _R_ACCOUNT_AGE) else None
@@ -653,7 +731,8 @@ class _Computation:
             else:
                 base = c + r  # B = C + R, pre-order (definitions.cash_accounting)
                 room = Decimal(total) * base - r
-                caps.append(self.contracts("total_csp", room, per, F_CSP, (inst, *acct)))
+                ids = (inst, *acct, *reads)
+                caps.append(self.contracts("total_csp", room, per, F_CSP, ids))
         return _smallest(caps)
 
     def underlying_cap(
