@@ -37,7 +37,7 @@ def test_account_reads_verified_on_account_number_from_capture() -> None:
         assert ROBINHOOD_ACCOUNT_SCOPE[name] == AccountScopeSpec.verified("account_number"), name
 
 
-def test_workspace_reads_are_login_scoped_and_discovery_and_tier_s_x_stay_unverified() -> None:
+def test_workspace_reads_are_login_scoped_discovery_unverified_orders_account_scoped() -> None:
     """ADR-0026: the owner accepted login-scoped workspace reads."""
     for name in (
         "get_scans",
@@ -57,7 +57,14 @@ def test_workspace_reads_are_login_scoped_and_discovery_and_tier_s_x_stay_unveri
     for tool in ROBINHOOD_REGISTRY.by_tier(ToolTier.S):  # no account argument (ADR-0027)
         assert account_scope_for("robinhood", tool.name).scope is AccountScope.LOGIN_SCOPED
     for tool in ROBINHOOD_REGISTRY.by_tier(ToolTier.X):
-        assert account_scope_for("robinhood", tool.name).scope is AccountScope.UNVERIFIED
+        scope = account_scope_for("robinhood", tool.name).scope
+        if tool.live_order_tool:  # ADR-0034: required account_number, verified
+            assert scope is AccountScope.VERIFIED, tool.name
+            spec = account_scope_for("robinhood", tool.name)
+            assert check_account_scope(spec, {}, SecretStr("5QR1"))  # missing: denied
+            assert check_account_scope(spec, {"account_number": "5QR1"}, SecretStr("5QR1")) is None
+        else:
+            assert scope is AccountScope.UNVERIFIED, tool.name
 
 
 def test_market_data_tools_are_not_scoped() -> None:

@@ -83,6 +83,9 @@ def test_verified_mappers_are_exactly_the_mapped_tools() -> None:
         ("robinhood", "get_option_orders"),
         ("robinhood", "get_option_positions"),
         ("robinhood", "get_equity_positions"),
+        ("robinhood", "review_option_order"),
+        ("robinhood", "place_option_order"),
+        ("robinhood", "cancel_option_order"),
     }
 
 
@@ -381,7 +384,7 @@ def test_portfolio_mismatch_raises(
         map_portfolio(_request("get_portfolio", data, **effective_input), _ids())
 
 
-# ----------------------------------------------------------------------- empty-only lists
+# ----------------------------------------------------------------------- empty lists
 
 
 def test_empty_option_orders_map_to_empty_read() -> None:
@@ -414,11 +417,10 @@ def test_empty_positions_map_to_empty_read(
         (map_option_positions, {"positions": [{"quantity": "1.0000"}]}),
         (map_equity_positions, {"positions": [{"symbol": "SPY"}]}),
         (map_option_orders, {"orders": [{"id": "x"}]}),
-        (map_option_orders, {"orders": [], "next": "cursor"}),
         (map_option_positions, {"results": []}),
     ],
 )
-def test_unverified_list_shapes_raise(
+def test_malformed_list_shapes_raise(
     mapper: Callable[[MappingRequest, Callable[[], uuid.UUID]], MappedEvidence], payload: Any
 ) -> None:
     with pytest.raises(ValueError):
@@ -476,7 +478,7 @@ def test_boundary_keeps_unregistered_tools_missing(tool: str, fixture: str) -> N
     assert envelope.kind is EnvelopeKind.MISSING
 
 
-def test_boundary_turns_non_empty_orders_into_missing() -> None:
+def test_boundary_turns_malformed_orders_into_missing() -> None:
     envelope = _validate("get_option_orders", {"orders": [{"id": "x"}]})
     assert envelope.kind is EnvelopeKind.MISSING
     assert envelope.data is None
@@ -497,6 +499,6 @@ def test_positions_reads_cover_only_their_own_kind(tool: str, mapper: Any, cover
 
 
 @pytest.mark.parametrize("tool", ["get_equity_positions", "get_option_positions"])
-def test_non_empty_positions_stay_missing_until_captured(tool: str) -> None:
+def test_malformed_positions_are_missing(tool: str) -> None:
     envelope = _validate(tool, {"positions": [{"symbol": "AAPL", "quantity": "100"}]})
     assert envelope.kind is EnvelopeKind.MISSING

@@ -6,9 +6,10 @@ define the code-issued references the model actually saw), persisted DecisionFac
 stored agent output/parse, and the PositionBook rendered into the prompt.
 
 Loader decisions (documented, not guessed values):
-- Only effective mode `off` is supported (phase 1, ADR-0013): no broker order is ever placed,
-  so `orders` and `attempt_evidence` are empty. Live loading needs order projections for the
-  run and is out of scope until phase 2.
+- Off runs place no broker order, so `orders` is empty. Live runs (ADR-0034) load every order
+  the run placed or observed (`ledger.orders.run_order_records`). `attempt_evidence` stays
+  empty: no loader links a place call to its snapshot/quote evidence yet, so V2 reports those
+  attempts unverifiable rather than guessing the link.
 - `reservation_baseline` and `reservation_requirements` are not built: the cash/share
   headroom definitions depend on unverified broker semantics. The assembler then sizes the
   first dry-run proposal from its fact set and leaves later proposals unavailable with a gap.
@@ -50,6 +51,7 @@ from wheelta_robinhood_agent.domain.facts import DecisionFacts
 from wheelta_robinhood_agent.domain.positions import PositionBook
 from wheelta_robinhood_agent.domain.run_record import Quote, RunRecord
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
+from wheelta_robinhood_agent.ledger.orders import run_order_records
 from wheelta_robinhood_agent.ledger.tool_calls import tool_call_records
 
 Conn = psycopg.Connection[tuple[object, ...]]
@@ -211,8 +213,7 @@ def _facts(conn: Conn, run_id: uuid.UUID) -> tuple[DecisionFacts, ...]:
 
 
 def _require_off(meta: RunMeta) -> None:
-    if meta.effective_mode is not ExecutionMode.OFF:
-        raise LoaderError("only effective mode off can be loaded in phase 1 (ADR-0013)")
+    """Live runs load too (ADR-0034); their order projections come from `_orders`."""
 
 
 def load_assembly_context(
@@ -242,6 +243,11 @@ def load_assembly_context(
         output_record_id=output_id,
         time_in_force=meta.rules.rules.orders.time_in_force,
         tool_calls=tool_call_records(conn, meta.run_id),
+        orders=(
+            run_order_records(conn, meta.run_id)
+            if meta.effective_mode is ExecutionMode.LIVE
+            else ()
+        ),
         facts=facts,
         refs=delivered.refs,
         quotes=delivered.quotes,

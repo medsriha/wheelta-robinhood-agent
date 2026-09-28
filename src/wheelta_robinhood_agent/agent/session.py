@@ -28,8 +28,9 @@ Two parts:
   parsed strictly into AgentDecisionOutput v5, and raw (redacted) plus parsed output are
   persisted.
 
-Effective mode is capped at off in phase 1 (ADR-0013). `assert_no_order_tools` re-checks
-that no Tier X tool is allowed before any session is built, whatever the settings say.
+`assert_no_order_tools` re-checks the plan before any session is built: in effective mode
+off no Tier X tool is allowed; in live (armed, ADR-0034) only the three option-order tools
+are. Live mode records broker orders through `broker_ledger.BrokerLedger`.
 """
 
 import contextlib
@@ -59,6 +60,7 @@ from wheelta_robinhood_agent.agent.account_scope import (
     ROBINHOOD_ACCOUNT_SCOPE,
     AccountScopeSpec,
 )
+from wheelta_robinhood_agent.agent.broker_ledger import BrokerLedger
 from wheelta_robinhood_agent.agent.facts_tool import (
     FACTS_TOOL_NAME,
     DecisionFactsService,
@@ -215,14 +217,14 @@ class SessionPlan:
 
 
 def assert_no_order_tools(access: ToolAccess, registries: Sequence[ToolRegistry]) -> None:
-    """Phase 1 (ADR-0013): no Tier X tool may ever be allowed. Raises SessionPlanError."""
+    """No Tier X tool in off mode; in live mode only the live option-order tools (ADR-0006,
+    ADR-0034). Raises SessionPlanError."""
     allowed = set(access.allowed_tools)
+    live = access.effective_mode is ExecutionMode.LIVE
     for registry in registries:
         for spec in registry.by_tier(ToolTier.X):
-            if registry.qualified(spec.name) in allowed:
+            if registry.qualified(spec.name) in allowed and not (live and spec.live_order_tool):
                 raise SessionPlanError(f"order tool {spec.name} would be exposed")
-    if access.effective_mode is not ExecutionMode.OFF:
-        raise SessionPlanError("effective mode above the phase-1 ceiling (off)")
 
 
 def plan_session(
@@ -532,6 +534,11 @@ def build_session_options(
             run_control=deps.run_control,
             clock=deps.clock,
             upstream_timeout_seconds=timeout,
+            order_recorder=(
+                BrokerLedger(deps.conn, deps.run_id, deps.account_scope_id)
+                if deps.plan.effective_mode is ExecutionMode.LIVE and name == ROBINHOOD
+                else None
+            ),
         )
         sdk_servers[name] = McpSdkServerConfig(
             type="sdk",

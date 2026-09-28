@@ -3,8 +3,7 @@
 Replaces the deprecated railway.toml (Railway stops reading Config as Code on 2026-12-01).
 Evaluated by the Railway CLI: `railway config plan`, then `railway config apply`. Secrets are
 `preserve()`: set them in Railway, never here (CLAUDE.md §7). Railway hosts production only
-(ADR-0024); a due production tick runs the dry-run session (ADR-0033) until a phase-2 ADR arms
-live mode.
+(ADR-0024); a due production tick runs an armed live session (ADR-0034).
 """
 
 from railway_sdk import define_railway, github, postgres, preserve, project, service
@@ -47,10 +46,10 @@ def railway(ctx):  # type: ignore[no-untyped-def]
             "APP_ENV": ctx.environment,
             "LOG_LEVEL": "INFO",
             "RUN_TIMEOUT_SECONDS": "1500",
-            # Safety controls: off until a phase-2 ADR; code caps the effective mode at off
-            # whatever these say; an off-mode run is a dry-run session (ADR-0033).
-            "EXECUTION_MODE": "off",
-            "EXECUTION_ARMED": "false",
+            # Safety controls (ADR-0034): armed live places real option orders with no human
+            # approval. KILL_SWITCH=true + redeploy stops future runs (OPERATIONS.md R9).
+            "EXECUTION_MODE": "live",
+            "EXECUTION_ARMED": "true",
             "KILL_SWITCH": "false",
             # Claude
             "ANTHROPIC_API_KEY": preserve(),

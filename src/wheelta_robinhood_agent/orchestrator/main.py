@@ -5,8 +5,8 @@ single-flight lock (`skipped_concurrent`) → run slot (completed → no-op; int
 reconcile and finalize without a new session) → preflight (kill switch, NYSE session, next-run
 time: ADR-0028, `skipped_not_due`; a due tick records the fallback next run first) →
 Robinhood credential (refresh_token mode only: load, refresh near expiry, persist before use;
-ADR-0021) → session plan (effective mode capped at off; no order tool can be exposed; dry runs
-start a session in every environment, ADR-0033) → prompt v6 →
+ADR-0021) → session plan (off: no order tool; armed live: the three option-order tools,
+ADR-0034; dry runs start a session in every environment, ADR-0033) → prompt v6 →
 agent session → the agent's `next_run`, if valid, replaces the fallback → `assemble_run_record` →
 position notes (ADR-0018) → `run_audit` → persist →
 alerts/heartbeat → run-summary email (ADR-0029: only when a session started) → exit code.
@@ -651,9 +651,6 @@ class _Run:
             if decision.status is RunStatus.SKIPPED_KILLED and due:
                 self.alert(AlertKind.KILL_SWITCH_ENGAGED, "KILL_SWITCH=true; the run did not start")
             return self.finalize(decision.status, decision.reason.value)
-        if decision.effective_mode is not ExecutionMode.OFF:
-            raise SessionPlanError("effective mode above the phase-1 ceiling")
-
         restore = (
             install_stop_signal_handlers(self.control, self.deps.clock)
             if (self.deps.install_signals)

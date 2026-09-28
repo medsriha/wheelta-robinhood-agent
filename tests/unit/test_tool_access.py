@@ -70,11 +70,12 @@ def test_invariants_in_every_mode(mode: ExecutionMode, writes: bool) -> None:
 @pytest.mark.parametrize(
     ("requested", "armed"), list(itertools.product(ExecutionMode, [True, False]))
 )
-def test_phase_1_settings_path_never_exposes_order_tools(
+def test_settings_path_exposes_order_tools_only_when_armed_live(
     requested: ExecutionMode, armed: bool
 ) -> None:
     mode = effective_execution_mode(requested, armed=armed, ceiling=PHASE_EXECUTION_CEILING)
-    assert not ORDER_TOOLS & set(_access(mode).allowed_tools)
+    exposed = bool(ORDER_TOOLS & set(_access(mode).allowed_tools))
+    assert exposed is (requested is ExecutionMode.LIVE and armed)
 
 
 def test_unregistered_tool_is_in_neither_list() -> None:

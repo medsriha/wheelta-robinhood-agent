@@ -459,11 +459,14 @@ def test_order_tool_allowed_live_with_verified_account() -> None:
     assert out == {}
 
 
-def test_order_tool_live_denied_while_account_scope_unverified() -> None:
+def test_order_tool_live_needs_the_configured_account() -> None:
+    """ADR-0034: the shipped table scopes order tools to the configured account."""
     from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
 
     s = session(effective_mode=ExecutionMode.LIVE, account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
-    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "account scope unverified")
+    assert_denied(s, s.pre(PLACE, {}), "missing")
+    s = session(effective_mode=ExecutionMode.LIVE, account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
+    assert_denied(s, s.pre(PLACE, {"account_number": "9ZZ99995678"}), "does not match")
 
 
 def test_non_agentic_account_denied() -> None:

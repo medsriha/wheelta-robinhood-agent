@@ -654,10 +654,8 @@ def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness
 # -- tool exposure ------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("mode", "armed"), [("off", False), ("live", False), ("live", True), ("bogus", True)]
-)
-def test_order_tools_absent_in_every_mode(
+@pytest.mark.parametrize(("mode", "armed"), [("off", False), ("live", False), ("bogus", True)])
+def test_order_tools_absent_unless_armed_live(
     harness: Callable[..., Harness], mode: str, armed: bool
 ) -> None:
     async def script(model: FakeModel) -> str | None:
@@ -681,16 +679,26 @@ def test_order_tools_absent_in_every_mode(
     assert [r.status for r in place] == [ToolCallStatus.DENIED]
 
 
-def test_plan_refuses_an_effective_live_mode() -> None:
-    from wheelta_robinhood_agent.agent.session import SessionPlanError
+def test_armed_live_exposes_exactly_the_option_order_tools(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0034: armed live allowlists review/place/cancel option orders and nothing else X."""
+    h = harness(EXECUTION_MODE="live", EXECUTION_ARMED=True)
+    assert h.run(dry_run_script) == 0
+    (cli,) = h.clis
+    assert set(cli.options.allowed_tools) & ORDER_TOOLS == ORDER_TOOLS
+    assert not ORDER_TOOLS & set(cli.options.disallowed_tools)
+    assert "mcp__robinhood__place_equity_order" in cli.options.disallowed_tools
 
-    with pytest.raises(SessionPlanError):
-        plan_session(
-            effective_mode=ExecutionMode.LIVE,
-            workspace_writes=False,
-            sources=(),
-            observed_at=SESSION_TIME,
-        )
+
+def test_plan_accepts_an_effective_live_mode() -> None:
+    plan = plan_session(
+        effective_mode=ExecutionMode.LIVE,
+        workspace_writes=False,
+        sources=(),
+        observed_at=SESSION_TIME,
+    )
+    assert plan.effective_mode is ExecutionMode.LIVE
 
 
 # -- result boundary (fake transport observation) ------------------------------------------------

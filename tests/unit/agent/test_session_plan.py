@@ -28,7 +28,12 @@ from wheelta_robinhood_agent.agent.session import (
 from wheelta_robinhood_agent.agent.tool_access import ToolAccess
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME, WEB_CACHE_TOOL_NAME
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, MignonType, SourceStatus
+from wheelta_robinhood_agent.domain.enums import (
+    ExecutionMode,
+    MignonType,
+    SourceStatus,
+    ToolTier,
+)
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     LIVE_ORDER_TOOLS,
     ROBINHOOD_REGISTRY,
@@ -119,18 +124,31 @@ def test_missing_token_is_needs_auth_and_required() -> None:
     assert obs in plan.observations
 
 
-def test_order_tools_are_never_allowed_and_live_is_refused() -> None:
+def test_order_tools_only_in_live_and_never_in_off() -> None:
     plan = _plan()
     assert not ORDER_TOOLS & set(plan.tool_access.allowed_tools)
     assert ORDER_TOOLS <= set(plan.tool_access.disallowed_tools)
+    live = plan_session(
+        effective_mode=ExecutionMode.LIVE,
+        workspace_writes=True,
+        sources=(RemoteSource(RH_VERIFIED, RH, required=True),),
+        observed_at=NOW,
+        remote_boundary_accepted=True,
+    )
+    assert ORDER_TOOLS <= set(live.tool_access.allowed_tools)
+    denied_x = {
+        RH_VERIFIED.qualified(t.name)
+        for t in RH_VERIFIED.by_tier(ToolTier.X)
+        if not t.live_order_tool
+    }
+    assert not denied_x & set(live.tool_access.allowed_tools)
+    leaky_live = ToolAccess(
+        effective_mode=ExecutionMode.LIVE,
+        allowed_tools=tuple(sorted(denied_x)),
+        disallowed_tools=(),
+    )
     with pytest.raises(SessionPlanError):
-        plan_session(
-            effective_mode=ExecutionMode.LIVE,
-            workspace_writes=True,
-            sources=(RemoteSource(RH_VERIFIED, RH, required=True),),
-            observed_at=NOW,
-            remote_boundary_accepted=True,
-        )
+        assert_no_order_tools(leaky_live, (ROBINHOOD_REGISTRY,))
     leaky = ToolAccess(
         effective_mode=ExecutionMode.OFF,
         allowed_tools=tuple(sorted(ORDER_TOOLS)),

@@ -715,6 +715,28 @@ def _linked_intent_ids(conn: Conn, account_scope_id: str) -> dict[uuid.UUID, set
     return out
 
 
+def run_order_records(conn: Conn, run_id: uuid.UUID) -> tuple[OrderRecord, ...]:
+    """Every order this run placed or observed (an intent of the run, or an order event
+    recorded in the run), plus this run's intents with no linked order, for run assembly."""
+    order_ids = [
+        r["order_id"]
+        for r in _rows(
+            conn,
+            "SELECT o.order_id FROM orders o WHERE EXISTS (SELECT 1 FROM order_events e "
+            "WHERE e.entity_id = o.order_id AND e.run_id = %s) ORDER BY o.recorded_at, o.order_id",
+            (run_id,),
+        )
+    ]
+    records = [order_record(conn, order_id) for order_id in order_ids]
+    linked = {r.intent.intent_id for r in records if r.intent is not None}
+    for row in _rows(
+        conn, _INTENT_SELECT + "WHERE i.run_id = %s ORDER BY t.requested_at", (run_id,)
+    ):
+        if row["intent_id"] not in linked:
+            records.append(OrderRecord(intent=_intent(row), broker_order=None))
+    return tuple(records)
+
+
 def owned_unresolved_orders(conn: Conn, account_scope_id: str) -> tuple[OrderRecord, ...]:
     """All unresolved owned placements in the account scope (the prompt's owned_orders).
 

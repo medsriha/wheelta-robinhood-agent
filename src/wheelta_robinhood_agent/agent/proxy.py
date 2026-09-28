@@ -38,7 +38,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import mcp_types as types
 from mcp.server.lowlevel import Server
@@ -79,6 +79,14 @@ __all__ = [
     "build_proxy_server",
     "upstream_timeout_seconds",
 ]
+
+
+class OrderRecorder(Protocol):
+    """Ledger writes around live broker calls (agent/broker_ledger.py, ADR-0034)."""
+
+    def before_dispatch(self, call: ProxyCall) -> None: ...
+
+    def after_validated(self, call: ProxyCall, envelope: dict[str, Any]) -> None: ...
 
 
 def upstream_timeout_seconds(mcp_tool_timeout_ms: int) -> float:
@@ -129,6 +137,9 @@ class ValidatingProxy:
     run_control: RunControl
     clock: Callable[[], datetime]
     upstream_timeout_seconds: float
+    # ADR-0034: set in live mode. A failed intent write means the call is not forwarded; a
+    # failed write after a result stops the run but still delivers the envelope.
+    order_recorder: OrderRecorder | None = None
 
     def _stop(self) -> None:
         try:
@@ -181,6 +192,14 @@ class ValidatingProxy:
         if call.tier in (ToolTier.S, ToolTier.X) and self.run_control.stop_requested:
             return self._not_forwarded(call, "run stop requested")
         sent = call.upstream_input if call.upstream_input is not None else arguments
+        if self.order_recorder is not None:
+            try:
+                self.order_recorder.before_dispatch(call)
+            except Exception as exc:  # noqa: BLE001 - never send an unrecorded order
+                self._stop()
+                return self._not_forwarded(
+                    call, f"order intent not recorded ({type(exc).__name__})"
+                )
         try:
             result = await self.upstream.call_tool(
                 call.tool, sent, timeout_seconds=self.upstream_timeout_seconds
@@ -239,6 +258,11 @@ class ValidatingProxy:
                 reason=f"result {envelope.kind.value}",
                 error_ref=ref,
             )
+        if valid and self.order_recorder is not None:
+            try:
+                self.order_recorder.after_validated(call, payload)
+            except Exception:  # noqa: BLE001 - deliver the broker's answer; stop further actions
+                self._stop()
         return mcp_tool_output(payload)
 
     def _error_output(self, call: ProxyCall, gap: str, now: datetime) -> list[dict[str, str]]:

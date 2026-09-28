@@ -26,8 +26,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from wheelta_robinhood_agent.domain.enums import AppEnv, ExecutionMode
 from wheelta_robinhood_agent.domain.gating import effective_execution_mode
 
-# ADR-0013: phase 1 caps the effective mode at off, whatever the environment requests.
-PHASE_EXECUTION_CEILING = ExecutionMode.OFF
+# ADR-0034: phase 2 allows live; live still requires EXECUTION_MODE=live and armed.
+PHASE_EXECUTION_CEILING = ExecutionMode.LIVE
 
 # The run budget stays below the hourly fallback cadence (ADR-0028). The cron ticks every 5
 # minutes; Railway skips ticks that overlap a running run, and the lock backs that up.

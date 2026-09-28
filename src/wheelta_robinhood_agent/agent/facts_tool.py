@@ -19,8 +19,8 @@ accepted. Missing evidence yields typed gaps (quality `missing`), never a guesse
 not even the instrument is known, no fact set can exist and an `unavailable` result with gaps
 is returned instead. This tool performs no broker request or mutation and gates no order.
 
-Robinhood result → evidence mappings are UNVERIFIED (result_boundary.VERIFIED_MAPPERS is
-empty), so in production every input is currently unavailable and reported as a gap.
+Inputs come only from `result_boundary.VERIFIED_MAPPERS`; a tool without a mapper yields no
+evidence, and the dependent input is reported as a gap.
 """
 
 import hashlib
@@ -54,6 +54,7 @@ from wheelta_robinhood_agent.domain.facts_compute import (
     OpenOrdersRead,
     OptionInstrument,
     PositionsRead,
+    ShortOptionHolding,
     UnderlyingQuote,
     combine_positions,
     compute_decision_facts,
@@ -184,11 +185,50 @@ class RunEvidence:
         )
         return latest
 
+    def _resolved_option_reads(self) -> list[PositionsRead]:
+        """Options-only reads built from pending short rows whose every contract this run's
+        instrument evidence identifies (ADR-0034). A row whose instrument is unknown, or whose
+        underlying or multiplier disagrees with it, leaves that read unresolved."""
+        reads: list[PositionsRead] = []
+        for e in self.items:
+            for pending in e.pending_option_positions:
+                holdings: list[ShortOptionHolding] = []
+                for row in pending.rows:
+                    inst = self.instrument(row.broker_instrument_id)
+                    if (
+                        inst is None
+                        or inst.underlying != row.underlying
+                        or inst.multiplier != row.multiplier
+                    ):
+                        break
+                    holdings.append(
+                        ShortOptionHolding(
+                            underlying=row.underlying,
+                            occ_symbol=inst.occ_symbol,
+                            broker_instrument_id=row.broker_instrument_id,
+                            short_quantity=row.short_quantity,
+                            multiplier=row.multiplier,
+                        )
+                    )
+                else:
+                    reads.append(
+                        PositionsRead(
+                            evidence_id=pending.evidence_id,
+                            as_of=pending.as_of,
+                            source_tool_call_ids=pending.source_tool_call_ids,
+                            covers=frozenset({PositionsCoverage.OPTIONS}),
+                            short_options=tuple(holdings),
+                        )
+                    )
+        return reads
+
     def positions(self) -> PositionsRead | None:
         """The latest complete positions read: a read covering both kinds, or the latest
         shares-only and options-only reads of this run combined (ADR-0031), whichever is
-        newer. A lone half is returned as is, so the facts record which half is missing."""
-        reads = [p for e in self.items for p in e.positions]
+        newer. A lone half is returned as is, so the facts record which half is missing.
+        Options halves include pending short rows once resolved (ADR-0034)."""
+        reads = [p for e in self.items for p in e.positions] + self._resolved_option_reads()
+        reads.sort(key=lambda p: p.as_of)
         complete = [p for p in reads if p.complete]
         shares = [p for p in reads if p.covers == {PositionsCoverage.SHARES}]
         options = [p for p in reads if p.covers == {PositionsCoverage.OPTIONS}]

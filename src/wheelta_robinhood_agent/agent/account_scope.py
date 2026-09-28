@@ -105,17 +105,17 @@ LOGIN_SCOPED_TOOLS = (
     "create_alert", "update_alert", "delete_alert", "mark_alerts_read",
 )  # fmt: skip
 
-# Account discovery (trusted code only) and the Tier X order tools (their account argument
-# is not wired yet: phase 2). Listed explicitly so the table documents them.
-_UNVERIFIED_TOOLS = (
-    "get_accounts",
-    "review_option_order", "place_option_order", "cancel_option_order",
-)  # fmt: skip
+# Account discovery (trusted code only). Listed explicitly so the table documents it.
+_UNVERIFIED_TOOLS = ("get_accounts",)
+# ADR-0034: the option-order tools take a required `account_number` (captured input schemas,
+# tests/fixtures/robinhood/tools_tier_sx_2026-09-27.json).
+_ORDER_TOOLS = ("review_option_order", "place_option_order", "cancel_option_order")
 
 ROBINHOOD_ACCOUNT_SCOPE: Mapping[str, AccountScopeSpec] = MappingProxyType(
     {
         **{name: NOT_SCOPED for name in _NOT_SCOPED_TOOLS},
         **{name: AccountScopeSpec.verified("account_number") for name in _ACCOUNT_NUMBER_TOOLS},
+        **{name: AccountScopeSpec.verified("account_number") for name in _ORDER_TOOLS},
         **{name: LOGIN_SCOPED for name in LOGIN_SCOPED_TOOLS},
         **{name: UNVERIFIED for name in _UNVERIFIED_TOOLS},
     }

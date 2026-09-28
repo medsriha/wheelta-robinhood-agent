@@ -100,14 +100,18 @@ def test_unknown_execution_mode_is_off(env: pytest.MonkeyPatch, raw: str) -> Non
     assert s.config_snapshot()["execution_mode_raw"] == raw
 
 
-@pytest.mark.parametrize("armed", ["true", "false"])
-def test_phase_1_caps_live_at_off(env: pytest.MonkeyPatch, armed: str) -> None:
-    assert PHASE_EXECUTION_CEILING is ExecutionMode.OFF
+@pytest.mark.parametrize(
+    ("armed", "effective"), [("true", ExecutionMode.LIVE), ("false", ExecutionMode.OFF)]
+)
+def test_phase_2_live_requires_arming(
+    env: pytest.MonkeyPatch, armed: str, effective: ExecutionMode
+) -> None:
+    assert PHASE_EXECUTION_CEILING is ExecutionMode.LIVE  # ADR-0034
     env.setenv("EXECUTION_MODE", "live")
     env.setenv("EXECUTION_ARMED", armed)
     s = load_settings()
     assert s.requested_execution_mode is ExecutionMode.LIVE
-    assert s.effective_execution_mode is ExecutionMode.OFF
+    assert s.effective_execution_mode is effective
 
 
 @pytest.mark.parametrize("value", ["3600", "7200", "0", "-5", "abc"])
