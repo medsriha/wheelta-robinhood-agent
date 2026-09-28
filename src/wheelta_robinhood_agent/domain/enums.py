@@ -59,7 +59,7 @@ class RunStatus(StrEnum):
     SKIPPED_CONCURRENT = "skipped_concurrent"
     SKIPPED_KILLED = "skipped_killed"
     SKIPPED_MARKET_CLOSED = "skipped_market_closed"
-    # ADR-0024: dry runs (effective mode off) run locally only; Railway is production.
+    # ADR-0024, superseded by ADR-0033: no longer produced; kept for recorded runs and the schema.
     SKIPPED_DRY_RUN_NOT_LOCAL = "skipped_dry_run_not_local"
     # ADR-0028: the cron tick is before the recorded next-run time; no session starts.
     SKIPPED_NOT_DUE = "skipped_not_due"

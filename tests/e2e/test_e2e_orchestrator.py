@@ -403,7 +403,7 @@ def test_robinhood_without_token_is_needs_auth_and_no_session(
 
 
 def test_local_off_mode_still_runs_the_dry_run_session(harness: Callable[..., Harness]) -> None:
-    """ADR-0024: the local-only gate leaves local dry runs untouched."""
+    """A local dry run starts the session (as production does since ADR-0033)."""
     h = harness()
     assert h.run() == 0
     assert len(h.clis) == 1 and h.status() is RunStatus.COMPLETED

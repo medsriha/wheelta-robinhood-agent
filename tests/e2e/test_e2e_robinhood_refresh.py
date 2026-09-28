@@ -236,10 +236,10 @@ def test_refresh_failure_is_needs_auth(
     _assert_no_token_leak(h, tokens, caplog)
 
 
-# -- ADR-0024: dry runs are local only; production keeps its credential fresh --------------------
+# -- ADR-0033: production runs the dry-run session with the refreshed credential ----------------
 
 
-def test_production_off_mode_refreshes_the_credential_but_starts_no_session(
+def test_production_off_mode_refreshes_the_credential_and_runs_the_session(
     make_settings: Any, notifier: RecordingNotifier, key: SecretStr
 ) -> None:
     settings = make_settings(
@@ -267,8 +267,6 @@ def test_production_off_mode_refreshes_the_credential_but_starts_no_session(
     refresher = Refresher(tokens)
     assert h.run(oauth_refresher=refresher) == 0
     assert refresher.calls == [tokens.old_refresh]  # the rotating token stays alive
-    assert h.clis == [] and h.world.upstream_servers == []  # no session, no MCP connection
-    assert h.status() is RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL
-    assert h.mailer.summaries == []  # ADR-0029: no session, no summary email
+    assert len(h.clis) == 1 and h.status() is RunStatus.COMPLETED
     assert _credential_event(h)["status"] == "refreshed"
     assert [hb.status.value for hb in notifier.heartbeats] == ["success"]

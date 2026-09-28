@@ -5,9 +5,8 @@ single-flight lock (`skipped_concurrent`) → run slot (completed → no-op; int
 reconcile and finalize without a new session) → preflight (kill switch, NYSE session, next-run
 time: ADR-0028, `skipped_not_due`; a due tick records the fallback next run first) →
 Robinhood credential (refresh_token mode only: load, refresh near expiry, persist before use;
-ADR-0021) → session plan (effective mode capped at off; no order tool can be exposed) → dry
-runs are local only (ADR-0024: outside APP_ENV=local an off-mode run ends
-`skipped_dry_run_not_local` here, after the credential and its alerts) → prompt v6 →
+ADR-0021) → session plan (effective mode capped at off; no order tool can be exposed; dry runs
+start a session in every environment, ADR-0033) → prompt v6 →
 agent session → the agent's `next_run`, if valid, replaces the fallback → `assemble_run_record` →
 position notes (ADR-0018) → `run_audit` → persist →
 alerts/heartbeat → run-summary email (ADR-0029: only when a session started) → exit code.
@@ -833,10 +832,6 @@ class _Run:
             for mignon in MignonType
         }
 
-    def dry_run_outside_local(self, effective_mode: ExecutionMode) -> bool:
-        """ADR-0024: a dry run (effective mode off) never starts a session outside local."""
-        return effective_mode is ExecutionMode.OFF and self.settings.APP_ENV is not AppEnv.LOCAL
-
     def _deadline_check(self) -> None:
         trip_if_deadline_passed(self.control, self.deadline, self.deps.clock)
 
@@ -868,12 +863,6 @@ class _Run:
                     message,
                     {"credential": credential.event_payload()} if credential else None,
                 )
-        if plan.may_start and self.dry_run_outside_local(effective_mode):
-            self.log.info(
-                "dry runs run locally only; no session outside APP_ENV=local",
-                extra={"app_env": self.settings.APP_ENV.value},
-            )
-            return self.finalize(RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL, "dry_run_local_only")
         book = ledger_positions.position_book(self.conn, self.scope_id, as_of=self.deps.clock())
         session: SessionResult | None = None
         prompt: RenderedPrompt | None = None

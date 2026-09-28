@@ -2,9 +2,9 @@
 
 Replaces the deprecated railway.toml (Railway stops reading Config as Code on 2026-12-01).
 Evaluated by the Railway CLI: `railway config plan`, then `railway config apply`. Secrets are
-`preserve()`: set them in Railway, never here (CLAUDE.md §7). Railway hosts production only;
-dry runs run locally (ADR-0024), so until a phase-2 ADR arms live mode every production fire
-ends `skipped_dry_run_not_local` after refreshing the Robinhood credential.
+`preserve()`: set them in Railway, never here (CLAUDE.md §7). Railway hosts production only
+(ADR-0024); a due production tick runs the dry-run session (ADR-0033) until a phase-2 ADR arms
+live mode.
 """
 
 from railway_sdk import define_railway, github, postgres, preserve, project, service
@@ -20,7 +20,7 @@ CRON_SCHEDULE = "*/5 13-20 * * 1-5"
 
 @define_railway
 def railway(ctx):  # type: ignore[no-untyped-def]
-    if ctx.environment != "production":  # ADR-0024: no staging; dry runs are local only
+    if ctx.environment != "production":  # ADR-0024: no staging
         raise ValueError(f"unexpected Railway environment: {ctx.environment!r}")
 
     db = postgres("Postgres")
@@ -48,7 +48,7 @@ def railway(ctx):  # type: ignore[no-untyped-def]
             "LOG_LEVEL": "INFO",
             "RUN_TIMEOUT_SECONDS": "1500",
             # Safety controls: off until a phase-2 ADR; code caps the effective mode at off
-            # whatever these say, and an off-mode run here starts no session (ADR-0024).
+            # whatever these say; an off-mode run is a dry-run session (ADR-0033).
             "EXECUTION_MODE": "off",
             "EXECUTION_ARMED": "false",
             "KILL_SWITCH": "false",
