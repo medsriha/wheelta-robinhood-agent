@@ -65,9 +65,10 @@ PROXY_TIMEOUT_MARGIN_SECONDS: Final = 10.0
 PROXY_SERVER_VERSION: Final = "1"
 PROXY_DEDUP_KEY: Final = "proxy"
 # The CLI rewrites MCP output above its token limit (MAX_MCP_OUTPUT_TOKENS, default 25,000),
-# and the PostToolUse delivery check then stops the run (dry run 2026-09-28, a 102 KB scan
-# envelope). JSON averages about 3 characters per token, so this keeps a margin below it.
-MAX_DELIVERED_CHARS: Final = 60_000
+# and the PostToolUse delivery check then stops the run. Dry runs on 2026-09-28 hit this with
+# 102 KB and 57 KB scan envelopes: JSON full of UUIDs and long decimals runs near 2 characters
+# per token, so this stays under the limit at that density.
+MAX_DELIVERED_CHARS: Final = 30_000
 
 __all__ = [
     "MAX_DELIVERED_CHARS",
