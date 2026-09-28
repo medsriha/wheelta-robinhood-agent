@@ -208,3 +208,19 @@ def test_raw_invalid_evidence_drops_account_numbers_inside_text_blocks() -> None
     assert _expand_text_json([{"type": "text", "text": "not json"}]) == [
         {"type": "text", "text": "not json"}
     ]
+
+
+def test_login_scoped_reads_are_delivered_as_context_never_as_evidence() -> None:
+    """ADR-0026: no mapper, but a redacted context-only envelope with account values dropped."""
+    from wheelta_robinhood_agent.agent.result_boundary import CONTEXT_ONLY_GAP
+
+    payload = {"watchlists": [{"name": "Tech", "account_number": "9ZZ11223344"}]}
+    outcome = BoundaryValidator(redactor=Redactor())(
+        _req("robinhood", "get_watchlists", _text(payload))
+    )
+    envelope = outcome.envelope
+    assert envelope.kind is EnvelopeKind.VALIDATED and envelope.gaps == (CONTEXT_ONLY_GAP,)
+    assert isinstance(envelope.data, dict) and envelope.data["context_only"] is True
+    assert "evidence_ref" not in envelope.data and "evidence" not in envelope.data
+    assert "9ZZ11223344" not in json.dumps(envelope.data)
+    assert envelope.data["payload"]["watchlists"][0]["name"] == "Tech"  # type: ignore[index]

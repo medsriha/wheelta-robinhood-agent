@@ -57,9 +57,7 @@ from claude_agent_sdk.types import McpSdkServerConfig
 
 from wheelta_robinhood_agent.agent.account_scope import (
     ROBINHOOD_ACCOUNT_SCOPE,
-    AccountScope,
     AccountScopeSpec,
-    account_scope_for,
 )
 from wheelta_robinhood_agent.agent.facts_tool import (
     FACTS_TOOL_NAME,
@@ -237,7 +235,6 @@ def plan_session(
     proxy_accepted: bool = PROXY_RESULT_BOUNDARY_ACCEPTED,
     local_registry: ToolRegistry = LOCAL_REGISTRY,
     mignons: bool = True,
-    account_scope_table: Mapping[str, AccountScopeSpec] = ROBINHOOD_ACCOUNT_SCOPE,
 ) -> SessionPlan:
     """Decide the exposed servers and tools before connecting (fail closed).
 
@@ -287,15 +284,7 @@ def plan_session(
             names = {registry.qualified(t.name) for t in registry.tools}
             disallowed |= names
             allowed -= names
-        # The hook denies every call to a tool whose account scope is unverified (CLAUDE.md
-        # §18), so it is not offered either: the proxy then never serves its schema.
-        for spec in registry.tools:
-            scope = account_scope_for(registry.server, spec.name, account_scope_table)
-            if scope.scope is AccountScope.UNVERIFIED:
-                name = registry.qualified(spec.name)
-                if name in allowed:
-                    allowed.discard(name)
-                    disallowed.add(name)
+
     access = ToolAccess(
         effective_mode=effective_mode,
         allowed_tools=tuple(sorted(allowed)),

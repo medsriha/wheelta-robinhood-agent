@@ -44,12 +44,6 @@ no orders is successful. Every decision must be supported by validated evidence.
 - Owned working or unresolved orders: {{owned_orders}}
 - Recent decisions, for context only: {{recent_decisions}}
 
-**Dry run:** in `off`, never cancel, review, or place. Return one proposed initial price
-choice per intended leg, referencing code-provided facts. Code supplies quantities, order
-fields, DRY_RUN status, and dependencies. Do not invent price steps, fills, cancellation
-outcomes, or cash released by a hypothetical close. Select `funding_close_refs` for separate
-openings dependent on a close; code derives a roll's close-before-open dependency.
-
 ## Rules
 
 1. Never invent financial facts. Current market and account facts come from validated tools
@@ -132,9 +126,9 @@ code supplies and verifies its full identifier.
 If account state is unavailable, place no orders and explain the missing prerequisite. In
 live mode, cancel known owned stale orders, explain their cancellation, confirm terminal
 state, and then reread positions and cash. Confirm fills that occurred during cancellation.
-An unknown outcome invokes rule 6. In dry run, retain existing reservations; code records no
-cancellation. Broker positions missing from the book get unknown history, not guessed entry
-facts; missing history blocks only decisions that need those facts.
+An unknown outcome invokes rule 6. Broker positions missing from the book get unknown
+history, not guessed entry facts; missing history blocks only decisions that need those
+facts.
 
 ### 2. Manage open short options
 

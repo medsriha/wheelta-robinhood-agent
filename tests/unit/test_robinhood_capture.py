@@ -44,7 +44,9 @@ def test_scope_table_matches_captured_account_arguments() -> None:
         spec = ROBINHOOD_ACCOUNT_SCOPE[name]
         if entry["account_arg"] is not None:
             assert spec == AccountScopeSpec.verified(entry["account_arg"]), name
-        elif entry["login_scoped"] or entry.get("lists_all_accounts"):
+        elif entry.get("lists_all_accounts"):
             assert spec.scope is AccountScope.UNVERIFIED, name
+        elif entry["login_scoped"]:
+            assert spec.scope is AccountScope.LOGIN_SCOPED, name  # ADR-0026
         else:
             assert spec.scope is AccountScope.NOT_ACCOUNT_SCOPED, name

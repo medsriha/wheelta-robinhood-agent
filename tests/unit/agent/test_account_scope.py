@@ -35,9 +35,9 @@ def test_account_reads_verified_on_account_number_from_capture() -> None:
         assert ROBINHOOD_ACCOUNT_SCOPE[name] == AccountScopeSpec.verified("account_number"), name
 
 
-def test_discovery_workspace_reads_and_tier_s_x_stay_unverified() -> None:
+def test_workspace_reads_are_login_scoped_and_discovery_and_tier_s_x_stay_unverified() -> None:
+    """ADR-0026: the owner accepted login-scoped workspace reads."""
     for name in (
-        "get_accounts",
         "get_scans",
         "run_scan",
         "get_watchlists",
@@ -46,8 +46,15 @@ def test_discovery_workspace_reads_and_tier_s_x_stay_unverified() -> None:
         "get_alerts",
         "get_alert_log",
     ):
-        assert ROBINHOOD_ACCOUNT_SCOPE[name] is UNVERIFIED, name
-    for tool in ROBINHOOD_REGISTRY.by_tier(ToolTier.S) + ROBINHOOD_REGISTRY.by_tier(ToolTier.X):
+        assert ROBINHOOD_ACCOUNT_SCOPE[name].scope is AccountScope.LOGIN_SCOPED, name
+        assert check_account_scope(ROBINHOOD_ACCOUNT_SCOPE[name], {}, SecretStr("5QR1")) is None
+        assert check_account_scope(
+            ROBINHOOD_ACCOUNT_SCOPE[name], {"account_number": "5QR1"}, SecretStr("5QR1")
+        )  # an account argument on a login-scoped tool is still denied
+    assert ROBINHOOD_ACCOUNT_SCOPE["get_accounts"] is UNVERIFIED
+    for tool in ROBINHOOD_REGISTRY.by_tier(ToolTier.S):  # no account argument (ADR-0027)
+        assert account_scope_for("robinhood", tool.name).scope is AccountScope.LOGIN_SCOPED
+    for tool in ROBINHOOD_REGISTRY.by_tier(ToolTier.X):
         assert account_scope_for("robinhood", tool.name).scope is AccountScope.UNVERIFIED
 
 

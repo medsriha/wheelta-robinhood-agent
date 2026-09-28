@@ -5,10 +5,12 @@ Every account-specific Robinhood call (reads included) must be confined to the f
 `robinhood-trading` 1.6.0 on 2026-09-26 (ADR-0017): every account-specific read takes a required
 `account_number`, so those tools are VERIFIED on that argument.
 
-Still `UNVERIFIED` (denied, CLAUDE.md §18): workspace reads (scans, watchlists, alerts), whose
-schemas carry no account argument because they belong to the Robinhood login rather than an
-account, so they can't be confined to the Agentic account; and every Tier S/X tool, whose
-schemas weren't captured. A Robinhood tool missing from the table is `UNVERIFIED` (fail closed).
+`LOGIN_SCOPED` (allowed by owner decision, ADR-0026): workspace reads (scans, watchlists,
+alerts), whose schemas carry no account argument because they belong to the Robinhood login
+rather than an account. Their results may include the login's non-Agentic objects.
+
+Still `UNVERIFIED` (denied, CLAUDE.md §18): every Tier S/X tool, whose schemas weren't
+captured. A Robinhood tool missing from the table is `UNVERIFIED` (fail closed).
 
 Account discovery (`get_accounts`) is trusted-code-only (CLAUDE.md §9): the model never
 calls it, so it stays `UNVERIFIED` here. Matching is on the full account number only;
@@ -36,6 +38,9 @@ class AccountScope(StrEnum):
     NOT_ACCOUNT_SCOPED = "not_account_scoped"  # market/reference data; no account argument
     VERIFIED = "verified"  # the account argument's name is captured from tools/list
     UNVERIFIED = "unverified"  # account-specific, or might be; schema not captured: withheld
+    # Belongs to the Robinhood login, not an account (no account argument). Allowed by owner
+    # decision (ADR-0026): results may include the login's non-Agentic objects.
+    LOGIN_SCOPED = "login_scoped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +58,7 @@ class AccountScopeSpec:
 
 
 NOT_SCOPED = AccountScopeSpec(AccountScope.NOT_ACCOUNT_SCOPED)
+LOGIN_SCOPED = AccountScopeSpec(AccountScope.LOGIN_SCOPED)
 UNVERIFIED = AccountScopeSpec(AccountScope.UNVERIFIED)
 
 # Market and reference data: quotes, chains, instruments, fundamentals, earnings, filings,
@@ -77,11 +83,10 @@ _ACCOUNT_NUMBER_TOOLS = (
     "get_option_positions", "get_option_orders",
 )  # fmt: skip
 
-# Account discovery (trusted code only), workspace reads with no account argument (login-scoped,
-# ADR-0017), and every Tier S/X tool. Listed explicitly so the table documents them; absence
-# from the table would give the same answer.
-_UNVERIFIED_TOOLS = (
-    "get_accounts",
+# Workspace objects belong to the Robinhood login, not an account: no account argument in the
+# captured schemas (reads: ADR-0017, allowed by ADR-0026; Tier S writes: tools/list of
+# 2026-09-27, ADR-0027, still subject to the hook's ownership checks).
+LOGIN_SCOPED_TOOLS = (
     "get_option_watchlist", "get_scans", "run_scan", "get_watchlists", "get_watchlist_items",
     "get_alerts", "get_alert_log",
     "create_scan", "update_scan_filters", "update_scan_config",
@@ -89,6 +94,12 @@ _UNVERIFIED_TOOLS = (
     "follow_watchlist", "unfollow_watchlist",
     "add_option_to_watchlist", "remove_option_from_watchlist",
     "create_alert", "update_alert", "delete_alert", "mark_alerts_read",
+)  # fmt: skip
+
+# Account discovery (trusted code only) and the Tier X order tools (their account argument
+# is not wired yet: phase 2). Listed explicitly so the table documents them.
+_UNVERIFIED_TOOLS = (
+    "get_accounts",
     "review_option_order", "place_option_order", "cancel_option_order",
 )  # fmt: skip
 
@@ -96,6 +107,7 @@ ROBINHOOD_ACCOUNT_SCOPE: Mapping[str, AccountScopeSpec] = MappingProxyType(
     {
         **{name: NOT_SCOPED for name in _NOT_SCOPED_TOOLS},
         **{name: AccountScopeSpec.verified("account_number") for name in _ACCOUNT_NUMBER_TOOLS},
+        **{name: LOGIN_SCOPED for name in LOGIN_SCOPED_TOOLS},
         **{name: UNVERIFIED for name in _UNVERIFIED_TOOLS},
     }
 )
@@ -130,13 +142,14 @@ def check_account_scope(
     - NOT_ACCOUNT_SCOPED: allowed, unless a top-level argument looks like an account
       identifier (the schema would then be wrong about the tool; fail closed).
     - UNVERIFIED: always denied (CLAUDE.md §18).
+    - LOGIN_SCOPED: allowed (ADR-0026), unless an argument looks like an account identifier.
     - VERIFIED: the account argument must be present, a string, and equal to the full
       configured account number (constant-time compare). A missing argument is denied: the
       broker's default account is never assumed.
     """
     if spec.scope is AccountScope.UNVERIFIED:
         return "account scope unverified for this tool; withheld until tools/list is captured"
-    if spec.scope is AccountScope.NOT_ACCOUNT_SCOPED:
+    if spec.scope in (AccountScope.NOT_ACCOUNT_SCOPED, AccountScope.LOGIN_SCOPED):
         if any(is_account_key(key) for key in tool_input):
             return "unexpected account argument on a tool without account scope"
         return None

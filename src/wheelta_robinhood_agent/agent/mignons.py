@@ -149,6 +149,7 @@ ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
                     "get_scanner_filter_specs",
                     "get_scanner_datapoints",
                     "preview_scan",
+                    "run_scan",
                     "get_popular_watchlists",
                 ),
                 *_wh(

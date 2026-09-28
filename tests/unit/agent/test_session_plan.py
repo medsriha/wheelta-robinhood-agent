@@ -281,15 +281,14 @@ def test_orchestrator_table_lists_its_tools_then_mignon_types_and_models_once() 
     assert "$1/$5" in roster
 
 
-def test_tools_with_unverified_account_scope_are_not_offered() -> None:
-    """The hook would deny every call (CLAUDE.md §18); the plan disallows them up front."""
+def test_login_scoped_workspace_reads_are_offered() -> None:
+    """ADR-0026: workspace reads stay listed and callable (login-scoped)."""
     plan = _plan()
-    allowed, disallowed = set(plan.tool_access.allowed_tools), plan.tool_access.disallowed_tools
+    table = available_tools_table(plan)
     for tool in ("get_scans", "get_watchlists", "get_alerts", "get_option_watchlist"):
-        name = f"mcp__robinhood__{tool}"
-        assert name not in allowed and name in disallowed
-        assert name not in available_tools_table(plan)
-    assert "mcp__robinhood__get_option_positions" in allowed  # verified scope
+        assert f"mcp__robinhood__{tool}" in plan.tool_access.allowed_tools
+        assert f"`mcp__robinhood__{tool}`" in table
+    assert "mcp__robinhood__run_scan" in available_tools_table(plan, Role.MARKET)
 
 
 def test_mignon_table_lists_only_its_role() -> None:

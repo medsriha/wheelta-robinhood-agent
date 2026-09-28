@@ -34,6 +34,7 @@ from typing import Any, Final
 
 from pydantic import JsonValue, ValidationError
 
+from wheelta_robinhood_agent.agent.account_scope import LOGIN_SCOPED_TOOLS
 from wheelta_robinhood_agent.agent.hooks import (
     BUILTIN_SERVER,
     EnvelopeKind,
@@ -71,6 +72,11 @@ def evidence_ref_for(tool_call_id: uuid.UUID) -> str:
     """The code-issued evidence reference of one validated tool result."""
     return f"{EVIDENCE_REF_PREFIX}{tool_call_id}"
 
+
+# ADR-0026: login-scoped workspace reads without a verified mapper reach the model as redacted
+# context, never as evidence (no evidence_ref, not citable, cannot support a number).
+CONTEXT_ONLY_TOOLS: Final = frozenset((ROBINHOOD_SERVER, tool) for tool in LOGIN_SCOPED_TOOLS)
+CONTEXT_ONLY_GAP: Final = "context only: no verified result mapping; not evidence"
 
 # (server, tool) -> mapper. Only tools whose result shapes were captured and verified
 # (ADR-0017 fixtures, tests/fixtures/robinhood/results/; robinhood_mappers.py).
@@ -161,6 +167,15 @@ class BoundaryValidator:
         if request.server == LOCAL_SERVER_NAME:
             return self._envelope(request, EnvelopeKind.VALIDATED, data=redacted)
         mapper = self.mappers.get((request.server, request.tool))
+        if mapper is None and (request.server, request.tool) in CONTEXT_ONLY_TOOLS:
+            # ADR-0026: delivered as redacted context with account values dropped. It carries
+            # no evidence ref, so it can neither be cited nor back a number or a decision.
+            return self._envelope(
+                request,
+                EnvelopeKind.VALIDATED,
+                data={"context_only": True, "payload": _drop_account_values(redacted)},
+                gaps=(CONTEXT_ONLY_GAP,),
+            )
         if mapper is None:
             gap = f"no verified result mapping for {request.server}.{request.tool}"
             return self._invalid(request, EnvelopeKind.MISSING, gap)

@@ -119,9 +119,14 @@ _RESULT_DEDUP_KEY = "post_tool_use"
 
 
 # --------------------------------------------------------------------------------------------
-# Tier S workspace targets (CLAUDE.md §9). Argument names are UNVERIFIED like every Robinhood
-# schema, so every entry is unverified and the hook denies it. Fill `id_arg`/`name_arg` and set
-# `verified=True` once tools/list is captured (with an ADR).
+# Tier S workspace targets (CLAUDE.md §9). Argument names verified against the captured
+# tools/list of 2026-09-27 (tests/fixtures/robinhood/tools_tier_sx_2026-09-27.json, ADR-0027).
+# Tools with no agent-ownable target stay unverified, so the hook denies them:
+# - create_alert: an alert has no name, so the prefix rule cannot mark it as the agent's;
+# - add/remove_option_(to|from)_watchlist: target the login's single options watchlist;
+# - mark_alerts_read: acts on the login's whole alert log.
+# follow/unfollow_watchlist target Robinhood-curated lists, never agent-owned: denied by the
+# ownership check.
 # --------------------------------------------------------------------------------------------
 
 
@@ -161,22 +166,33 @@ def _unverified(kind: WorkspaceKind, action: WorkspaceAction) -> WorkspaceTarget
 _W, _S, _A = WorkspaceKind.WATCHLIST, WorkspaceKind.SCAN, WorkspaceKind.ALERT
 _CREATE, _MUTATE, _ADD = WorkspaceAction.CREATE, WorkspaceAction.MUTATE, WorkspaceAction.ADD_ITEM
 
+def _verified(
+    kind: WorkspaceKind,
+    action: WorkspaceAction,
+    *,
+    id_arg: str | None = None,
+    name_arg: str | None = None,
+) -> WorkspaceTargetSpec:
+    return WorkspaceTargetSpec(kind, action, verified=True, id_arg=id_arg, name_arg=name_arg)
+
+
 ROBINHOOD_WORKSPACE_TARGETS: Mapping[str, WorkspaceTargetSpec] = MappingProxyType(
     {
-        "create_scan": _unverified(_S, _CREATE),
-        "update_scan_filters": _unverified(_S, _MUTATE),
-        "update_scan_config": _unverified(_S, _MUTATE),
-        "create_watchlist": _unverified(_W, _CREATE),
-        "update_watchlist": _unverified(_W, _MUTATE),
-        "add_to_watchlist": _unverified(_W, _ADD),
-        "remove_from_watchlist": _unverified(_W, _MUTATE),
-        "follow_watchlist": _unverified(_W, _MUTATE),
-        "unfollow_watchlist": _unverified(_W, _MUTATE),
+        # create_scan with `scan_id` updates that scan (a mutation; see check_workspace).
+        "create_scan": _verified(_S, _CREATE, id_arg="scan_id", name_arg="title"),
+        "update_scan_filters": _verified(_S, _MUTATE, id_arg="scan_id"),
+        "update_scan_config": _verified(_S, _MUTATE, id_arg="scan_id"),
+        "create_watchlist": _verified(_W, _CREATE, name_arg="display_name"),
+        "update_watchlist": _verified(_W, _MUTATE, id_arg="list_id", name_arg="display_name"),
+        "add_to_watchlist": _verified(_W, _ADD, id_arg="list_id"),
+        "remove_from_watchlist": _verified(_W, _MUTATE, id_arg="list_id"),
+        "follow_watchlist": _verified(_W, _MUTATE, id_arg="list_id"),
+        "unfollow_watchlist": _verified(_W, _MUTATE, id_arg="list_id"),
         "add_option_to_watchlist": _unverified(_W, _ADD),
         "remove_option_from_watchlist": _unverified(_W, _MUTATE),
         "create_alert": _unverified(_A, _CREATE),
-        "update_alert": _unverified(_A, _MUTATE),
-        "delete_alert": _unverified(_A, _MUTATE),
+        "update_alert": _verified(_A, _MUTATE, id_arg="alert_id"),
+        "delete_alert": _verified(_A, _MUTATE, id_arg="alert_id"),
         "mark_alerts_read": _unverified(_A, _MUTATE),
     }
 )
@@ -516,7 +532,10 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             ws.max_mutations_per_run,
             deps.counter.mutations_this_run(),
         )
-        if target.action is WorkspaceAction.CREATE:
+        creating = target.action is WorkspaceAction.CREATE and not (
+            target.id_arg is not None and tool_input.get(target.id_arg) is not None
+        )
+        if creating:
             name = _required_str(tool_input, str(target.name_arg))
             if not in_namespace(name):
                 raise _Denied("new workspace object name lacks the workspace prefix")

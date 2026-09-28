@@ -49,7 +49,7 @@ def test_mignons_hold_no_account_state_actions_or_delegation(role: Role) -> None
         assert spec.tier is ToolTier.R, name
         if registry is ROBINHOOD_REGISTRY:
             scope = ROBINHOOD_ACCOUNT_SCOPE[spec.name].scope
-            assert scope is AccountScope.NOT_ACCOUNT_SCOPED, name
+            assert scope in (AccountScope.NOT_ACCOUNT_SCOPED, AccountScope.LOGIN_SCOPED), name
     assert f"mcp__wra_local__{FACTS_TOOL_NAME}" not in ROLE_TOOLS[role]
 
 

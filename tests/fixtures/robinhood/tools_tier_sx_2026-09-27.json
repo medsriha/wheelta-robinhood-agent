@@ -1,0 +1,892 @@
+{
+  "provenance": {
+    "captured_on": "2026-09-27",
+    "captured_via": "initialize + tools/list only, owner-approved; no tool was called",
+    "scrubbing": "none needed: tool names, descriptions, and input schemas carry no account data",
+    "server": "robinhood-trading (agent.robinhood.com/mcp/trading)"
+  },
+  "tools": {
+    "add_option_to_watchlist": {
+      "description": "Add option contracts to the user's options watchlist. Works for both equity options (AAPL, NVDA) and index options (SPX, NDX, RUT). Source option_ids from get_option_instruments. Confirm with the user before calling \u2014 this is a real write.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "option_ids": {
+            "description": "Option contract UUIDs to add. Each becomes a single-leg position on the user's options watchlist. Source from get_option_instruments.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "position_type": {
+            "description": "\"long\" (default) or \"short\". Applies to every option_id in this call. For mixed long/short adds, issue two calls.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "option_ids"
+        ],
+        "type": "object"
+      }
+    },
+    "add_to_watchlist": {
+      "description": "Add items to a watchlist. Exactly one of symbols (stocks/ETFs), currency_pair_ids (crypto), or index_ids (market indexes like SPX, NDX) is required \u2014 mutually exclusive. For options use add_option_to_watchlist (separate dedicated watchlist). Futures still require the Robinhood app. Already-present items are no-ops. Confirm with the user before calling.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "currency_pair_ids": {
+            "description": "Currency-pair UUIDs to add (e.g. the object_id from get_watchlist_items where object_type=currency_pair, or the id from get_currency_pairs). Mutually exclusive with symbols and index_ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "index_ids": {
+            "description": "Market-index UUIDs to add (the id field from get_indexes; SPX, NDX, DJI, etc.). Mutually exclusive with symbols and currency_pair_ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "list_id": {
+            "description": "UUID of the watchlist to add items to.",
+            "type": "string"
+          },
+          "symbols": {
+            "description": "Stock symbols to add (e.g. ['AAPL', 'NVDA']). US stocks and ETFs only. Mutually exclusive with currency_pair_ids and index_ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "type": "object"
+      }
+    },
+    "cancel_option_order": {
+      "description": "Cancel an open option order by account_number + order_id. Always confirm with the user before calling. Resolve order_id via get_option_orders if the user refers to it by description; pass the same account_number you used there. Requires an agentic_allowed=true account; non-agentic accounts are rejected. Cancellation may be rejected if the order has already filled, was already cancelled, or is otherwise ineligible.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_number": {
+            "description": "Brokerage account that owns the order. Must come from the user or be clearly implied \u2014 never default from get_accounts. Must be agentic_allowed=true. Mismatches against the order's owning account are rejected.",
+            "type": "string"
+          },
+          "order_id": {
+            "description": "Order UUID from get_option_orders. Must live in account_number.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_number",
+          "order_id"
+        ],
+        "type": "object"
+      }
+    },
+    "create_alert": {
+      "description": "Create a price or indicator alert on an equity or crypto symbol. Confirm the symbol and condition with the user before calling \u2014 this is a real write; when it fires the user gets their usual Robinhood notification.\n\nParameter rules:\n- price_above / price_below / price_crosses: threshold is the trigger price. Do not send indicator.\n- sma_above, sma_below, sma_crosses, ema_above, ema_below, ema_crosses, vwap_above, vwap_below, vwap_crosses, rsi_above, rsi_below, rsi_crosses (the indicator's own value vs your target): threshold is the target indicator value AND indicator is required.\n- price_above_sma, price_below_sma, price_crosses_sma, price_above_ema, price_below_ema, price_crosses_ema, price_above_vwap, price_below_vwap, price_crosses_vwap, price_above_boll_upper, price_below_boll_lower, price_crosses_boll_mid, macd_above_signal, macd_below_signal, macd_crosses_signal (price vs indicator line): indicator only \u2014 do not send threshold.\n- Pick the family by WHAT crosses WHAT: sma_crosses means the SMA's own value crosses your numeric threshold; price_crosses_sma means the market price crosses the SMA line and takes no threshold. \"Alert me when the price crosses the 50-day SMA\" is price_crosses_sma, never sma_crosses \u2014 a mixed-up sibling still creates a well-formed but wrong alert.\n- indicator fields: period + interval_secs for sma/ema/rsi; interval_secs only for vwap (must be 300 / 5m bars); fast_period + slow_period + signal_period + interval_secs for macd; period + std_dev + ma_type + interval_secs for boll.\n- Crypto symbols support price conditions only.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "asset_class": {
+            "description": "Optional: equity or crypto, pinning which asset the symbol names. When omitted the symbol is resolved as an equity first, then as crypto.",
+            "type": "string"
+          },
+          "condition_type": {
+            "description": "The alert condition: price_above, price_below, price_crosses, sma_above, sma_below, sma_crosses, ema_above, ema_below, ema_crosses, vwap_above, vwap_below, vwap_crosses, rsi_above, rsi_below, rsi_crosses, price_above_sma, price_below_sma, price_crosses_sma, price_above_ema, price_below_ema, price_crosses_ema, price_above_vwap, price_below_vwap, price_crosses_vwap, price_above_boll_upper, price_below_boll_lower, price_crosses_boll_mid, macd_above_signal, macd_below_signal, or macd_crosses_signal. Same vocabulary get_alerts returns in condition_type.",
+            "type": "string"
+          },
+          "indicator": {
+            "additionalProperties": false,
+            "description": "Indicator configuration. Required for every indicator condition; not used for price conditions.",
+            "properties": {
+              "fast_period": {
+                "description": "macd only: fast EMA period (commonly 12).",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "interval_secs": {
+                "description": "Bar size in seconds \u2014 one of 300 (5m), 600 (10m), 3600 (1h), 86400 (1d), 604800 (1w), or 2592000 (30d). Required for every indicator condition; vwap conditions support 300 only.",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "ma_type": {
+                "description": "boll only: which moving average the bands are built on \u2014 sma or ema.",
+                "type": "string"
+              },
+              "period": {
+                "description": "Lookback window in bars. Required for sma/ema/rsi/boll conditions.",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "signal_period": {
+                "description": "macd only: signal-line EMA period (commonly 9).",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "slow_period": {
+                "description": "macd only: slow EMA period (commonly 26).",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "std_dev": {
+                "description": "boll only: number of standard deviations for the bands (commonly 2).",
+                "type": "number"
+              }
+            },
+            "required": [
+              "interval_secs"
+            ],
+            "type": [
+              "null",
+              "object"
+            ]
+          },
+          "symbol": {
+            "description": "The equity symbol or crypto asset the alert watches, e.g. AAPL or BTC.",
+            "type": "string"
+          },
+          "threshold": {
+            "description": "Decimal string: the trigger price for price conditions, or the target indicator value for sma_above-style conditions. Not used for price-vs-indicator-line conditions.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol",
+          "condition_type"
+        ],
+        "type": "object"
+      }
+    },
+    "create_scan": {
+      "description": "Create a new saved scanner (screener) on the user's account \u2014 or, with scan_id, update an existing one by appending a new configuration version. Filters can be enum-based (from get_scanner_filter_specs) or expression-based (a raw market-data expression built from get_scanner_datapoints). Returns the scan's id, title, applied filters, and live market results.\n\nPrefer an enum filter_type whenever one covers the request: enum filters are pre-validated and render as standard, user-editable filters in Legend. Build a raw expression only when no enum filter covers the request, and validate it with preview_scan before saving it here. This is the only tool that saves expression filters \u2014 update_scan_filters rejects them \u2014 so to change a scan that has an expression filter, call this tool with that scan's scan_id and the full desired filter set.\n\nColumns display values, filters screen. To show a datapoint in results without restricting matches, pass it in columns \u2014 never fake it with a no-op filter like \">= 0\", which pollutes the scan's filter list. A column is a display_name plus an expression, or a standard column's display name alone. A couple of contextual columns supporting the filters make a scan read better in Legend.\n\nTwo execution paths:\n- New scan, enum-only filters (or none), no columns: composes multiple Beacon operations \u2014 create the scan, apply the preset configuration if non-INITIAL, apply filters, set the title. If a step after the initial create fails, the scan still exists in its partial state; the response surfaces what was applied, and update_scan_filters / update_scan_config can fix the rest.\n- scan_id set, any expression filter present, or any columns present: a single transactional Beacon call that persists the filters and columns as a new ACTIVE configuration version (on the given scan, or on a brand-new one). All-or-nothing \u2014 an expression the market-data provider rejects means NOTHING is persisted, and the provider's validation error is returned. Earlier versions of a scan are never edited. A non-INITIAL preset cannot be combined with this path.\n\nParameters:\n- scan_id (optional) \u2014 update this existing scan instead of creating one. REPLACE semantics: the new version holds exactly the filters and columns passed, so read the current set via get_scans first and send the complete intended set. Cortex-managed scans are rejected.\n- preset (optional) \u2014 starting preset for a new scan. Default: DAILY_GAINERS when no filters supplied, INITIAL when filters supplied. Valid values: INITIAL, DAILY_GAINERS, DAILY_LOSERS, HIGH_OPTIONS_VOLUME_IV, UPCOMING_EARNINGS.\n- filters (optional for a new scan, required with scan_id) \u2014 array of filter specs, enum and/or expression. Call get_scanner_filter_specs for enum filters; call get_scanner_datapoints before composing an expression.\n- columns (optional) \u2014 extra result columns on top of the filters' own columns and the standard defaults. An expression matching a standard column's canonical form is saved as that standard column, canonical name included (e.g. \"optionsPutDayVolume\" always saves as \"Total put volume\").\n- title (optional) \u2014 custom human-readable name for the scan.\n\nExample: to make \"stocks with RSI > 70 and volume > 1M\", call with\n  preset = \"INITIAL\"\n  filters = [\n    {\"filter_type\": \"FILTER_TYPE_RSI\", \"predicate\": \">\", \"values\": [\"70\"], \"interval\": \"1d\", \"length\": 14},\n    {\"filter_type\": \"FILTER_TYPE_VOLUME\", \"predicate\": \">\", \"values\": [\"1000000\"], \"interval\": \"1d\"}\n  ]\n  title = \"High RSI + High Volume\"\n\nExample: to save \"stocks where put option volume exceeds call option volume\" (no enum filter compares two datapoints), showing both volumes and the ratio as context, call with\n  filters = [\n    {\"expression\": \"optionsPutDayVolume > optionsCallDayVolume\", \"predicate\": \"=\", \"values\": [\"True\"], \"display_title\": \"Put exceeds call\"}\n  ]\n  columns = [\n    {\"display_name\": \"Put volume\", \"expression\": \"optionsPutDayVolume\"},\n    {\"display_name\": \"Call volume\", \"expression\": \"optionsCallDayVolume\"},\n    {\"display_name\": \"Put/Call ratio\", \"expression\": \"optionsPutDayVolume / optionsCallDayVolume\"}\n  ]\n  title = \"Put hedging screen\"\n  (the first two save under their canonical standard names, \"Total put volume\" and \"Total call volume\")\n\nExample: to tighten that saved screen later without creating a second scan, call with\n  scan_id = \"<its scan_id from get_scans>\"\n  filters = [the scan's current filters, copied from get_scans (expressions verbatim, enum filters by filter_type_enum), with the desired change applied]\n  columns = [the scan's current extra columns, copied from get_scans, if they should be kept]",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "description": "Optional result columns to display on top of what the filters and the standard default columns already show. Each column: display_name plus either an expression (from get_scanner_datapoints) or nothing (a standard column referenced by name, e.g. \"Market cap\"). Columns display values, filters screen \u2014 to show a datapoint without restricting results, add a column here, never a no-op filter (e.g. >= 0). A couple of contextual columns supporting the filters make the scan read better in Legend.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "display_name": {
+                  "description": "Column header, and the column's identity: matching an existing column's name (case-insensitively) customizes that column instead of adding a duplicate, and two columns cannot share a name. A filter with non-default interval/length names its column with those parameters (e.g. a 5-minute RSI filter's column is \"RSI (14, 5M)\") \u2014 matching it requires that exact name; a bare \"RSI\" next to it adds a separate, default-parameters RSI column. Without expression, must name a standard column (e.g. \"Market cap\", \"RSI\", \"Volume\") \u2014 an unknown name is rejected with the full list of valid ones.",
+                  "type": "string"
+                },
+                "expression": {
+                  "description": "Raw market-data expression computing the column's value, built from get_scanner_datapoints (same language as expression filters), e.g. \"optionsPutDayVolume / optionsCallDayVolume\". Omit to reference a standard column by display_name alone. If the expression equals a standard column's canonical form, the column is saved as that standard column and display_name is REPLACED by its canonical name (e.g. \"optionsPutDayVolume\" always saves as \"Total put volume\").",
+                  "type": "string"
+                },
+                "order": {
+                  "description": "Relative ordering among the columns passed in this call: lower comes first, columns without an order go last in the order given. The scan's standard default columns (Symbol, Name, price, Volume, ...) always come before these.",
+                  "maximum": 2147483647,
+                  "minimum": -2147483648,
+                  "type": [
+                    "null",
+                    "integer"
+                  ]
+                },
+                "visible": {
+                  "description": "Whether the column shows in results. When omitted, a NEW column is visible, but a column customizing an existing filter-created column keeps that column's current visibility (some filter columns are deliberately hidden) \u2014 pass an explicit value to change it. A hidden column is still computed and saved.",
+                  "type": [
+                    "null",
+                    "boolean"
+                  ]
+                }
+              },
+              "required": [
+                "display_name"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "filters": {
+            "description": "Custom filters, enum-based and/or expression-based. Enum filter: filter_type (FILTER_TYPE_... enum from get_scanner_filter_specs) plus predicate/values and optional interval/length/plot. Expression filter: expression (built from get_scanner_datapoints; omit filter_type) plus predicate/values and an optional display_title. Required when scan_id is set. Prefer an enum filter_type whenever one covers the request; validate an expression with preview_scan before saving it here.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "display_title": {
+                  "description": "Optional short label for an expression filter, shown as the results-column header (e.g. \"Relative volume (30D)\"). Only used with expression.",
+                  "type": "string"
+                },
+                "expression": {
+                  "description": "Raw market-data expression to screen on, e.g. \"dayVolume / volumeAvg(candleCount=30, candlePeriod=\\\"1d\\\", session=\\\"all\\\")\" with a numeric predicate, or a whole comparison like \"tradeAllDay.price > closeAvg(candleCount=50, candlePeriod=\\\"1d\\\", session=\\\"all\\\")\" with predicate \"=\" and values [\"True\"]. Accepted by preview_scan (validate without saving) and create_scan (save); update_scan_filters rejects expressions \u2014 to change an expression filter on a saved scan, call create_scan with that scan's scan_id and the full filter set (a new configuration version is appended; earlier versions are preserved). Omit filter_type when set. Prefer an enum filter_type whenever one covers the request.",
+                  "type": "string"
+                },
+                "filter_type": {
+                  "description": "Wire-format enum name, e.g. \"FILTER_TYPE_RSI\". See the scanner-filter-specs resource for valid values. Omit when supplying expression.",
+                  "type": "string"
+                },
+                "interval": {
+                  "description": "Time granularity for time-series filters (e.g. \"1d\"). Use one of the supported_intervals from the filter's scanner-filter-specs entry. Not used with expression \u2014 encode granularity inside the expression.",
+                  "type": "string"
+                },
+                "length": {
+                  "description": "Lookback length for filters that need one (e.g. RSI period of 14). Use one of the supported_lengths from the filter's scanner-filter-specs entry. Not used with expression.",
+                  "maximum": 2147483647,
+                  "minimum": -2147483648,
+                  "type": "integer"
+                },
+                "plot": {
+                  "description": "Plot / price-field input for filters that have one (e.g. \"open\" or \"close\" for % Change). Use one of the supported_plots from the filter's scanner-filter-specs entry. Not used with expression.",
+                  "type": "string"
+                },
+                "predicate": {
+                  "description": "Wire-format enum name, e.g. \"PREDICATE_GREATER_THAN\". See the scanner-filter-specs resource for the predicates supported by each filter.",
+                  "type": "string"
+                },
+                "values": {
+                  "description": "Threshold values. Single-element for unary predicates, two-element for BETWEEN, multi-element for IN_LIST/ANY_OF. For a boolean expression screen, exactly [\"True\"].",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                }
+              },
+              "required": [
+                "predicate",
+                "values"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "preset": {
+            "description": "Starting preset for the new scan. One of: INITIAL (no preset; only valid if filters are provided), DAILY_GAINERS, DAILY_LOSERS, HIGH_OPTIONS_VOLUME_IV, UPCOMING_EARNINGS. Defaults to DAILY_GAINERS when no filters are provided, INITIAL when filters are provided. A non-INITIAL preset cannot be combined with expression filters, columns, or scan_id.",
+            "type": "string"
+          },
+          "scan_id": {
+            "description": "Optional. Update an existing scan by appending the given filters (and columns) as a NEW configuration version, which becomes the active one \u2014 earlier versions are preserved, never edited. The version holds exactly what is passed (REPLACE semantics, not merge): read the scan's current filters and columns with get_scans first and pass the complete intended set. This is how to change a scan that has expression filters, which update_scan_filters cannot carry. Cortex-managed scans are rejected. Omit to create a new scan.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Optional custom title for the saved scan. If omitted: a new scan gets Beacon's default title for the preset, and a scan_id update keeps the scan's existing title.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "create_watchlist": {
+      "description": "Create a new custom watchlist for the user \u2014 a real write. When the user has already specified the name, call this directly; ask for a name first only when they have not. Do not use this to follow a Robinhood-curated list (use follow_watchlist).",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "display_description": {
+            "description": "Short description shown under the name.",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "Name for the new watchlist (e.g. 'Tech Stocks'). Must be unique among the user's watchlists.",
+            "type": "string"
+          },
+          "icon_emoji": {
+            "description": "Emoji shown next to the name (one character).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "display_name"
+        ],
+        "type": "object"
+      }
+    },
+    "delete_alert": {
+      "description": "Permanently delete a price or indicator alert, with a server-enforced confirmation step: a call without confirm deletes nothing and returns a preview of exactly what would be deleted; show that preview to the user, and only after they approve call again with confirm=true. There is no undo. If the user only wants to stop notifications for a while, disable the alert with update_alert (enabled=false) instead of deleting it.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "alert_id": {
+            "description": "The alert to delete \u2014 take it from get_alerts or create_alert; never construct one.",
+            "type": "string"
+          },
+          "confirm": {
+            "description": "Set true only after the user approved the preview returned by a prior call without confirm. Omitted or false = preview only: nothing is deleted.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "alert_id"
+        ],
+        "type": "object"
+      }
+    },
+    "follow_watchlist": {
+      "description": "Follow a Robinhood-curated list so it appears in the user's watchlists. Confirm with the user before calling. Use only for curated lists; the user already owns their custom lists.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "list_id": {
+            "description": "UUID of the Robinhood-curated list to follow. Obtain from get_popular_watchlists.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "type": "object"
+      }
+    },
+    "mark_alerts_read": {
+      "description": "Mark fired alerts as read so already-handled events are not reported to the user twice. Call it after relaying fired alerts from get_alert_log.\n\nParameter rules:\n- Provide exactly one of alert_log_ids or all_through.\n- alert_log_ids marks specific events; all_through marks every event triggered at or before that instant, across ALL symbols \u2014 not only the ones just discussed.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "alert_log_ids": {
+            "description": "Fired-alert event ids from get_alert_log's alert_log_id (never alert_id). At most 100 per call \u2014 the server enforces the exact cap and rejects oversized batches naming the current limit.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "all_through": {
+            "description": "RFC3339 timestamp: mark every event triggered at or before this instant as read, across all symbols. Set it to the triggered_at of the newest event you relayed so later events stay unread. Never a future timestamp \u2014 the upstream rejects it, and one would silently suppress unread state for alerts that have not fired yet.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "place_option_order": {
+      "description": "Place a real options order with real money.\n\nCapability: single-leg options orders \u2014 Level 2 strategies (covered calls, cash-secured puts, long calls and puts). Multi-leg spreads (Level 3 strategies) are supported on option_level_3 accounts.\n\nAccount requirements: confirm via get_accounts that the chosen account is agentic_allowed=true AND has option_level_2 or option_level_3. If agentic_allowed=false do NOT call. If option_level is empty or option_level_0, do NOT call; follow the get_accounts guide for how to direct the user to enroll.\n\nAlert handling: pre-trade alerts surface only in review_option_order. After the user has acknowledged the reviewed alert, call this tool with the same parameters.\n\nIdempotency: pass a fresh UUID as ref_id on the first call for each logical order, and re-send the SAME ref_id on retries of transient transport failures. Use a new ref_id only when the user wants a new order.\n\nTo find option_id: get_option_chains \u2192 get_option_instruments filtered by expiration_date/strike_price/type.\n\nParameter rules:\n- Multi-leg leg layouts \u2014 vertical spread: two legs, same expiration, different strikes, opposite sides. Calendar: two legs, same strike, different expirations. Iron condor: four legs, a put spread plus a call spread. Roll: close the leg you hold (position_effect 'close', side opposite the position) plus open the replacement ('open').\n- Get the net price from the user rather than inferring it from individual leg quotes.\n- Multi-leg is not available on cash or retirement accounts through this tool.\n- type: 'limit' (default), 'market', 'stop_limit', 'stop_market'. price for limit/stop_limit; stop_price for stop_market/stop_limit.\n- market, stop_market, and stop_limit are single-leg only. market and stop_market are also regular_hours, GFD only. stop_market is sell-to-close only with stop_price below the current ask.\n\nNot currently supported anywhere (including the Robinhood apps):\n- combo orders. At Robinhood, \"combo\" specifically means a stock-option combo: one option leg paired with 100 shares of the underlying equity. In broader industry use, \"combo\" without qualifier sometimes refers to multi-leg option structures.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_number": {
+            "description": "Brokerage account number. Must come from the user or be clearly implied \u2014 never default from get_accounts. Must be agentic_allowed=true.",
+            "type": "string"
+          },
+          "direction": {
+            "description": "Net direction of the whole order: 'debit' (you pay the net premium) or 'credit' (you receive it). Required with 2 or more legs; for one leg it is derived from that leg's side, so omit it.",
+            "type": "string"
+          },
+          "legs": {
+            "description": "1 to 4 legs, all on the same underlying and each a different contract. Several legs are filled together as one strategy. Should match the legs the user reviewed.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "option_id": {
+                  "description": "Option instrument UUID (from get_option_instruments).",
+                  "type": "string"
+                },
+                "position_effect": {
+                  "description": "'open' (new position) or 'close' (existing position). To close a long use sell; to close a short use buy.",
+                  "type": "string"
+                },
+                "ratio_quantity": {
+                  "description": "Contracts for this leg per unit of the order's quantity. Defaults to 1, which is what standard spreads, condors, calendars, and rolls use. Must be 1 on a single-leg order; across legs the ratios must be in lowest terms (1:2, not 2:4).",
+                  "type": "integer"
+                },
+                "side": {
+                  "description": "'buy' or 'sell'.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "option_id",
+                "side",
+                "position_effect"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "market_hours": {
+            "description": "'regular_hours' (default), 'regular_curb_hours', or 'regular_curb_overnight_hours'. Non-limit-immediate orders only place in regular_hours. CURB requires an index chain with extended_hours_state='enabled'.",
+            "type": "string"
+          },
+          "price": {
+            "description": "Limit price. Per contract for one leg; with several legs it is the net premium of the whole strategy per unit of quantity, always positive \u2014 direction says whether it is paid or received. Required for limit/stop_limit; must be omitted for market/stop_market.",
+            "type": "string"
+          },
+          "quantity": {
+            "description": "Positive integer contract count. With several legs it counts whole strategies \u2014 each leg fills quantity \u00d7 its ratio_quantity contracts.",
+            "type": "string"
+          },
+          "ref_id": {
+            "description": "Idempotency key (UUID). Generate once per logical order and re-send on retry. Omitting falls back to a server-generated key.",
+            "type": "string"
+          },
+          "stop_price": {
+            "description": "Stop trigger price per contract. Required for stop_limit/stop_market; must be omitted for limit/market.",
+            "type": "string"
+          },
+          "time_in_force": {
+            "description": "'gfd' (default) or 'gtc'. Market orders must be 'gfd'.",
+            "type": "string"
+          },
+          "type": {
+            "description": "'limit' (default), 'market', 'stop_limit', or 'stop_market'. Should match the type the user reviewed. Only 'limit' is available with 2 or more legs.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_number",
+          "legs",
+          "quantity"
+        ],
+        "type": "object"
+      }
+    },
+    "remove_from_watchlist": {
+      "description": "Remove items from a watchlist. Exactly one of symbols (stocks/ETFs), currency_pair_ids (crypto), or index_ids (market indexes) is required \u2014 mutually exclusive. For options use remove_option_from_watchlist. Items not on the list are no-ops (not errors). Confirm with the user before calling.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "currency_pair_ids": {
+            "description": "Currency-pair UUIDs to remove. Mutually exclusive with symbols and index_ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "index_ids": {
+            "description": "Index UUIDs to remove. Mutually exclusive with symbols and currency_pair_ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "list_id": {
+            "description": "UUID of the watchlist to remove items from.",
+            "type": "string"
+          },
+          "symbols": {
+            "description": "Stock symbols to remove (e.g. ['AAPL']). Mutually exclusive with currency_pair_ids and index_ids.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "type": "object"
+      }
+    },
+    "remove_option_from_watchlist": {
+      "description": "Remove option contracts from the user's options watchlist. Specify the same position_type used when the contract was added (defaults to \"long\"). Contracts not on the list are no-ops. Confirm with the user before calling.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "option_ids": {
+            "description": "Option contract UUIDs to remove. The position_type must match how each contract was added (most likely \"long\").",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "position_type": {
+            "description": "\"long\" (default) or \"short\". Must match how the contract was originally added.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "option_ids"
+        ],
+        "type": "object"
+      }
+    },
+    "review_option_order": {
+      "description": "Simulate an options order without placing it. Returns the current quote plus pre-trade alerts. Call this by default before place_option_order or replace_option_order unless the user has very explicitly asked to skip review.\n\nCapability: single-leg options orders \u2014 Level 2 strategies (covered calls, cash-secured puts, long calls and puts). Multi-leg spreads (Level 3 strategies) are supported on option_level_3 accounts.\n\nAccount requirements: confirm via get_accounts that the chosen account is agentic_allowed=true AND has option_level_2 or option_level_3. If agentic_allowed=false do NOT call. If option_level is empty or option_level_0, do NOT call; follow the get_accounts guide for how to direct the user to enroll.\n\nParameter rules:\n- legs: option_id (from get_option_instruments), side, position_effect, optional ratio_quantity per leg.\n- Multi-leg leg layouts \u2014 vertical spread: two legs, same expiration, different strikes, opposite sides. Calendar: two legs, same strike, different expirations. Iron condor: four legs, a put spread plus a call spread. Roll: close the leg you hold (position_effect 'close', side opposite the position) plus open the replacement ('open').\n- Get the net price from the user rather than inferring it from individual leg quotes.\n- Multi-leg is not available on cash or retirement accounts through this tool.\n- type: 'limit' (default), 'market', 'stop_limit', 'stop_market'. If unspecified, ask. price for limit/stop_limit; stop_price for stop_market/stop_limit.\n- market, stop_market, and stop_limit are single-leg only. market and stop_market are also GFD, regular_hours only. stop_market is sell-to-close only with stop_price below the current ask. Non-limit-immediate types are blocked in any extended-hours session.\n- Surface order_checks alerts verbatim \u2014 the detail strings carry the actual time/contract/BP values for the user.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "account_number": {
+            "description": "Brokerage account number. Must come from the user or be clearly implied \u2014 never default from get_accounts. Must be agentic_allowed=true.",
+            "type": "string"
+          },
+          "chain_symbol": {
+            "description": "Underlying ticker (e.g. 'AAPL', 'SPXW'). Supply alongside underlying_type to include fees and collateral in the response \u2014 always do so when known.",
+            "type": "string"
+          },
+          "direction": {
+            "description": "Net direction of the whole order: 'debit' (you pay the net premium) or 'credit' (you receive it). Required with 2 or more legs; for one leg it is derived from that leg's side, so omit it.",
+            "type": "string"
+          },
+          "legs": {
+            "description": "1 to 4 legs, all on the same underlying and each a different contract. Several legs are filled together as one strategy.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "option_id": {
+                  "description": "Option instrument UUID (from get_option_instruments).",
+                  "type": "string"
+                },
+                "position_effect": {
+                  "description": "'open' (new position) or 'close' (existing position). To close a long use sell; to close a short use buy.",
+                  "type": "string"
+                },
+                "ratio_quantity": {
+                  "description": "Contracts for this leg per unit of the order's quantity. Defaults to 1, which is what standard spreads, condors, calendars, and rolls use. Must be 1 on a single-leg order; across legs the ratios must be in lowest terms (1:2, not 2:4).",
+                  "type": "integer"
+                },
+                "side": {
+                  "description": "'buy' or 'sell'.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "option_id",
+                "side",
+                "position_effect"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "market_hours": {
+            "description": "'regular_hours' (default), 'regular_curb_hours', or 'regular_curb_overnight_hours'. Extended-hours sessions only accept limit+immediate. CURB requires an index chain with extended_hours_state='enabled' (per get_option_chains); rejection surfaces at place time.",
+            "type": "string"
+          },
+          "price": {
+            "description": "Limit price (e.g. '1.50'). Per contract for one leg; with several legs it is the net premium of the whole strategy per unit of quantity, always positive \u2014 direction says whether it is paid or received. Required for limit/stop_limit; must be omitted for market/stop_market.",
+            "type": "string"
+          },
+          "quantity": {
+            "description": "Positive integer contract count. With several legs it counts whole strategies \u2014 each leg fills quantity \u00d7 its ratio_quantity contracts.",
+            "type": "string"
+          },
+          "stop_price": {
+            "description": "Stop trigger price per contract. Required for stop_limit/stop_market; must be omitted for limit/market. For sell-side stop_market, must be below the current ask.",
+            "type": "string"
+          },
+          "time_in_force": {
+            "description": "'gfd' (default) or 'gtc'. Market orders must be 'gfd'.",
+            "type": "string"
+          },
+          "type": {
+            "description": "'limit' (default), 'market', 'stop_limit', or 'stop_market'. Only 'limit' is available with 2 or more legs.",
+            "type": "string"
+          },
+          "underlying_type": {
+            "description": "'equity' or 'index'. Required alongside chain_symbol to enable the fee + collateral fetch.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_number",
+          "legs",
+          "quantity"
+        ],
+        "type": "object"
+      }
+    },
+    "unfollow_watchlist": {
+      "description": "Stop following a Robinhood-curated list. The list itself is unchanged \u2014 it just no longer appears in the user's watchlists. Confirm with the user before calling.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "list_id": {
+            "description": "UUID of the Robinhood-curated list to unfollow.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "type": "object"
+      }
+    },
+    "update_alert": {
+      "description": "Change an existing price or indicator alert: enable/disable it, adjust its threshold or indicator settings, or switch its condition within the same family. Confirm the change with the user before calling \u2014 this is a real write.\n\nParameter rules:\n- At least one of enabled, condition_type, threshold, or indicator is required; only the fields you send change, the rest keep their stored values.\n- condition_type may only change within the alert's current condition family \u2014 e.g. price_above -> price_below, or sma_above -> price_above_sma (both sma family). To change the indicator family or the symbol, create a new alert instead.\n- threshold/indicator rules per condition family match create_alert; conditions comparing price to an indicator line take no threshold.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "alert_id": {
+            "description": "The alert to change \u2014 take it from get_alerts or create_alert; never construct one.",
+            "type": "string"
+          },
+          "condition_type": {
+            "description": "New condition for the alert \u2014 same vocabulary as create_alert. Omitted = unchanged.",
+            "type": "string"
+          },
+          "enabled": {
+            "description": "Set false to pause the alert or true to re-enable it. Omitted = unchanged.",
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "indicator": {
+            "additionalProperties": false,
+            "description": "New indicator configuration \u2014 replaces the stored one wholesale, so send the complete configuration when provided. Omitted = unchanged.",
+            "properties": {
+              "fast_period": {
+                "description": "macd only: fast EMA period (commonly 12).",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "interval_secs": {
+                "description": "Bar size in seconds \u2014 one of 300 (5m), 600 (10m), 3600 (1h), 86400 (1d), 604800 (1w), or 2592000 (30d). Required for every indicator condition; vwap conditions support 300 only.",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "ma_type": {
+                "description": "boll only: which moving average the bands are built on \u2014 sma or ema.",
+                "type": "string"
+              },
+              "period": {
+                "description": "Lookback window in bars. Required for sma/ema/rsi/boll conditions.",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "signal_period": {
+                "description": "macd only: signal-line EMA period (commonly 9).",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "slow_period": {
+                "description": "macd only: slow EMA period (commonly 26).",
+                "maximum": 2147483647,
+                "minimum": -2147483648,
+                "type": "integer"
+              },
+              "std_dev": {
+                "description": "boll only: number of standard deviations for the bands (commonly 2).",
+                "type": "number"
+              }
+            },
+            "required": [
+              "interval_secs"
+            ],
+            "type": [
+              "null",
+              "object"
+            ]
+          },
+          "threshold": {
+            "description": "New trigger price or target indicator value, as a decimal string. Omitted = unchanged.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "alert_id"
+        ],
+        "type": "object"
+      }
+    },
+    "update_scan_config": {
+      "description": "Change the sort order of a saved scan's results table, and/or replace its extra result columns. The scan's filters are always preserved.\n\nParameters:\n- scan_id (required) \u2014 the scan to modify.\n- sorting_column (required unless columns is provided) \u2014 display name of the column to sort by. Must match a column on the scan; the error response lists available columns when no match is found.\n- sorting_direction \u2014 \"asc\" or \"desc\". Required with sorting_column.\n- columns (optional) \u2014 REPLACE the scan's extra result columns (beyond the filters' own columns and the standard defaults). The scan keeps its current filters verbatim and gets a new configuration version \u2014 earlier versions are preserved. To add one column, pass the complete intended set (current columns from get_scans plus the new one). Columns display values, filters screen \u2014 to show a datapoint without restricting results, this is the tool, never a no-op filter.\n\nRestrictions:\n- Cortex-managed scans (cortex_managed: true in get_scans) are rejected.\n- Omitted/empty columns means sorting-only. To remove every extra column, use create_scan with this scan's scan_id and its current filters.\n- An expression matching a standard column's canonical form is saved as that standard column, canonical name included.\n\nReturns the scan with the changes applied and fresh live results.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "columns": {
+            "description": "REPLACE the scan's extra result columns (the ones beyond what its filters and the standard defaults contribute): the scan keeps its current filters verbatim and gets a new configuration version whose extra columns are exactly this list. To add one column, read the scan's current columns with get_scans and pass the complete intended set, carrying visible: false for any column get_scans shows as hidden (a hidden extra column re-sent without it becomes visible). Omitted or empty means sorting-only, columns untouched; to remove every extra column, use create_scan with this scan's scan_id and its current filters. Each column: display_name plus either an expression (from get_scanner_datapoints) or nothing (a standard column referenced by name, e.g. \"Market cap\").",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "display_name": {
+                  "description": "Column header, and the column's identity: matching an existing column's name (case-insensitively) customizes that column instead of adding a duplicate, and two columns cannot share a name. A filter with non-default interval/length names its column with those parameters (e.g. a 5-minute RSI filter's column is \"RSI (14, 5M)\") \u2014 matching it requires that exact name; a bare \"RSI\" next to it adds a separate, default-parameters RSI column. Without expression, must name a standard column (e.g. \"Market cap\", \"RSI\", \"Volume\") \u2014 an unknown name is rejected with the full list of valid ones.",
+                  "type": "string"
+                },
+                "expression": {
+                  "description": "Raw market-data expression computing the column's value, built from get_scanner_datapoints (same language as expression filters), e.g. \"optionsPutDayVolume / optionsCallDayVolume\". Omit to reference a standard column by display_name alone. If the expression equals a standard column's canonical form, the column is saved as that standard column and display_name is REPLACED by its canonical name (e.g. \"optionsPutDayVolume\" always saves as \"Total put volume\").",
+                  "type": "string"
+                },
+                "order": {
+                  "description": "Relative ordering among the columns passed in this call: lower comes first, columns without an order go last in the order given. The scan's standard default columns (Symbol, Name, price, Volume, ...) always come before these.",
+                  "maximum": 2147483647,
+                  "minimum": -2147483648,
+                  "type": [
+                    "null",
+                    "integer"
+                  ]
+                },
+                "visible": {
+                  "description": "Whether the column shows in results. When omitted, a NEW column is visible, but a column customizing an existing filter-created column keeps that column's current visibility (some filter columns are deliberately hidden) \u2014 pass an explicit value to change it. A hidden column is still computed and saved.",
+                  "type": [
+                    "null",
+                    "boolean"
+                  ]
+                }
+              },
+              "required": [
+                "display_name"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "scan_id": {
+            "description": "The scan to modify. Get this from get_scans or create_scan. Cortex-managed scans are rejected.",
+            "type": "string"
+          },
+          "sorting_column": {
+            "description": "Display name of the column to sort by (e.g. \"Volume\", \"% Change\", \"RSI\"). Must match a column on the scan \u2014 call get_scans / run_scan first to see available columns. Required unless columns is provided.",
+            "type": "string"
+          },
+          "sorting_direction": {
+            "description": "\"asc\" or \"desc\" (ascending or descending). Required with sorting_column.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scan_id"
+        ],
+        "type": "object"
+      }
+    },
+    "update_scan_filters": {
+      "description": "Replace the filters on an existing saved scan. The complete filter set provided replaces whatever filters the scan had \u2014 this is REPLACE semantics, not merge. To add a single filter to an existing scan, the agent must first read the scan (via get_scans or run_scan), then call this tool with all the existing filters plus the new one.\n\nParameters:\n- scan_id (required) \u2014 the scan to modify. Get from get_scans or create_scan.\n- filters (required) \u2014 the complete new filter set. Send [] to clear all filters. Each filter has filter_type (FILTER_TYPE_... enum), predicate, values, optional interval/length. Call get_scanner_filter_specs for valid combinations.\n\nRestrictions:\n- Cortex-managed scans (cortex_managed: true in get_scans) are rejected with a user-friendly error.\n- Returns an error and does not apply any change if any filter fails validation.\n\nReturns the scan with its new filters and fresh live results.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "filters": {
+            "description": "The complete set of filters the scan should have after the update. REPLACE semantics \u2014 to add a filter, supply all existing filters plus the new one. To remove a filter, omit it from the array. To clear all filters, send []. Each filter: filter_type (FILTER_TYPE_... enum), predicate (>, <, =, BETWEEN, etc.), values, optional interval (e.g. 1d), optional length (e.g. 14 for RSI). Call get_scanner_filter_specs first for valid filter_type / predicate / interval / length combinations.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "display_title": {
+                  "description": "Optional short label for an expression filter, shown as the results-column header (e.g. \"Relative volume (30D)\"). Only used with expression.",
+                  "type": "string"
+                },
+                "expression": {
+                  "description": "Raw market-data expression to screen on, e.g. \"dayVolume / volumeAvg(candleCount=30, candlePeriod=\\\"1d\\\", session=\\\"all\\\")\" with a numeric predicate, or a whole comparison like \"tradeAllDay.price > closeAvg(candleCount=50, candlePeriod=\\\"1d\\\", session=\\\"all\\\")\" with predicate \"=\" and values [\"True\"]. Accepted by preview_scan (validate without saving) and create_scan (save); update_scan_filters rejects expressions \u2014 to change an expression filter on a saved scan, call create_scan with that scan's scan_id and the full filter set (a new configuration version is appended; earlier versions are preserved). Omit filter_type when set. Prefer an enum filter_type whenever one covers the request.",
+                  "type": "string"
+                },
+                "filter_type": {
+                  "description": "Wire-format enum name, e.g. \"FILTER_TYPE_RSI\". See the scanner-filter-specs resource for valid values. Omit when supplying expression.",
+                  "type": "string"
+                },
+                "interval": {
+                  "description": "Time granularity for time-series filters (e.g. \"1d\"). Use one of the supported_intervals from the filter's scanner-filter-specs entry. Not used with expression \u2014 encode granularity inside the expression.",
+                  "type": "string"
+                },
+                "length": {
+                  "description": "Lookback length for filters that need one (e.g. RSI period of 14). Use one of the supported_lengths from the filter's scanner-filter-specs entry. Not used with expression.",
+                  "maximum": 2147483647,
+                  "minimum": -2147483648,
+                  "type": "integer"
+                },
+                "plot": {
+                  "description": "Plot / price-field input for filters that have one (e.g. \"open\" or \"close\" for % Change). Use one of the supported_plots from the filter's scanner-filter-specs entry. Not used with expression.",
+                  "type": "string"
+                },
+                "predicate": {
+                  "description": "Wire-format enum name, e.g. \"PREDICATE_GREATER_THAN\". See the scanner-filter-specs resource for the predicates supported by each filter.",
+                  "type": "string"
+                },
+                "values": {
+                  "description": "Threshold values. Single-element for unary predicates, two-element for BETWEEN, multi-element for IN_LIST/ANY_OF. For a boolean expression screen, exactly [\"True\"].",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": [
+                    "null",
+                    "array"
+                  ]
+                }
+              },
+              "required": [
+                "predicate",
+                "values"
+              ],
+              "type": "object"
+            },
+            "type": [
+              "null",
+              "array"
+            ]
+          },
+          "scan_id": {
+            "description": "The scan to modify. Get this from get_scans or create_scan. Cortex-managed scans (cortex_managed: true in get_scans output) are rejected.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scan_id",
+          "filters"
+        ],
+        "type": "object"
+      }
+    },
+    "update_watchlist": {
+      "description": "Rename a custom watchlist or change its icon/description. Robinhood-curated lists cannot be renamed; the call will fail with 404. Provide at least one of display_name, icon_emoji, display_description.",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "display_description": {
+            "description": "New description.",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "New name for the watchlist.",
+            "type": "string"
+          },
+          "icon_emoji": {
+            "description": "New emoji.",
+            "type": "string"
+          },
+          "list_id": {
+            "description": "UUID of the watchlist to update. Obtain from get_watchlists.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "type": "object"
+      }
+    }
+  }
+}

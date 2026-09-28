@@ -71,6 +71,7 @@ SCOPE: dict[str, AccountScopeSpec] = {
     "create_scan": NOT_SCOPED,
     "get_option_quotes": NOT_SCOPED,
     "place_option_order": AccountScopeSpec.verified("account_number"),
+    **{name: NOT_SCOPED for name in ROBINHOOD_WORKSPACE_TARGETS},
 }
 OWNED_LIST = OwnedWorkspaceObject(W, "wl-1", PREFIX + "Held")
 USER_LIST = OwnedWorkspaceObject(W, "wl-2", "My list")  # recorded ID but no prefix
@@ -346,10 +347,44 @@ def test_from_settings_takes_safety_values_from_settings() -> None:
     assert deps.workspace_targets is ROBINHOOD_WORKSPACE_TARGETS
 
 
-def test_shipped_workspace_targets_are_all_unverified() -> None:
+def test_shipped_workspace_targets_match_the_captured_schemas() -> None:
+    """ADR-0027: argument names come from the captured tools/list; unownable targets stay
+    unverified (denied)."""
+    from pathlib import Path
+
+    captured = json.loads(
+        (Path(__file__).parents[2] / "fixtures/robinhood/tools_tier_sx_2026-09-27.json").read_text()
+    )["tools"]
     names = {t.name for t in ROBINHOOD_REGISTRY.by_tier(ToolTier.S)}
-    assert set(ROBINHOOD_WORKSPACE_TARGETS) == names
-    assert not any(t.verified for t in ROBINHOOD_WORKSPACE_TARGETS.values())
+    assert set(ROBINHOOD_WORKSPACE_TARGETS) == names <= set(captured)
+    unverified = {n for n, t in ROBINHOOD_WORKSPACE_TARGETS.items() if not t.verified}
+    assert unverified == {
+        "create_alert",
+        "add_option_to_watchlist",
+        "remove_option_from_watchlist",
+        "mark_alerts_read",
+    }
+    for name, target in ROBINHOOD_WORKSPACE_TARGETS.items():
+        properties = captured[name]["input_schema"].get("properties", {})
+        for arg in (target.id_arg, target.name_arg):
+            assert arg is None or arg in properties, (name, arg)
+
+
+def test_shipped_targets_create_prefixed_and_never_touch_unowned_objects() -> None:
+    s = session(workspace_targets=ROBINHOOD_WORKSPACE_TARGETS)
+    assert_allowed(s, s.pre(RH + "create_watchlist", {"display_name": PREFIX + "New"}))
+    s = session(workspace_targets=ROBINHOOD_WORKSPACE_TARGETS)
+    assert_denied(s, s.pre(RH + "create_watchlist", {"display_name": "Tech"}), "prefix")
+    s = session(workspace_targets=ROBINHOOD_WORKSPACE_TARGETS)
+    out = s.pre(RH + "update_watchlist", {"list_id": "wl-2", "display_name": PREFIX + "x"})
+    assert_denied(s, out, "outside the owned name prefix")  # the user's list
+    s = session(workspace_targets=ROBINHOOD_WORKSPACE_TARGETS)
+    out = s.pre(RH + "create_scan", {"scan_id": "scan-user", "title": PREFIX + "x"})
+    assert_denied(s, out, "not owned")  # create_scan with scan_id edits an existing scan
+    s = session(workspace_targets=ROBINHOOD_WORKSPACE_TARGETS)
+    assert_denied(s, s.pre(RH + "follow_watchlist", {"list_id": "curated-1"}), "not owned")
+    s = session(workspace_targets=ROBINHOOD_WORKSPACE_TARGETS)
+    assert_denied(s, s.pre(RH + "create_alert", {"symbol": "AAPL"}), "unverified")
 
 
 def test_verified_target_spec_invariants() -> None:
@@ -453,7 +488,9 @@ def test_shipped_scope_table_confines_account_reads() -> None:
         s, s.pre(RH + "get_option_positions", {"account_number": "999999999"}), "does not match"
     )
     s = session(account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
-    assert_denied(s, s.pre(RH + "get_watchlists"), "account scope unverified")
+    assert_denied(s, s.pre(RH + "get_accounts"), "not available")  # trusted code only
+    s = session(account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
+    assert_allowed(s, s.pre(RH + "get_watchlists"))  # login-scoped (ADR-0026)
 
 
 # ---- kill switch and stop latch ------------------------------------------------------------
