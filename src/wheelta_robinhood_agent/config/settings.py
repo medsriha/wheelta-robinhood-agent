@@ -37,6 +37,8 @@ _CRON_INTERVAL_SECONDS = 3600
 # into a Mignon agent name, agent/mignons.py).
 MODEL_ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9.]+)*$")
 MODEL_ALIASES = frozenset({"sonnet", "opus", "haiku", "inherit", "default", "best"})
+# A plain addr-spec: one @, no whitespace or angle brackets, a dotted domain.
+_EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
 _FERNET_KEY_BYTES = 32
 
 
@@ -113,6 +115,15 @@ class Settings(BaseSettings):
     HEARTBEAT_URL: SecretStr | None = None
     ALERT_WEBHOOK_URL: SecretStr | None = None
 
+    # ADR-0029: one summary email per run whose agent session started. Off by default. The
+    # recipient is a secret so the redactor keeps it out of logs.
+    RUN_SUMMARY_EMAIL_ENABLED: bool = False
+    RESEND_API_KEY: SecretStr | None = None
+    RUN_SUMMARY_EMAIL_FROM: str = Field(default="Wheelta Agent <agent@wheelta.com>", min_length=3)
+    RUN_SUMMARY_EMAIL_TO: SecretStr | None = None
+    # Exact model ID for the summary prose; unset or blank means AGENT_MODEL.
+    RUN_SUMMARY_MODEL: str | None = None
+
     @field_validator("RUN_TIMEOUT_SECONDS")
     @classmethod
     def _run_budget_below_cron_interval(cls, value: int) -> int:
@@ -126,6 +137,9 @@ class Settings(BaseSettings):
         "HEARTBEAT_URL",
         "ALERT_WEBHOOK_URL",
         "MIGNON_AGENT_MODELS",
+        "RESEND_API_KEY",
+        "RUN_SUMMARY_EMAIL_TO",
+        "RUN_SUMMARY_MODEL",
         mode="before",
     )
     @classmethod
@@ -139,6 +153,35 @@ class Settings(BaseSettings):
         if value.strip().lower() in MODEL_ALIASES:
             raise ValueError(f"must be an exact model ID, not the alias {value!r}")
         return value
+
+    @field_validator("RUN_SUMMARY_MODEL")
+    @classmethod
+    def _summary_model_is_pinned(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value.lower() in MODEL_ALIASES:
+            raise ValueError(f"must be an exact model ID, not the alias {value!r}")
+        if not MODEL_ID_PATTERN.fullmatch(value):
+            raise ValueError(f"not an exact model ID: {value!r}")
+        return value
+
+    @field_validator("RUN_SUMMARY_EMAIL_TO")
+    @classmethod
+    def _recipient_shape(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not _EMAIL_ADDRESS_PATTERN.fullmatch(value.get_secret_value()):
+            raise ValueError("must be a single email address")
+        return value
+
+    @model_validator(mode="after")
+    def _run_summary_email_is_complete(self) -> "Settings":
+        """ADR-0029: an enabled summary email needs the Resend key and a recipient."""
+        if self.RUN_SUMMARY_EMAIL_ENABLED and (
+            self.RESEND_API_KEY is None or self.RUN_SUMMARY_EMAIL_TO is None
+        ):
+            raise ValueError(
+                "RUN_SUMMARY_EMAIL_ENABLED=true requires RESEND_API_KEY and RUN_SUMMARY_EMAIL_TO"
+            )
+        return self
 
     @field_validator("MIGNON_AGENT_MODELS")
     @classmethod
@@ -238,6 +281,11 @@ class Settings(BaseSettings):
         return (self.AGENT_MODEL,)
 
     @property
+    def run_summary_model(self) -> str:
+        """The model that writes the summary email prose (ADR-0029)."""
+        return self.RUN_SUMMARY_MODEL or self.AGENT_MODEL
+
+    @property
     def account_last4(self) -> str:
         """The only form of the account number that may be logged (CLAUDE.md §7)."""
         return self.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER.get_secret_value()[-4:]
@@ -271,6 +319,8 @@ class Settings(BaseSettings):
             "wheelta_mcp_url": str(self.WHEELTA_MCP_URL),
             "heartbeat_configured": self.HEARTBEAT_URL is not None,
             "alerts_configured": self.ALERT_WEBHOOK_URL is not None,
+            "run_summary_email_enabled": self.RUN_SUMMARY_EMAIL_ENABLED,
+            "run_summary_model": self.run_summary_model,
         }
 
 

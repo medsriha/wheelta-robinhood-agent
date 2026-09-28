@@ -110,6 +110,8 @@ def settings_secrets(settings: Settings) -> tuple[SecretStr, ...]:
         settings.DATABASE_URL,
         settings.HEARTBEAT_URL,
         settings.ALERT_WEBHOOK_URL,
+        settings.RESEND_API_KEY,
+        settings.RUN_SUMMARY_EMAIL_TO,
     )
     return tuple(secret for secret in candidates if secret is not None)
 

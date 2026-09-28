@@ -72,6 +72,10 @@ def railway(ctx):  # type: ignore[no-untyped-def]
             # Observability
             "HEARTBEAT_URL": preserve(),
             "ALERT_WEBHOOK_URL": preserve(),
+            # Run summary email (ADR-0029)
+            "RUN_SUMMARY_EMAIL_ENABLED": preserve(),
+            "RESEND_API_KEY": preserve(),
+            "RUN_SUMMARY_EMAIL_TO": preserve(),
         },
     )
 

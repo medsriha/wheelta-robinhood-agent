@@ -28,6 +28,7 @@ class _Settings:
     ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = None
     ALERT_WEBHOOK_URL = None
     HEARTBEAT_URL = None
+    RUN_SUMMARY_EMAIL_ENABLED = False
 
 
 @pytest.mark.parametrize(

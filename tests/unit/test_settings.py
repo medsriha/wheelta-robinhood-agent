@@ -42,6 +42,11 @@ ALL_VARS = [
     "WHEELTA_MCP_URL",
     "HEARTBEAT_URL",
     "ALERT_WEBHOOK_URL",
+    "RUN_SUMMARY_EMAIL_ENABLED",
+    "RESEND_API_KEY",
+    "RUN_SUMMARY_EMAIL_FROM",
+    "RUN_SUMMARY_EMAIL_TO",
+    "RUN_SUMMARY_MODEL",
 ]
 
 
@@ -358,4 +363,60 @@ def test_bad_mignon_model_allowlists_are_rejected(env: pytest.MonkeyPatch, value
 def test_agent_model_aliases_are_rejected(env: pytest.MonkeyPatch, alias: str) -> None:
     env.setenv("AGENT_MODEL", alias)
     with pytest.raises(SettingsError, match="AGENT_MODEL"):
+        load_settings()
+
+
+# -- run-summary email (ADR-0029) ---------------------------------------------------------------
+
+
+def test_run_summary_email_is_off_by_default(env: pytest.MonkeyPatch) -> None:
+    s = load_settings()
+    assert s.RUN_SUMMARY_EMAIL_ENABLED is False
+    assert s.RESEND_API_KEY is None and s.RUN_SUMMARY_EMAIL_TO is None
+    assert s.RUN_SUMMARY_EMAIL_FROM == "Wheelta Agent <agent@wheelta.com>"
+    assert s.run_summary_model == "claude-test-model"
+    assert s.config_snapshot()["run_summary_email_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [("RESEND_API_KEY",), ("RUN_SUMMARY_EMAIL_TO",), ("RESEND_API_KEY", "RUN_SUMMARY_EMAIL_TO")],
+)
+def test_enabled_run_summary_email_needs_key_and_recipient(
+    env: pytest.MonkeyPatch, missing: tuple[str, ...]
+) -> None:
+    env.setenv("RUN_SUMMARY_EMAIL_ENABLED", "true")
+    env.setenv("RESEND_API_KEY", "re_secret_value_123")
+    env.setenv("RUN_SUMMARY_EMAIL_TO", "owner@example.com")
+    for name in missing:
+        env.setenv(name, "")
+    with pytest.raises(SettingsError, match="RUN_SUMMARY_EMAIL_ENABLED") as exc:
+        load_settings()
+    assert "re_secret_value_123" not in str(exc.value)
+
+
+def test_enabled_run_summary_email_loads_and_keeps_secrets_out_of_the_snapshot(
+    env: pytest.MonkeyPatch,
+) -> None:
+    env.setenv("RUN_SUMMARY_EMAIL_ENABLED", "true")
+    env.setenv("RESEND_API_KEY", "re_secret_value_123")
+    env.setenv("RUN_SUMMARY_EMAIL_TO", "owner@example.com")
+    env.setenv("RUN_SUMMARY_MODEL", "claude-haiku-4-5")
+    s = load_settings()
+    assert s.run_summary_model == "claude-haiku-4-5"
+    snapshot = repr(s.config_snapshot())
+    assert "re_secret_value_123" not in snapshot and "owner@example.com" not in snapshot
+
+
+@pytest.mark.parametrize("value", ["not-an-address", "a@b", "Owner <owner@example.com>", "a b@c.d"])
+def test_run_summary_recipient_must_be_one_address(env: pytest.MonkeyPatch, value: str) -> None:
+    env.setenv("RUN_SUMMARY_EMAIL_TO", value)
+    with pytest.raises(SettingsError, match="RUN_SUMMARY_EMAIL_TO"):
+        load_settings()
+
+
+@pytest.mark.parametrize("value", ["haiku", "Claude Haiku", "sonnet"])
+def test_run_summary_model_must_be_exact(env: pytest.MonkeyPatch, value: str) -> None:
+    env.setenv("RUN_SUMMARY_MODEL", value)
+    with pytest.raises(SettingsError, match="RUN_SUMMARY_MODEL"):
         load_settings()

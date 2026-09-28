@@ -35,7 +35,13 @@ from e2e_fakes import (
     mignon_report,
     research,
 )
-from e2e_support import SESSION_TIME, WEEKEND_TIME, FakeClock, RecordingNotifier
+from e2e_support import (
+    SESSION_TIME,
+    WEEKEND_TIME,
+    FakeClock,
+    RecordingMailer,
+    RecordingNotifier,
+)
 
 from wheelta_robinhood_agent.agent.session import plan_session
 from wheelta_robinhood_agent.config.prompts import load_prompt
@@ -80,12 +86,14 @@ class Harness:
         self.notifier = notifier
         self.clock = clock
         self.clis: list[FakeCli] = []
+        self.mailer = RecordingMailer()
         self.world = build_world(clock.now)
         self.run_id = run_id_for(AppEnv.LOCAL, slot_for(clock.now))
 
     def deps(self, script: Script, **overrides: Any) -> OrchestratorDeps:
         values: dict[str, Any] = {
             "notifier": self.notifier,
+            "summary_mailer": self.mailer,
             "clock": self.clock,
             "transport_factory": factory(self.world, script, self.clis),
             "upstream_factory": world_upstreams(self.world),
@@ -824,6 +832,7 @@ def test_interrupted_slot_is_finalized_without_a_new_session(
         assert ledger_evidence.run_records_for_run(c, h.run_id)
     assert call.status is ToolCallStatus.FAILED
     assert h.events(RunEventType.RECOVERY_STARTED)
+    assert h.mailer.summaries == []  # ADR-0029: recovery starts no session
 
 
 # -- orchestrator and Mignons (ADR-0025) ---------------------------------------------------------
@@ -965,3 +974,137 @@ def test_the_orchestrator_assigns_each_mignon_a_model_from_the_allowlist(
         types = [r.identity.agent_type for r in tool_call_records(c, h.run_id)]
     assert "mignon-macro--claude-haiku-4-5" not in types  # the empty Mignon made no call
     assert MARKET in types  # the dry-run research ran on the session model
+
+
+# -- run-summary email (ADR-0029) ----------------------------------------------------------------
+
+
+def _summary_rows(h: Harness) -> list[ledger_evidence.StoredAlert]:
+    with h.conn() as c:
+        rows = ledger_evidence.alerts_for_run(c, h.run_id)
+    return [r for r in rows if r.alert_kind == "run_summary_email"]
+
+
+def test_completed_session_sends_one_summary_email(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    assert h.run() == 0, h.notifier.alert_kinds()
+    (summary,) = h.mailer.summaries
+    assert summary.status is RunStatus.COMPLETED and summary.run_id == str(h.run_id)
+    assert summary.effective_execution_mode is ExecutionMode.OFF
+    assert summary.record is not None and len(summary.record.decisions) == 1
+    assert summary.audit_status == "completed" and summary.audit_violations == 0
+    assert summary.next_run_at is not None and summary.next_run_source == "fallback"
+    (row,) = _summary_rows(h)
+    assert row.delivery_status is ledger_evidence.DeliveryStatus.SENT
+    assert row.payload["provider_message_id"] == "em_1"
+    assert row.dedup_key == f"run-summary/{h.run_id}"
+
+
+def test_summary_email_reports_the_agents_next_run(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    chosen = SESSION_TIME + timedelta(minutes=42)
+    assert h.run(_next_run_script(chosen.isoformat().replace("+00:00", "Z"))) == 0
+    (summary,) = h.mailer.summaries
+    assert summary.next_run_at == chosen and summary.next_run_source == "agent"
+    assert summary.next_run_rationale == "Scripted schedule."
+
+
+def test_failed_session_still_sends_a_summary_email(harness: Callable[..., Harness]) -> None:
+    async def script(model: FakeModel) -> str:
+        await research(model)
+        return "I would sell the AAPL put."  # not JSON
+
+    h = harness()
+    assert h.run(script) == 1
+    (summary,) = h.mailer.summaries
+    assert summary.status is RunStatus.FAILED and summary.reason == "invalid_agent_output"
+    assert "invalid_agent_output" in summary.alerts
+
+
+def test_timed_out_session_sends_a_summary_email(harness: Callable[..., Harness]) -> None:
+    async def script(model: FakeModel) -> str | None:
+        await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": ["x"]})
+        h.clock.advance(2000)
+        for _ in range(200):
+            if model.interrupted:
+                break
+            await asyncio.sleep(0.01)
+        return None
+
+    h = harness()
+    assert h.run(script) == 2
+    (summary,) = h.mailer.summaries
+    assert summary.status is RunStatus.TIMED_OUT
+
+
+@pytest.mark.parametrize(
+    "setup",
+    ["kill_switch", "market_closed", "needs_auth", "not_agentic"],
+)
+def test_runs_without_a_session_send_no_summary_email(
+    harness: Callable[..., Harness], setup: str
+) -> None:
+    if setup == "kill_switch":
+        h = harness(KILL_SWITCH=True)
+    elif setup == "market_closed":
+        h = harness(at=WEEKEND_TIME)
+    elif setup == "needs_auth":
+        h = harness(ROBINHOOD_MCP_ACCESS_TOKEN=None)
+    else:
+        h = harness()
+        listing = h.world.handlers["robinhood"]["get_accounts"]
+
+        def not_agentic(args: dict[str, Any]) -> dict[str, Any]:
+            response = listing(args)
+            payload = json.loads(response["content"][0]["text"])
+            payload["data"]["accounts"][0]["agentic_allowed"] = False
+            return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+        h.world.handlers["robinhood"]["get_accounts"] = not_agentic
+    h.run()
+    assert h.clis == []
+    assert h.mailer.summaries == []
+    assert _summary_rows(h) == []
+
+
+def test_lock_contention_sends_no_summary_email(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    with h.conn() as holder:
+        assert try_advisory_lock(holder, RUN_LOCK_OBJID[AppEnv.LOCAL])
+        assert h.run() == 0
+    assert h.mailer.summaries == []
+
+
+def test_not_due_tick_sends_no_summary_email(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    chosen = SESSION_TIME + timedelta(minutes=42)
+    assert h.run(_next_run_script(chosen.isoformat().replace("+00:00", "Z"))) == 0
+    _tick(h, SESSION_TIME + timedelta(minutes=40))
+    assert h.run() == 0
+    assert h.status() is RunStatus.SKIPPED_NOT_DUE
+    assert len(h.mailer.summaries) == 1  # only the first, due run
+
+
+def test_a_failing_mailer_never_changes_the_run_outcome(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    h.mailer.error = RuntimeError("mail down")
+    assert h.run() == 0
+    assert h.status() is RunStatus.COMPLETED
+    assert len(h.mailer.summaries) == 1
+    assert _summary_rows(h) == []  # nothing came back to record
+
+
+def test_a_failed_delivery_is_recorded_as_failed(harness: Callable[..., Harness]) -> None:
+    from wheelta_robinhood_agent.integrations.notifications.email import (
+        EmailDeliveryResult,
+        EmailDeliveryStatus,
+    )
+
+    h = harness()
+    h.mailer.result = EmailDeliveryResult(
+        status=EmailDeliveryStatus.FAILED, subject="s", attempts=3, error="http_503"
+    )
+    assert h.run() == 0
+    (row,) = _summary_rows(h)
+    assert row.delivery_status is ledger_evidence.DeliveryStatus.FAILED
+    assert row.payload["error"] == "http_503"

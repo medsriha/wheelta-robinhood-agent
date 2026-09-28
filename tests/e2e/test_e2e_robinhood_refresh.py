@@ -269,5 +269,6 @@ def test_production_off_mode_refreshes_the_credential_but_starts_no_session(
     assert refresher.calls == [tokens.old_refresh]  # the rotating token stays alive
     assert h.clis == [] and h.world.upstream_servers == []  # no session, no MCP connection
     assert h.status() is RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL
+    assert h.mailer.summaries == []  # ADR-0029: no session, no summary email
     assert _credential_event(h)["status"] == "refreshed"
     assert [hb.status.value for hb in notifier.heartbeats] == ["success"]

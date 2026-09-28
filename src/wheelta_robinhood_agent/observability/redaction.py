@@ -77,6 +77,8 @@ SETTINGS_SECRET_FIELDS = frozenset(
         "database_url",
         "heartbeat_url",
         "alert_webhook_url",
+        "resend_api_key",
+        "run_summary_email_to",
     }
 )
 _ACCOUNT_ID_PARTS = frozenset({"number", "num", "no", "id"})

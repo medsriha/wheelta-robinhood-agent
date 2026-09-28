@@ -1,4 +1,4 @@
-"""Shared e2e helpers: fixed session times, a settable clock, a recording notifier."""
+"""Shared e2e helpers: fixed session times, a settable clock, a recording notifier and mailer."""
 
 from __future__ import annotations
 
@@ -9,7 +9,13 @@ from wheelta_robinhood_agent.integrations.notifications.delivery import (
     DeliveryOutcome,
     DeliveryResult,
 )
+from wheelta_robinhood_agent.integrations.notifications.email import (
+    EmailDeliveryResult,
+    EmailDeliveryStatus,
+)
 from wheelta_robinhood_agent.observability.alerts import AlertPayload, HeartbeatPayload
+from wheelta_robinhood_agent.observability.redaction import Redactor
+from wheelta_robinhood_agent.observability.run_summary import RunSummaryInput
 
 # Wednesday 2026-09-23 11:30 America/New_York: inside the NYSE regular session.
 SESSION_TIME = datetime(2026, 9, 23, 15, 30, tzinfo=UTC)
@@ -45,3 +51,22 @@ class RecordingNotifier:
 
     def alert_kinds(self) -> list[str]:
         return [a.kind.value for a in self.alerts]
+
+
+@dataclass
+class RecordingMailer:
+    """Records run-summary emails (ADR-0029); `error` makes `send` raise instead."""
+
+    summaries: list[RunSummaryInput] = field(default_factory=list)
+    result: EmailDeliveryResult = field(
+        default_factory=lambda: EmailDeliveryResult(
+            status=EmailDeliveryStatus.SENT, subject="s", provider_message_id="em_1", attempts=1
+        )
+    )
+    error: Exception | None = None
+
+    def send(self, summary: RunSummaryInput, redactor: Redactor) -> EmailDeliveryResult:
+        self.summaries.append(summary)
+        if self.error is not None:
+            raise self.error
+        return self.result

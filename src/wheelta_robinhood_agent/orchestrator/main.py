@@ -10,7 +10,7 @@ runs are local only (ADR-0024: outside APP_ENV=local an off-mode run ends
 `skipped_dry_run_not_local` here, after the credential and its alerts) → prompt v6 →
 agent session → the agent's `next_run`, if valid, replaces the fallback → `assemble_run_record` →
 position notes (ADR-0018) → `run_audit` → persist →
-alerts/heartbeat → exit code.
+alerts/heartbeat → run-summary email (ADR-0029: only when a session started) → exit code.
 
 Contains no trading logic. Everything the run decides is recorded as run events.
 `python -m wheelta_robinhood_agent.orchestrator [--run-now]` calls `main()`. `--run-now`
@@ -112,6 +112,12 @@ from wheelta_robinhood_agent.integrations.notifications.delivery import (
     deliver_alert,
     deliver_heartbeat,
 )
+from wheelta_robinhood_agent.integrations.notifications.email import (
+    EmailDeliveryResult,
+    EmailDeliveryStatus,
+    RunSummaryEmailConfig,
+    send_run_summary,
+)
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
@@ -153,6 +159,7 @@ from wheelta_robinhood_agent.observability.logging import (
 )
 from wheelta_robinhood_agent.observability.metrics import RunMetrics
 from wheelta_robinhood_agent.observability.redaction import Redactor
+from wheelta_robinhood_agent.observability.run_summary import RunSummaryInput
 from wheelta_robinhood_agent.orchestrator.exit_codes import EXIT_FAILED, EXIT_OK, exit_code_for
 from wheelta_robinhood_agent.orchestrator.market_session import (
     TradingCalendar,
@@ -190,6 +197,8 @@ from wheelta_robinhood_agent.orchestrator.signals import (
 Conn = psycopg.Connection[tuple[object, ...]]
 _LOG = logging.getLogger("wheelta_robinhood_agent.run")
 NOTIFY_TIMEOUT_SECONDS = 10.0
+# ADR-0029: summary email deliveries share the alerts_sent ledger table under this kind.
+RUN_SUMMARY_EMAIL_KIND = "run_summary_email"
 # Time kept back from the run budget for assembly, audit, and finalization.
 FINALIZE_RESERVE_SECONDS = 60.0
 
@@ -233,6 +242,45 @@ class HttpNotifier:
             self._client.close()
 
 
+class SummaryMailer(Protocol):
+    """Run-summary email delivery (ADR-0029). Never raises; returns the typed result."""
+
+    def send(self, summary: RunSummaryInput, redactor: Redactor) -> EmailDeliveryResult: ...
+
+
+@dataclass
+class HttpSummaryMailer:
+    """`SummaryMailer` over integrations/notifications (Resend + Anthropic Messages)."""
+
+    config: RunSummaryEmailConfig
+    _client: httpx.Client | None = None
+
+    def send(self, summary: RunSummaryInput, redactor: Redactor) -> EmailDeliveryResult:
+        if self._client is None:
+            self._client = httpx.Client()
+        return send_run_summary(summary, config=self.config, client=self._client, redactor=redactor)
+
+    def close(self) -> None:
+        if self._client is not None:
+            self._client.close()
+
+
+def summary_mailer_for(settings: Settings) -> HttpSummaryMailer | None:
+    """The mailer when RUN_SUMMARY_EMAIL_ENABLED (Settings then guarantees key and recipient)."""
+    if not settings.RUN_SUMMARY_EMAIL_ENABLED:
+        return None
+    return HttpSummaryMailer(
+        RunSummaryEmailConfig(
+            enabled=True,
+            resend_api_key=settings.RESEND_API_KEY,
+            from_address=settings.RUN_SUMMARY_EMAIL_FROM,
+            to_address=settings.RUN_SUMMARY_EMAIL_TO,
+            anthropic_api_key=settings.ANTHROPIC_API_KEY,
+            model=settings.run_summary_model,
+        )
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -245,6 +293,8 @@ def _calendar(start: date, end: date) -> TradingCalendar:
 class OrchestratorDeps:
     notifier: Notifier
     clock: Callable[[], datetime] = _utc_now
+    # ADR-0029: None means no run-summary email.
+    summary_mailer: SummaryMailer | None = None
     connect_db: Callable[[SecretStr], Conn] = connect
     calendar_factory: Callable[[date, date], TradingCalendar] = _calendar
     transport_factory: TransportFactory | None = None
@@ -377,6 +427,14 @@ class _Run:
         # ADR-0028: when this run passed the schedule gate; the fallback and the maximum gap
         # are measured from it. Set in _execute on a due tick.
         self.gate_at: datetime | None = None
+        # ADR-0029: what the run-summary email reports. The email is sent only when a session
+        # started; the rest is filled in by _finish, _audit and record_next_run.
+        self.session_started = False
+        self.summary_record: RunRecord | None = None
+        self.audit_result: AuditResult | None = None
+        self.audit_ran = False
+        self.next_run: NextRun | None = None
+        self.next_run_rationale: str | None = None
 
     # -- ledger helpers -------------------------------------------------------------------
 
@@ -433,11 +491,72 @@ class _Run:
     def finalize(self, status: RunStatus, reason: str | None) -> int:
         self.event(RunEventType.STATUS, {"reason": reason} if reason else None, status=status)
         _heartbeat(self.settings, self.deps, status, self.run_id, self.slot, reason)
+        if self.session_started:
+            self.send_summary(status, reason)
         snapshot = self.metrics.snapshot().model_dump(mode="json")
         self.log.bind(stage="finalize").info(
             "run finished", extra={"status": status.value, "reason": reason, "metrics": snapshot}
         )
         return exit_code_for(status)
+
+    def send_summary(self, status: RunStatus, reason: str | None) -> None:
+        """ADR-0029: email the run summary. Informational: never changes status or exit code."""
+        mailer = self.deps.summary_mailer
+        if mailer is None:
+            return
+        try:
+            audit = self.audit_result
+            summary = RunSummaryInput(
+                run_id=str(self.run_id),
+                environment=self.settings.APP_ENV,
+                slot=self.slot,
+                status=status,
+                reason=reason,
+                requested_execution_mode=self.settings.requested_execution_mode,
+                effective_execution_mode=self.settings.effective_execution_mode,
+                record=self.summary_record,
+                audit_status=(
+                    (audit.status.value if audit is not None else AuditStatus.FAILED.value)
+                    if self.audit_ran
+                    else None
+                ),
+                audit_violations=len(audit.violations) if audit is not None else 0,
+                audit_unverifiable=len(audit.unverifiable_checks) if audit is not None else 0,
+                alerts=tuple(k.value for k in self.alerts_sent),
+                next_run_at=self.next_run.not_before if self.next_run else None,
+                next_run_source=self.next_run.source.value if self.next_run else None,
+                next_run_rationale=self.next_run_rationale,
+            )
+            result = mailer.send(summary, self.redactor)
+        except Exception as exc:  # noqa: BLE001 - informational email: never fail the run
+            self.log.warning("run summary email failed", extra={"error_type": type(exc).__name__})
+            return
+        log = self.log.bind(stage="summary_email")
+        log.info(
+            "run summary email",
+            extra={"delivery_status": result.status.value, "error": result.error},
+        )
+        if result.status is EmailDeliveryStatus.SKIPPED:
+            return
+        with contextlib.suppress(Exception):
+            ledger_evidence.record_alert_sent(
+                self.conn,
+                run_id=self.run_id,
+                alert_kind=RUN_SUMMARY_EMAIL_KIND,
+                dedup_key=f"run-summary/{self.run_id}",
+                payload={
+                    "subject": result.subject,
+                    "provider_message_id": result.provider_message_id,
+                    "prose_written": result.prose_written,
+                    "attempts": result.attempts,
+                    "status_code": result.status_code,
+                    "error": result.error,
+                },
+                delivery_status=ledger_evidence.DeliveryStatus.SENT
+                if result.status is EmailDeliveryStatus.SENT
+                else ledger_evidence.DeliveryStatus.FAILED,
+                attempted_at=self.deps.clock(),
+            )
 
     def meta(self, *, prompt: RenderedPrompt | None, model_id: str | None) -> RunMeta:
         return RunMeta(
@@ -560,6 +679,7 @@ class _Run:
             requested_at, source, self.deps.calendar_factory(start, end), latest_at=latest
         )
         self.event(RunEventType.SCHEDULE, scheduled.event_payload(), key=f"schedule:{source.value}")
+        self.next_run = scheduled
         self.log.bind(stage="schedule").info("next run scheduled", extra=scheduled.event_payload())
         return scheduled
 
@@ -572,6 +692,7 @@ class _Run:
         requested = decisions.output.next_run.at
         try:
             self.record_next_run(requested, ScheduleSource.AGENT)
+            self.next_run_rationale = decisions.output.next_run.rationale
         except Exception as exc:  # noqa: BLE001 - model-chosen input: any failure keeps the fallback
             rejected = {"requested_at": requested.isoformat(), "error_type": type(exc).__name__}
             self.log.warning("agent next run not placeable; fallback stands", extra=rejected)
@@ -808,6 +929,9 @@ class _Run:
         session: SessionResult | None,
         unavailable_reason: str | None = None,
     ) -> int:
+        self.session_started = session is not None and session.status is not (
+            SessionStatus.NOT_STARTED
+        )
         if session is not None:
             self.observe_sources(session.observations[len(plan.observations) :])
             if session.eligibility is not None:
@@ -843,6 +967,7 @@ class _Run:
         meta = self.meta(prompt=prompt, model_id=(session.model_id if session else None))
         decisions, output_id = load_decisions(self.conn, self.run_id)
         record = self._assemble(meta, book, decisions, output_id)
+        self.summary_record = record
         audit_ok = self._audit(meta, book, decisions, record)
         # After assembly and audit, so nothing in the agent's schedule can keep them from running.
         self._apply_agent_next_run(decisions)
@@ -936,6 +1061,8 @@ class _Run:
         except Exception as exc:  # noqa: BLE001 - an audit that cannot run is a failed audit
             self.log.exception("audit failed", extra={"error_type": type(exc).__name__})
             result = None
+        self.audit_ran = True
+        self.audit_result = result
         if result is not None:
             for finding in result.findings:
                 ledger_evidence.insert_audit_finding(self.conn, finding)
@@ -1036,12 +1163,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         secrets=settings_secrets(settings),
     )
     notifier = HttpNotifier(settings.ALERT_WEBHOOK_URL, settings.HEARTBEAT_URL)
+    mailer = summary_mailer_for(settings)
     try:
         return run_once(
             settings,
             rules,
             template,
-            OrchestratorDeps(notifier=notifier),
+            OrchestratorDeps(notifier=notifier, summary_mailer=mailer),
             mignon_templates,
             run_now=run_now,
         )
@@ -1059,3 +1187,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_FAILED
     finally:
         notifier.close()
+        if mailer is not None:
+            mailer.close()
