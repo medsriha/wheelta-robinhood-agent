@@ -37,7 +37,7 @@ def test_identity() -> None:
     assert _identity().run_id == run_id_for(AppEnv.STAGING, SLOT)
     with pytest.raises(ValidationError, match="does not match"):
         RunIdentity(run_id=uuid4(), environment=AppEnv.STAGING, slot=SLOT)
-    with pytest.raises(ValidationError, match="whole UTC hour"):
+    with pytest.raises(ValidationError, match="whole 5-minute UTC slot"):
         RunIdentity(run_id=uuid4(), environment=AppEnv.STAGING, slot=SLOT + timedelta(minutes=1))
 
 

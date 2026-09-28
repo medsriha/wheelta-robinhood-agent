@@ -406,6 +406,7 @@ def _output(
         if cancel
         else (),
         unresolved_questions=(),
+        next_run=None,
     )
 
 

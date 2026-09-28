@@ -1,7 +1,8 @@
-"""AgentDecisionOutput v5 parser: strictness, failure shape, and parity with the JSON schema."""
+"""AgentDecisionOutput v6 parser: strictness, failure shape, and parity with the JSON schema."""
 
 import copy
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import cast
@@ -14,12 +15,14 @@ from pydantic import BaseModel
 from wheelta_robinhood_agent.config.prompts import load_prompt
 from wheelta_robinhood_agent.domain.decision_output import (
     LIMIT_PRICE_PATTERN,
+    NEXT_RUN_AT_PATTERN,
     SCHEMA_VERSION,
     AgentDecisionOutput,
     CancellationRationale,
     Decision,
     DecisionOutputParsed,
     DecisionOutputParseFailure,
+    NextRun,
     ProposedLeg,
     ResearchQuestion,
     parse_agent_decision_output,
@@ -28,7 +31,7 @@ from wheelta_robinhood_agent.domain.enums import DecisionAction
 
 SCHEMA_PATH = (
     Path(__file__).resolve().parents[3]
-    / "src/wheelta_robinhood_agent/prompts/agent_decision_output.v5.schema.json"
+    / "src/wheelta_robinhood_agent/prompts/agent_decision_output.v6.schema.json"
 )
 SCHEMA = json.loads(SCHEMA_PATH.read_text())
 JsonObj = dict[str, object]
@@ -56,6 +59,7 @@ def _valid() -> JsonObj:
         "unresolved_questions": [
             {"target_ref": None, "question": "Guidance date?", "evidence_refs": []}
         ],
+        "next_run": {"at": "2026-09-28T15:30:00Z", "rationale": "Re-check after the open."},
     }
 
 
@@ -66,6 +70,7 @@ LOCATIONS: dict[str, tuple[str | int, ...]] = {
     "proposed_leg": ("decisions", 0, "proposed_legs", 0),
     "cancellation_rationale": ("cancellation_rationales", 0),
     "research_question": ("unresolved_questions", 0),
+    "next_run": ("next_run",),
 }
 MODELS: dict[str, type[BaseModel]] = {
     "#": AgentDecisionOutput,
@@ -73,6 +78,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "proposed_leg": ProposedLeg,
     "cancellation_rationale": CancellationRationale,
     "research_question": ResearchQuestion,
+    "next_run": NextRun,
 }
 
 
@@ -108,7 +114,7 @@ def _resolve(prop: JsonObj) -> JsonObj:
 def test_valid_document_parses() -> None:
     result = _parse(_valid())
     assert isinstance(result, DecisionOutputParsed)
-    assert result.schema_version == SCHEMA_VERSION == 5
+    assert result.schema_version == SCHEMA_VERSION == 6
     decision = result.output.decisions[0]
     assert decision.action is DecisionAction.OPEN_CSP
     assert decision.proposed_legs[0].limit_price == Decimal("1.25")
@@ -122,7 +128,12 @@ def test_prompt_example_parses() -> None:
 
 
 def test_empty_output_and_bytes() -> None:
-    doc = {"decisions": [], "cancellation_rationales": [], "unresolved_questions": []}
+    doc = {
+        "decisions": [],
+        "cancellation_rationales": [],
+        "unresolved_questions": [],
+        "next_run": None,
+    }
     assert parse_agent_decision_output(json.dumps(doc).encode()).ok
 
 
@@ -168,14 +179,15 @@ def test_failure_preserves_raw_and_locates_issue() -> None:
     result = parse_agent_decision_output(raw)
     assert isinstance(result, DecisionOutputParseFailure)
     assert result.raw_text == raw
-    assert result.schema_version == 5
+    assert result.schema_version == 6
     assert any(i.loc == "decisions.0.action" for i in result.issues)
 
 
 @pytest.mark.parametrize(
     ("path", "key", "value"),
     [
-        ((), "schema_version", "5"),
+        ((), "schema_version", "6"),
+        (("next_run",), "not_before", "2026-09-28T15:30:00Z"),
         ((), "rejected_candidates", []),
         (("decisions", 0), "quantity", "1"),
         (("decisions", 0), "status", "filled"),
@@ -241,6 +253,13 @@ def test_fields_and_required_match(name: str) -> None:
     assert all(f.is_required() for f in model.model_fields.values())
 
 
+# (matching, non-matching) value per schema string pattern.
+PATTERN_SAMPLES: dict[str, tuple[str, str]] = {
+    LIMIT_PRICE_PATTERN: ("2.50", "2.5.0"),
+    NEXT_RUN_AT_PATTERN: ("2026-09-28T19:45:00-04:00", "2026-09-28 19:45:00"),
+}
+
+
 def _probes(name: str) -> list[tuple[str, str, object, bool]]:
     """(description, field, replacement value, expected ok) derived from the schema only."""
     schema = _schema_def(name)
@@ -262,8 +281,9 @@ def _probes(name: str) -> list[tuple[str, str, object, bool]]:
                     probes.append((f"enum {value}", field, value, True))
                 probes.append(("unknown enum", field, "open_csp", False))
             elif "pattern" in prop:
-                probes.append(("pattern ok", field, "2.50", True))
-                probes.append(("pattern bad", field, "2.5.0", False))
+                good, bad = PATTERN_SAMPLES[cast(str, prop["pattern"])]
+                probes.append(("pattern ok", field, good, True))
+                probes.append(("pattern bad", field, bad, False))
             else:
                 probes.append(("string", field, "some-text", True))
         elif kind == "array":
@@ -277,7 +297,10 @@ def _probes(name: str) -> list[tuple[str, str, object, bool]]:
                 probes.append(("duplicates", field, ["a", "a"], not prop.get("uniqueItems")))
             else:
                 probes.append(("non-object item", field, ["a"], False))
-        else:  # pragma: no cover - the v5 schema has no other property kinds
+        elif kind == "object":
+            probes.append(("string-for-object", field, "x", False))
+            probes.append(("array-for-object", field, [], False))
+        else:  # pragma: no cover - the v6 schema has no other property kinds
             raise AssertionError(f"unhandled schema kind {kind} for {name}.{field}")
     return probes
 
@@ -303,6 +326,64 @@ def test_enum_and_pattern_match_code() -> None:
     assert action["enum"] == [a.value for a in DecisionAction]
     leg = SCHEMA["$defs"]["proposed_leg"]["properties"]["limit_price"]
     assert leg["pattern"] == LIMIT_PRICE_PATTERN
+    at = SCHEMA["$defs"]["next_run"]["properties"]["at"]
+    assert at["pattern"] == NEXT_RUN_AT_PATTERN
+
+
+# ---------------------------------------------------------------- next_run (ADR-0028)
+
+
+@pytest.mark.parametrize(
+    ("at", "expected"),
+    [
+        ("2026-09-28T15:30:00Z", datetime(2026, 9, 28, 15, 30, tzinfo=UTC)),
+        ("2026-09-28T11:30:00-04:00", datetime(2026, 9, 28, 15, 30, tzinfo=UTC)),
+        ("2026-09-28T15:30:00.250+00:00", datetime(2026, 9, 28, 15, 30, 0, 250000, tzinfo=UTC)),
+    ],
+)
+def test_next_run_at_parses_to_utc(at: str, expected: datetime) -> None:
+    doc = _valid()
+    _obj(doc, LOCATIONS["next_run"])["at"] = at
+    result = _parse(doc)
+    assert isinstance(result, DecisionOutputParsed)
+    assert result.output.next_run is not None
+    assert result.output.next_run.at == expected
+    assert result.output.next_run.at.tzinfo is UTC
+
+
+@pytest.mark.parametrize(
+    "at",
+    [
+        "2026-09-28T15:30:00",  # no offset
+        "2026-09-28T15:30Z",  # no seconds
+        "2026-09-28",
+        "2026-13-01T15:30:00Z",  # matches the pattern, not a date
+        "2026-09-28T25:00:00Z",
+        "in 45 minutes",
+        "",
+        "2026-09-28T15:30:00+99:00",  # offset out of range
+        # In range locally, out of range in UTC: must fail parsing, never raise.
+        "0001-01-01T00:00:00+14:00",
+        "9999-12-31T23:59:59-14:00",
+    ],
+)
+def test_next_run_at_invalid(at: str) -> None:
+    doc = _valid()
+    _obj(doc, LOCATIONS["next_run"])["at"] = at
+    assert not _ok(doc)
+
+
+def test_next_run_null_and_round_trip() -> None:
+    doc = _valid()
+    doc["next_run"] = None
+    result = _parse(doc)
+    assert isinstance(result, DecisionOutputParsed)
+    assert result.output.next_run is None
+    stored = _parse(_valid())
+    assert isinstance(stored, DecisionOutputParsed)
+    dumped = stored.output.model_dump(mode="json")
+    assert dumped["next_run"]["at"] == "2026-09-28T15:30:00+00:00"
+    assert AgentDecisionOutput.model_validate(dumped) == stored.output
 
 
 # ---------------------------------------------------------------- property-based
@@ -354,11 +435,22 @@ _CANCEL = st.fixed_dictionaries(
 _QUESTION = st.fixed_dictionaries(
     {"target_ref": st.none() | _REF, "question": _TEXT, "evidence_refs": _unique_list(_REF)}
 )
+_NEXT_RUN = st.fixed_dictionaries(
+    {
+        "at": st.datetimes(
+            min_value=datetime(2026, 1, 1),  # noqa: DTZ001 - hypothesis bounds are naive
+            max_value=datetime(2030, 12, 31),  # noqa: DTZ001
+            timezones=st.just(UTC),
+        ).map(lambda d: d.replace(microsecond=0).isoformat()),
+        "rationale": _TEXT,
+    }
+)
 _OUTPUT = st.fixed_dictionaries(
     {
         "decisions": st.lists(_DECISION, max_size=3),
         "cancellation_rationales": st.lists(_CANCEL, max_size=2),
         "unresolved_questions": st.lists(_QUESTION, max_size=2),
+        "next_run": st.none() | _NEXT_RUN,
     }
 )
 

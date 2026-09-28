@@ -28,11 +28,11 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 7
+version = 8
 status = "signed_off"
-adr = "ADR-0025"
+adr = "ADR-0028"
 signed_off_by = "medsriha (account owner)"
-signed_off_on = "2026-09-27"
+signed_off_on = "2026-09-28"
 
 [conventions]
 value_conventions = [
@@ -308,6 +308,24 @@ notes = [
 max_per_run = 8
 max_concurrent = 4
 max_turns_per_mignon = 40
+
+# ---------------------------------------------------------------------------------------------
+# Scheduling (ADR-0028). The orchestrator applies these; the agent only chooses next_run.
+# Owner, 2026-09-28: no minimum gap; a maximum gap of 2 days (48 h); outside-session times
+# move to the next open.
+# ---------------------------------------------------------------------------------------------
+
+[scheduling]
+notes = [
+  "You choose when your next session starts: next_run.at in your final output, with a short rationale.",
+  "Choose any time up to max_next_run_gap_hours after this run started; a later time is moved back to that limit. There is no minimum.",
+  "A time outside the NYSE regular session (nights, weekends, holidays, after an early close), including one moved back to the limit, moves to the next session's open.",
+  "The scheduler checks every 5 minutes, so a session starts at the first check at or after the chosen time. It never starts earlier.",
+  "next_run null, or a missing or invalid final output, schedules the next session fallback_next_run_minutes after this run started, moved into the session the same way.",
+  "Nothing else starts a session: price alerts and order fills do not wake you. Choose a time that leaves room to manage open positions and working orders.",
+]
+fallback_next_run_minutes = 60
+max_next_run_gap_hours = 48
 
 # ---------------------------------------------------------------------------------------------
 # Data quality (docs/DATA_QUALITY.md explains the pipeline these values feed)

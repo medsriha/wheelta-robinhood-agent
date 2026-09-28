@@ -467,6 +467,14 @@ def insert_agent_decision(
     return decision_id
 
 
+def _stored_output(schema_version: str, parsed: dict[str, object]) -> AgentDecisionOutput:
+    """A stored parse as the current model. v5 rows predate `next_run` (ADR-0028): they had
+    no scheduling preference, which v6 expresses as null. Nothing else differs."""
+    if schema_version == "5":
+        parsed = {**parsed, "next_run": None}
+    return AgentDecisionOutput.model_validate(parsed)
+
+
 def agent_decisions_for_run(conn: Conn, run_id: uuid.UUID) -> tuple[StoredAgentDecision, ...]:
     rows = _rows(
         conn,
@@ -481,7 +489,9 @@ def agent_decisions_for_run(conn: Conn, run_id: uuid.UUID) -> tuple[StoredAgentD
             schema_version=r["schema_version"],
             parse_status=ParseStatus(r["parse_status"]),
             output=(
-                AgentDecisionOutput.model_validate(r["parsed"]) if r["parsed"] is not None else None
+                _stored_output(r["schema_version"], r["parsed"])
+                if r["parsed"] is not None
+                else None
             ),
             issues=tuple(
                 ParseIssue(loc=str(e["loc"]), message=str(e["message"]), kind=str(e["kind"]))

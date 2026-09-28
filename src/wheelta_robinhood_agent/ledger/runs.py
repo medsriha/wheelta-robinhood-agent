@@ -64,10 +64,10 @@ def open_run_slot(
     """Create or get the run identity for (environment, slot) and classify the slot.
 
     Call only while holding the single-flight lock (lock.py). Raises ValueError if `slot` is
-    not a whole UTC hour and IdentityConflict if a stored row has a different run_id.
+    not a whole 5-minute UTC slot and IdentityConflict if a stored row has a different run_id.
     """
     if slot != slot_for(slot):
-        raise ValueError(f"slot must be a whole UTC hour, got {slot.isoformat()}")
+        raise ValueError(f"slot must be a whole 5-minute UTC slot, got {slot.isoformat()}")
     run_id = run_id_for(environment, slot)
     with conn.transaction():
         inserted = conn.execute(
@@ -168,3 +168,31 @@ def run_event_payloads(
         (run_id, event_type.value),
     ).fetchall()
     return tuple(row[0] for row in rows if isinstance(row[0], dict))
+
+
+def latest_next_run_not_before(
+    conn: psycopg.Connection[tuple[object, ...]], environment: AppEnv
+) -> datetime | None:
+    """The `not_before` of the environment's latest `schedule` event (ADR-0028), or None if
+    no run has recorded one. Latest means the newest slot, then the highest sequence within
+    it (a run's agent choice follows its fallback). Raises LedgerError on a malformed payload.
+    """
+    row = conn.execute(
+        "SELECT e.payload FROM run_events e JOIN runs r ON r.run_id = e.run_id "
+        "WHERE r.environment = %s AND e.event_type = %s "
+        "ORDER BY r.slot DESC, e.sequence DESC LIMIT 1",
+        (environment.value, RunEventType.SCHEDULE.value),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = row[0]
+    raw = payload.get("not_before") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        raise LedgerError("schedule event has no not_before")
+    try:
+        not_before = datetime.fromisoformat(raw)
+    except ValueError:
+        raise LedgerError("schedule event not_before is not an ISO timestamp") from None
+    if not_before.tzinfo is None:
+        raise LedgerError("schedule event not_before is naive")
+    return not_before

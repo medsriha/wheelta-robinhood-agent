@@ -31,11 +31,21 @@ def test_run_slot_is_unique_per_environment(conn: Conn) -> None:
     open_run_slot(conn, AppEnv.PRODUCTION, SLOT)  # same slot, other environment: allowed
 
 
-def test_slot_must_be_a_whole_utc_hour(conn: Conn) -> None:
+@pytest.mark.parametrize("minute", [0, 5, 30, 55])
+def test_slot_on_a_five_minute_boundary_is_accepted(conn: Conn, minute: int) -> None:
+    # ADR-0028 (migration 0004): whole hours, the earlier slots, still qualify.
+    conn.execute(
+        "INSERT INTO runs (run_id, environment, slot) VALUES (%s, 'local', %s)",
+        (uuid.uuid4(), SLOT.replace(minute=minute)),
+    )
+
+
+@pytest.mark.parametrize("off_boundary", [{"minute": 31}, {"minute": 30, "second": 1}])
+def test_slot_must_be_a_whole_five_minute_slot(conn: Conn, off_boundary: dict[str, int]) -> None:
     with pytest.raises(psycopg.errors.CheckViolation):
         conn.execute(
             "INSERT INTO runs (run_id, environment, slot) VALUES (%s, 'local', %s)",
-            (uuid.uuid4(), SLOT.replace(minute=30)),
+            (uuid.uuid4(), SLOT.replace(**off_boundary)),
         )
 
 

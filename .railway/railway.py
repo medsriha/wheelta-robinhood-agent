@@ -9,10 +9,13 @@ ends `skipped_dry_run_not_local` after refreshing the Robinhood credential.
 
 from railway_sdk import define_railway, github, postgres, preserve, project, service
 
-# Hourly on weekdays at :35 UTC, 13:35-20:35. That covers every regular-session hour in both
-# EDT (13:30-20:00 UTC) and EST (14:30-21:00 UTC); fires outside the session (DST edges,
-# holidays, early closes) exit skipped_market_closed via the NYSE calendar in code.
-CRON_SCHEDULE = "35 13-20 * * 1-5"
+# Every 5 minutes on weekdays, 13:00-20:55 UTC (ADR-0028). That covers every regular-session
+# minute in both EDT (13:30-20:00 UTC) and EST (14:30-21:00 UTC); ticks outside the session
+# (DST edges, holidays, early closes) exit skipped_market_closed via the NYSE calendar in code.
+# A tick starts a session only when it is due: the agent chooses its next run, and each due
+# run records an hourly fallback first (orchestrator/schedule.py). Other ticks exit
+# skipped_not_due. The interval must equal domain/run_identity.py SLOT_MINUTES.
+CRON_SCHEDULE = "*/5 13-20 * * 1-5"
 
 
 @define_railway

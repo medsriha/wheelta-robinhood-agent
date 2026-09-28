@@ -11,7 +11,7 @@ import tomllib
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 from pydantic import (
     BaseModel,
@@ -21,6 +21,7 @@ from pydantic import (
     StrictInt,
     StrictStr,
     ValidationError,
+    model_validator,
 )
 
 DEFAULT_RULES_PATH = Path(__file__).resolve().parent.parent / "rules" / "trading_rules.toml"
@@ -240,6 +241,22 @@ class Mignons(_Section):
     max_turns_per_mignon: IntRule
 
 
+class Scheduling(_Section):
+    """Next-run scheduling (ADR-0028), applied by the orchestrator (orchestrator/schedule.py).
+    Both values are fixed positive counts: no marker, since every due run needs them. The
+    fallback must not exceed the maximum gap."""
+
+    notes: Notes = ()
+    fallback_next_run_minutes: StrictInt = Field(gt=0)
+    max_next_run_gap_hours: StrictInt = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _fallback_within_max_gap(self) -> Self:
+        if self.fallback_next_run_minutes > self.max_next_run_gap_hours * 60:
+            raise ValueError("fallback_next_run_minutes exceeds max_next_run_gap_hours")
+        return self
+
+
 class Freshness(_Section):
     notes: Notes = ()
     option_quote_max_age_seconds: IntRule
@@ -299,6 +316,7 @@ class TradingRules(_Section):
     circuit_breakers: CircuitBreakers
     workspace: Workspace
     mignons: Mignons
+    scheduling: Scheduling
     data_quality: DataQuality
 
 

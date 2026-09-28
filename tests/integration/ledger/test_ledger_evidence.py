@@ -212,7 +212,10 @@ def test_agent_output_and_decisions_are_kept_separately(conn: Conn, run_id: uuid
     assert not bad.ok
     insert_agent_decision(conn, run_id=run_id, output_id=bad_output, result=bad)
 
-    raw_ok = '{"decisions": [], "cancellation_rationales": [], "unresolved_questions": []}'
+    raw_ok = (
+        '{"decisions": [], "cancellation_rationales": [], "unresolved_questions": [], '
+        '"next_run": null}'
+    )
     ok_output = insert_agent_output(
         conn, run_id=run_id, raw_redacted=raw_ok, observed_at=T0, corrects_output_id=bad_output
     )
@@ -227,7 +230,26 @@ def test_agent_output_and_decisions_are_kept_separately(conn: Conn, run_id: uuid
     assert [d.parse_status for d in decisions] == [ParseStatus.INVALID, ParseStatus.VALID]
     assert decisions[0].output is None and decisions[0].issues == bad.issues
     assert decisions[1].output == good.output
-    assert decisions[1].schema_version == "5"
+    assert decisions[1].schema_version == "6"
+
+
+def test_stored_v5_decision_reads_as_v6_without_next_run(conn: Conn, run_id: uuid.UUID) -> None:
+    # ADR-0028: rows written before next_run existed had no scheduling preference.
+    raw = '{"decisions": [], "cancellation_rationales": [], "unresolved_questions": []}'
+    output_id = insert_agent_output(conn, run_id=run_id, raw_redacted=raw, observed_at=T0)
+    conn.execute(
+        "INSERT INTO agent_decisions (agent_decision_id, run_id, output_id, schema_version, "
+        "parse_status, parsed, errors) VALUES (%s, %s, %s, '5', 'valid', %s, '[]')",
+        (
+            new_id(),
+            run_id,
+            output_id,
+            '{"decisions": [], "cancellation_rationales": [], "unresolved_questions": []}',
+        ),
+    )
+    (stored,) = agent_decisions_for_run(conn, run_id)
+    assert stored.schema_version == "5"
+    assert stored.output is not None and stored.output.next_run is None
 
 
 def test_decision_facts_round_trip_and_correction_keeps_ref(conn: Conn, run_id: uuid.UUID) -> None:

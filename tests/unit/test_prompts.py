@@ -30,10 +30,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v7_with_expected_placeholders() -> None:
+def test_active_prompt_is_v8_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 7
+    assert template.version == 8
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -46,6 +46,14 @@ def test_render_substitutes_everything() -> None:
     assert rendered.template_sha256 == template.sha256
     assert rendered.sha256 != template.sha256
     assert rendered == render_prompt(template, _values(ACTIVE_PLACEHOLDERS))
+
+
+def test_active_prompt_asks_for_next_run() -> None:
+    # ADR-0028: the agent chooses its next session; the rules explain how it is applied.
+    body = load_prompt().body
+    assert "### 6. Choose your next run" in body
+    assert "AgentDecisionOutput v6" in body
+    assert "`scheduling`" in body
 
 
 def test_active_prompt_explains_position_notes() -> None:

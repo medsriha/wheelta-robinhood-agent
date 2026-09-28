@@ -383,7 +383,10 @@ def parsed(
     return DecisionOutputParsed(
         ok=True,
         output=AgentDecisionOutput(
-            decisions=decisions, cancellation_rationales=cancels, unresolved_questions=questions
+            decisions=decisions,
+            cancellation_rationales=cancels,
+            unresolved_questions=questions,
+            next_run=None,
         ),
     )
 

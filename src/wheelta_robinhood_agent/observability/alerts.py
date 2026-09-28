@@ -159,6 +159,8 @@ _SUCCESS_STATUSES = frozenset(
         RunStatus.SKIPPED_MARKET_CLOSED,
         # ADR-0024: the expected production outcome until live mode is authorized.
         RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL,
+        # ADR-0028: a tick before the agent's chosen next run.
+        RunStatus.SKIPPED_NOT_DUE,
     }
 )
 

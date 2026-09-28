@@ -12,7 +12,7 @@ import asyncio
 import json
 import signal
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -29,6 +29,7 @@ from e2e_fakes import (
     OTHER_ACCOUNT_NUMBER,
     RAW_MARKER,
     build_world,
+    decision_json,
     dry_run_script,
     market_mignon,
     mignon_report,
@@ -61,6 +62,10 @@ from wheelta_robinhood_agent.ledger.lock import RUN_LOCK_OBJID, try_advisory_loc
 from wheelta_robinhood_agent.ledger.runs import open_run_slot, run_projection
 from wheelta_robinhood_agent.ledger.tool_calls import tool_call_records
 from wheelta_robinhood_agent.orchestrator.main import OrchestratorDeps, run_once
+from wheelta_robinhood_agent.orchestrator.market_session import (
+    CalendarOutOfRange,
+    build_nyse_calendar,
+)
 
 RULES = load_rules()
 TEMPLATE = load_prompt()
@@ -96,8 +101,10 @@ class Harness:
         values.update(overrides)
         return OrchestratorDeps(**values)
 
-    def run(self, script: Script = dry_run_script, **overrides: Any) -> int:
-        return run_once(self.settings, RULES, TEMPLATE, self.deps(script, **overrides))
+    def run(self, script: Script = dry_run_script, run_now: bool = False, **overrides: Any) -> int:
+        return run_once(
+            self.settings, RULES, TEMPLATE, self.deps(script, **overrides), run_now=run_now
+        )
 
     def conn(self) -> Any:
         return connect(self.settings.DATABASE_URL)
@@ -165,6 +172,208 @@ def test_completed_slot_is_a_no_op(harness: Callable[..., Harness]) -> None:
         after = c.execute("SELECT count(*) FROM run_events").fetchone()
     assert before == after
     assert len(h.notifier.heartbeats) == 1
+
+
+# -- agent-chosen next run (ADR-0028) ------------------------------------------------------------
+
+
+def _tick(h: Harness, at: datetime) -> None:
+    """Move the harness to a later cron tick: its slot, run_id, and a fresh fake world."""
+    h.clock.now = at
+    h.run_id = run_id_for(AppEnv.LOCAL, slot_for(at))
+    h.world = build_world(at)
+
+
+def _next_run_script(at: str) -> Script:
+    async def script(model: FakeModel) -> str:
+        candidate_ref, facts_ref = await research(model)
+        return decision_json(
+            candidate_ref, facts_ref, next_run={"at": at, "rationale": "Scripted schedule."}
+        )
+
+    return script
+
+
+def test_initial_run_records_the_hourly_fallback(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    assert h.run() == 0, h.notifier.alert_kinds()
+    assert h.events(RunEventType.SCHEDULE) == [
+        {
+            "not_before": (SESSION_TIME + timedelta(hours=1)).isoformat(),
+            "source": "fallback",
+            "requested_at": (SESSION_TIME + timedelta(hours=1)).isoformat(),
+            "latest_at": (SESSION_TIME + timedelta(hours=48)).isoformat(),
+            "capped": False,
+            "moved_to_session_open": False,
+        }
+    ]
+    (check,) = [
+        e["schedule_check"] for e in h.events(RunEventType.METADATA) if "schedule_check" in e
+    ]
+    assert check == {"not_before": None, "due": True, "run_now": False}
+
+
+def test_agent_next_run_gates_later_ticks(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    chosen = SESSION_TIME + timedelta(minutes=42)  # 16:12 UTC, inside the session
+    assert h.run(_next_run_script(chosen.isoformat().replace("+00:00", "Z"))) == 0
+    assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == ["fallback", "agent"]
+    assert h.events(RunEventType.SCHEDULE)[-1]["not_before"] == chosen.isoformat()
+
+    _tick(h, SESSION_TIME + timedelta(minutes=40))  # before the chosen time
+    assert h.run() == 0
+    assert h.status() is RunStatus.SKIPPED_NOT_DUE
+    assert len(h.clis) == 1 and h.events(RunEventType.SCHEDULE) == []
+    assert h.notifier.heartbeats[-1].run_status is RunStatus.SKIPPED_NOT_DUE
+    assert h.notifier.heartbeats[-1].status.value == "success"
+
+    _tick(h, SESSION_TIME + timedelta(minutes=45))  # the first tick at or after it
+    assert h.run() == 0, h.notifier.alert_kinds()
+    assert h.status() is RunStatus.COMPLETED
+    assert len(h.clis) == 2
+
+
+def test_run_now_overrides_a_later_next_run_locally(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    assert h.run(_next_run_script("2026-09-24T15:00:00Z")) == 0  # tomorrow
+    _tick(h, SESSION_TIME + timedelta(minutes=5))
+    assert h.run() == 0
+    assert h.status() is RunStatus.SKIPPED_NOT_DUE
+    _tick(h, SESSION_TIME + timedelta(minutes=10))
+    assert h.run(run_now=True) == 0, h.notifier.alert_kinds()
+    assert h.status() is RunStatus.COMPLETED and len(h.clis) == 2
+    (check,) = [
+        e["schedule_check"] for e in h.events(RunEventType.METADATA) if "schedule_check" in e
+    ]
+    assert check == {"not_before": "2026-09-24T15:00:00+00:00", "due": True, "run_now": True}
+    # The forced run records its own fallback, so the schedule moves on from it.
+    assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == ["fallback"]
+
+
+def test_run_now_still_respects_the_kill_switch_and_the_session(
+    harness: Callable[..., Harness],
+) -> None:
+    killed = harness(KILL_SWITCH=True)
+    assert killed.run(run_now=True) == 0
+    assert killed.status() is RunStatus.SKIPPED_KILLED and killed.clis == []
+
+
+def test_run_now_is_refused_outside_local(harness: Callable[..., Harness]) -> None:
+    h = harness(APP_ENV="production")
+    with pytest.raises(ValueError, match="APP_ENV=local"):
+        h.run(run_now=True)
+    assert h.clis == []
+
+
+def test_agent_next_run_outside_the_session_moves_to_the_next_open(
+    harness: Callable[..., Harness],
+) -> None:
+    h = harness()
+    assert h.run(_next_run_script("2026-09-23T18:00:00-04:00")) == 0  # after Wednesday's close
+    agent = h.events(RunEventType.SCHEDULE)[-1]
+    assert agent == {
+        "not_before": "2026-09-24T13:30:00+00:00",
+        "source": "agent",
+        "requested_at": "2026-09-23T22:00:00+00:00",
+        "latest_at": "2026-09-25T15:30:00+00:00",
+        "capped": False,
+        "moved_to_session_open": True,
+    }
+
+
+# Friday 2026-09-25 11:30 America/New_York: inside the session, before a weekend.
+FRIDAY_TIME = SESSION_TIME + timedelta(days=2)
+
+
+def test_agent_next_run_on_a_weekend_moves_to_monday_open(
+    harness: Callable[..., Harness],
+) -> None:
+    h = harness(at=FRIDAY_TIME)
+    assert h.run(_next_run_script("2026-09-27T12:00:00Z")) == 0  # Sunday, within 48 h
+    agent = h.events(RunEventType.SCHEDULE)[-1]
+    assert agent["not_before"] == "2026-09-28T13:30:00+00:00"
+    assert agent["capped"] is False and agent["moved_to_session_open"] is True
+
+
+@pytest.mark.parametrize(
+    ("at", "requested", "not_before"),
+    [
+        # Wednesday: capped at Friday 15:30 UTC, inside the session.
+        (SESSION_TIME, "2026-10-07T15:00:00Z", "2026-09-25T15:30:00+00:00"),
+        (SESSION_TIME, "9999-12-31T00:00:00Z", "2026-09-25T15:30:00+00:00"),
+        # Friday: capped at Sunday 15:30 UTC, then moved to Monday's open.
+        (FRIDAY_TIME, "2026-10-07T15:00:00Z", "2026-09-28T13:30:00+00:00"),
+    ],
+)
+def test_agent_next_run_beyond_the_max_gap_is_capped(
+    harness: Callable[..., Harness], at: datetime, requested: str, not_before: str
+) -> None:
+    h = harness(at=at)
+    assert h.run(_next_run_script(requested)) == 0, h.notifier.alert_kinds()
+    agent = h.events(RunEventType.SCHEDULE)[-1]
+    assert agent["source"] == "agent" and agent["capped"] is True
+    assert agent["latest_at"] == (at + timedelta(hours=48)).isoformat()
+    assert agent["not_before"] == not_before
+
+
+def test_unplaceable_agent_next_run_keeps_the_fallback_and_the_audit(
+    harness: Callable[..., Harness],
+) -> None:
+    # The third calendar built in a run places the agent's time (after the market-session
+    # and fallback calendars); make it fail as a broken calendar would.
+    built: list[object] = []
+
+    def calendar_factory(start: Any, end: Any) -> Any:
+        built.append((start, end))
+        if len(built) == 3:
+            raise CalendarOutOfRange("simulated calendar failure")
+        return build_nyse_calendar(start, end)
+
+    h = harness()
+    script = _next_run_script("2026-09-24T15:00:00Z")
+    assert h.run(script, calendar_factory=calendar_factory) == 0, h.notifier.alert_kinds()
+    assert len(built) == 3
+    assert h.status() is RunStatus.COMPLETED
+    assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == ["fallback"]
+    rejected = [e for e in h.events(RunEventType.METADATA) if "next_run_rejected" in e]
+    assert rejected == [
+        {
+            "next_run_rejected": {
+                "requested_at": "2026-09-24T15:00:00+00:00",
+                "error_type": "CalendarOutOfRange",
+            }
+        }
+    ]
+    assert h.events(RunEventType.AUDIT_STATUS)[0]["status"] == "completed"
+    with h.conn() as c:
+        assert ledger_evidence.run_records_for_run(c, h.run_id)
+
+
+def test_invalid_output_keeps_the_fallback(harness: Callable[..., Harness]) -> None:
+    async def script(model: FakeModel) -> str:
+        await research(model)
+        return '{"next_run": {"at": "soon", "rationale": "x"}}'
+
+    h = harness()
+    assert h.run(script) == 1
+    assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == ["fallback"]
+
+
+def test_kill_switch_alerts_only_on_due_ticks(harness: Callable[..., Harness]) -> None:
+    h = harness(KILL_SWITCH=True)
+    assert h.run() == 0
+    assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == ["fallback"]
+    _tick(h, SESSION_TIME + timedelta(minutes=5))
+    assert h.run() == 0
+    assert h.status() is RunStatus.SKIPPED_KILLED
+    assert h.notifier.alert_kinds().count("kill_switch_engaged") == 1
+    assert h.clis == []
+
+
+def test_market_closed_tick_records_no_schedule(harness: Callable[..., Harness]) -> None:
+    h = harness(at=WEEKEND_TIME)
+    assert h.run() == 0
+    assert h.events(RunEventType.SCHEDULE) == []
 
 
 # -- Robinhood availability -----------------------------------------------------------------------
@@ -409,6 +618,7 @@ def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness
                 "decisions": [hold],
                 "cancellation_rationales": [],
                 "unresolved_questions": [question],
+                "next_run": None,
             }
         )
 

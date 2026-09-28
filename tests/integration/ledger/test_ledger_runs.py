@@ -11,11 +11,12 @@ import pytest
 from wheelta_robinhood_agent.domain.enums import AppEnv, RunStatus
 from wheelta_robinhood_agent.domain.events import RunEventType
 from wheelta_robinhood_agent.domain.run_identity import run_id_for
-from wheelta_robinhood_agent.ledger.errors import DedupConflict
+from wheelta_robinhood_agent.ledger.errors import DedupConflict, LedgerError
 from wheelta_robinhood_agent.ledger.runs import (
     SlotState,
     append_run_event,
     current_run_status,
+    latest_next_run_not_before,
     open_run_slot,
     run_projection,
 )
@@ -140,8 +141,8 @@ def test_correction_references_an_event_of_the_same_run(conn: Conn) -> None:
         )
 
 
-def test_non_hour_slot_rejected(conn: Conn) -> None:
-    with pytest.raises(ValueError, match="whole UTC hour"):
+def test_non_slot_boundary_rejected(conn: Conn) -> None:
+    with pytest.raises(ValueError, match="whole 5-minute UTC slot"):
         open_run_slot(conn, AppEnv.LOCAL, SLOT.replace(minute=1))
 
 
@@ -169,3 +170,42 @@ def test_sequence_allocation_under_concurrency(conn_factory: Callable[[], Conn])
         )
     ]
     assert sequences == list(range(1, writers * per_writer + 1))
+
+
+def _schedule(conn: Conn, run_id: uuid.UUID, not_before: object, key: str) -> None:
+    append_run_event(
+        conn,
+        run_id,
+        RunEventType.SCHEDULE,
+        observed_at=T0,
+        dedup_key=key,
+        payload={"not_before": not_before},
+    )
+
+
+def test_latest_next_run_is_newest_slot_then_sequence(conn: Conn) -> None:
+    # ADR-0028: a run's agent choice (later sequence) replaces its fallback; a later slot's
+    # record replaces an earlier slot's, whatever the times say.
+    assert latest_next_run_not_before(conn, AppEnv.LOCAL) is None
+    first = open_run_slot(conn, AppEnv.LOCAL, SLOT)
+    _schedule(conn, first.run_id, (SLOT + timedelta(hours=1)).isoformat(), "schedule:fallback")
+    _schedule(conn, first.run_id, (SLOT + timedelta(hours=3)).isoformat(), "schedule:agent")
+    assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(hours=3)
+    later = open_run_slot(conn, AppEnv.LOCAL, SLOT + timedelta(minutes=5))
+    _schedule(conn, later.run_id, (SLOT + timedelta(minutes=20)).isoformat(), "schedule:agent")
+    assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(minutes=20)
+    assert latest_next_run_not_before(conn, AppEnv.PRODUCTION) is None
+
+
+def test_skipped_not_due_is_a_final_status(conn: Conn) -> None:
+    run = open_run_slot(conn, AppEnv.LOCAL, SLOT)
+    _status(conn, run.run_id, RunStatus.SKIPPED_NOT_DUE, T0)
+    assert open_run_slot(conn, AppEnv.LOCAL, SLOT).state is SlotState.COMPLETED
+
+
+@pytest.mark.parametrize("bad", [None, "not a time", "2026-09-25T15:00:00"])
+def test_malformed_schedule_fails_closed(conn: Conn, bad: object) -> None:
+    run = open_run_slot(conn, AppEnv.LOCAL, SLOT)
+    _schedule(conn, run.run_id, bad, "schedule:fallback")
+    with pytest.raises(LedgerError):
+        latest_next_run_not_before(conn, AppEnv.LOCAL)

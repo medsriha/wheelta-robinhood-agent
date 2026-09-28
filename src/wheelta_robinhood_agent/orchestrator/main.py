@@ -2,16 +2,20 @@
 
 boot (settings, rules, prompt; fail fast) → logging → slot/run_id → ledger connection →
 single-flight lock (`skipped_concurrent`) → run slot (completed → no-op; interrupted →
-reconcile and finalize without a new session) → preflight (kill switch, NYSE session) →
+reconcile and finalize without a new session) → preflight (kill switch, NYSE session, next-run
+time: ADR-0028, `skipped_not_due`; a due tick records the fallback next run first) →
 Robinhood credential (refresh_token mode only: load, refresh near expiry, persist before use;
 ADR-0021) → session plan (effective mode capped at off; no order tool can be exposed) → dry
 runs are local only (ADR-0024: outside APP_ENV=local an off-mode run ends
 `skipped_dry_run_not_local` here, after the credential and its alerts) → prompt v6 →
-agent session → `assemble_run_record` → position notes (ADR-0018) → `run_audit` → persist →
+agent session → the agent's `next_run`, if valid, replaces the fallback → `assemble_run_record` →
+position notes (ADR-0018) → `run_audit` → persist →
 alerts/heartbeat → exit code.
 
 Contains no trading logic. Everything the run decides is recorded as run events.
-`python -m wheelta_robinhood_agent.orchestrator` calls `main()`.
+`python -m wheelta_robinhood_agent.orchestrator [--run-now]` calls `main()`. `--run-now`
+(APP_ENV=local only) makes a hand-started local run due whatever the recorded next run
+(ADR-0028).
 
 `OrchestratorDeps` carries the injectable boundaries (clock, database connect, calendar,
 notifier, SDK transport). Its remaining fields (`remote_boundary_accepted`,
@@ -126,6 +130,7 @@ from wheelta_robinhood_agent.ledger.lock import single_flight
 from wheelta_robinhood_agent.ledger.runs import (
     SlotState,
     append_run_event,
+    latest_next_run_not_before,
     open_run_slot,
     run_event_payloads,
 )
@@ -154,7 +159,11 @@ from wheelta_robinhood_agent.orchestrator.market_session import (
     build_nyse_calendar,
     evaluate_market_session,
 )
-from wheelta_robinhood_agent.orchestrator.preflight import PreflightSkip, decide_preflight
+from wheelta_robinhood_agent.orchestrator.preflight import (
+    PreflightReason,
+    PreflightSkip,
+    decide_preflight,
+)
 from wheelta_robinhood_agent.orchestrator.robinhood_credential import (
     CredentialInserter,
     CredentialResolution,
@@ -162,6 +171,15 @@ from wheelta_robinhood_agent.orchestrator.robinhood_credential import (
     OAuthRefresher,
     refresh_via_http,
     resolve_robinhood_credential,
+)
+from wheelta_robinhood_agent.orchestrator.schedule import (
+    NextRun,
+    ScheduleSource,
+    calendar_window,
+    fallback_requested_at,
+    is_due,
+    latest_next_run,
+    next_run,
 )
 from wheelta_robinhood_agent.orchestrator.signals import (
     RunDeadline,
@@ -275,11 +293,17 @@ def run_once(
     template: PromptTemplate,
     deps: OrchestratorDeps,
     mignon_templates: Mapping[MignonType, PromptTemplate] | None = None,
+    *,
+    run_now: bool = False,
 ) -> int:
     """Run one cron fire and return the process exit code (exit_codes.py).
 
     `mignon_templates` defaults to the packaged Mignon prompts (`main` loads them at startup
-    so a missing file fails before any network call)."""
+    so a missing file fails before any network call). `run_now` (local only, ADR-0028) makes
+    the tick due whatever the recorded next run; the kill switch and market session still
+    apply. Raises ValueError outside APP_ENV=local."""
+    if run_now and settings.APP_ENV is not AppEnv.LOCAL:
+        raise ValueError("run_now is allowed only with APP_ENV=local")
     if mignon_templates is None:
         mignon_templates = load_mignon_prompts()
     started = deps.clock()
@@ -305,6 +329,7 @@ def run_once(
             return EXIT_OK
         run = _Run(settings, rules, template, deps, conn, run_id, slot, started, log)
         run.mignon_templates = dict(mignon_templates)
+        run.run_now = run_now
         if run_slot.state is SlotState.INTERRUPTED:
             return run.recover()
         return run.execute()
@@ -347,6 +372,11 @@ class _Run:
         self.deadline = RunDeadline(started, settings.RUN_TIMEOUT_SECONDS)
         self._event_counter = 0
         self.alerts_sent: list[AlertKind] = []
+        # ADR-0028: a hand-started local run (`--run-now`); set by run_once.
+        self.run_now = False
+        # ADR-0028: when this run passed the schedule gate; the fallback and the maximum gap
+        # are measured from it. Set in _execute on a due tick.
+        self.gate_at: datetime | None = None
 
     # -- ledger helpers -------------------------------------------------------------------
 
@@ -469,15 +499,38 @@ class _Run:
                 },
             },
         )
+        not_before = latest_next_run_not_before(self.conn, settings.APP_ENV)
+        due = self.run_now or is_due(now, not_before)
+        self.event(
+            RunEventType.METADATA,
+            {
+                "schedule_check": {
+                    "not_before": not_before.isoformat() if not_before else None,
+                    "due": due,
+                    "run_now": self.run_now,
+                }
+            },
+            key="metadata:schedule_check",
+        )
         decision = decide_preflight(
             kill_switch=settings.KILL_SWITCH,
             market=market,
+            due=due,
             requested_mode=settings.requested_execution_mode,
             armed=settings.EXECUTION_ARMED,
             ceiling=PHASE_EXECUTION_CEILING,
         )
+        if due and not (
+            isinstance(decision, PreflightSkip)
+            and decision.reason is PreflightReason.OUTSIDE_REGULAR_SESSION
+        ):
+            # ADR-0028: a due tick is this cadence's run, even when killed. The fallback keeps
+            # a crashed or output-less run (and the kill alert) on the hourly cadence.
+            self.gate_at = now
+            minutes = self.rules.rules.scheduling.fallback_next_run_minutes
+            self.record_next_run(fallback_requested_at(now, minutes), ScheduleSource.FALLBACK)
         if isinstance(decision, PreflightSkip):
-            if decision.status is RunStatus.SKIPPED_KILLED:
+            if decision.status is RunStatus.SKIPPED_KILLED and due:
                 self.alert(AlertKind.KILL_SWITCH_ENGAGED, "KILL_SWITCH=true; the run did not start")
             return self.finalize(decision.status, decision.reason.value)
         if decision.effective_mode is not ExecutionMode.OFF:
@@ -493,6 +546,40 @@ class _Run:
         finally:
             if restore is not None:
                 restore()
+
+    def record_next_run(self, requested_at: datetime, source: ScheduleSource) -> NextRun:
+        """Record when the next session may start (ADR-0028): `requested_at` capped at the
+        maximum gap after the gate, then moved into the NYSE regular session. Raises
+        CalendarOutOfRange/ValueError if it cannot be placed, and SessionPlanError before the
+        gate has passed."""
+        if self.gate_at is None:
+            raise SessionPlanError("a next run is recorded only after the schedule gate")
+        latest = latest_next_run(self.gate_at, self.rules.rules.scheduling.max_next_run_gap_hours)
+        start, end = calendar_window(min(requested_at, latest))
+        scheduled = next_run(
+            requested_at, source, self.deps.calendar_factory(start, end), latest_at=latest
+        )
+        self.event(RunEventType.SCHEDULE, scheduled.event_payload(), key=f"schedule:{source.value}")
+        self.log.bind(stage="schedule").info("next run scheduled", extra=scheduled.event_payload())
+        return scheduled
+
+    def _apply_agent_next_run(self, decisions: DecisionsInput) -> None:
+        """A valid `next_run` replaces the fallback. A time that cannot be placed (no session
+        within the search window, or out of the date range) is recorded as rejected, and the
+        fallback stands. Never raises: the run's status does not depend on this."""
+        if not isinstance(decisions, DecisionOutputParsed) or decisions.output.next_run is None:
+            return
+        requested = decisions.output.next_run.at
+        try:
+            self.record_next_run(requested, ScheduleSource.AGENT)
+        except Exception as exc:  # noqa: BLE001 - model-chosen input: any failure keeps the fallback
+            rejected = {"requested_at": requested.isoformat(), "error_type": type(exc).__name__}
+            self.log.warning("agent next run not placeable; fallback stands", extra=rejected)
+            self.event(
+                RunEventType.METADATA,
+                {"next_run_rejected": rejected},
+                key="metadata:next_run_rejected",
+            )
 
     def _robinhood_credential(self) -> CredentialResolution | None:
         """ADR-0021: in refresh_token mode, the access token for this run (refreshed and
@@ -757,6 +844,8 @@ class _Run:
         decisions, output_id = load_decisions(self.conn, self.run_id)
         record = self._assemble(meta, book, decisions, output_id)
         audit_ok = self._audit(meta, book, decisions, record)
+        # After assembly and audit, so nothing in the agent's schedule can keep them from running.
+        self._apply_agent_next_run(decisions)
         status, reason = self._status(plan, session, decisions)
         if unavailable_reason is not None and reason == "required_source_unavailable":
             reason = unavailable_reason
@@ -912,9 +1001,22 @@ class _Run:
         return self.finalize(RunStatus.FAILED, "interrupted_run_recovered")
 
 
+RUN_NOW_FLAG = "--run-now"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Production entrypoint: load and validate everything before any network call."""
-    del argv
+    """Production entrypoint: load and validate everything before any network call.
+
+    `argv` excludes the program name; None means no arguments. The only argument is
+    `--run-now`, accepted only with APP_ENV=local (ADR-0028). Anything else fails fast.
+    """
+    args = list(argv or ())
+    unknown = [a for a in args if a != RUN_NOW_FLAG]
+    if unknown:
+        logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
+        _LOG.error("unknown arguments: %s (only %s is accepted)", " ".join(unknown), RUN_NOW_FLAG)
+        return EXIT_FAILED
+    run_now = RUN_NOW_FLAG in args
     try:
         settings = load_settings()
         rules = load_rules()
@@ -924,6 +1026,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
         _LOG.error("startup configuration invalid: %s", exc)
         return EXIT_FAILED
+    if run_now and settings.APP_ENV is not AppEnv.LOCAL:
+        logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
+        _LOG.error("%s is allowed only with APP_ENV=local", RUN_NOW_FLAG)
+        return EXIT_FAILED
     configure_logging(
         settings.LOG_LEVEL,
         settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
@@ -932,7 +1038,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     notifier = HttpNotifier(settings.ALERT_WEBHOOK_URL, settings.HEARTBEAT_URL)
     try:
         return run_once(
-            settings, rules, template, OrchestratorDeps(notifier=notifier), mignon_templates
+            settings,
+            rules,
+            template,
+            OrchestratorDeps(notifier=notifier),
+            mignon_templates,
+            run_now=run_now,
         )
     except psycopg.errors.UndefinedTable:
         # The ledger schema is missing: migrations haven't run on this database.

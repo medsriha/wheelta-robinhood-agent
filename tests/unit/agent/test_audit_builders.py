@@ -769,7 +769,10 @@ class Scenario:
                 )
             )
         return AgentDecisionOutput(
-            decisions=tuple(decisions), cancellation_rationales=(), unresolved_questions=()
+            decisions=tuple(decisions),
+            cancellation_rationales=(),
+            unresolved_questions=(),
+            next_run=None,
         )
 
     def ctx(self) -> AuditContext:

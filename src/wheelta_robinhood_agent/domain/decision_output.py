@@ -1,11 +1,12 @@
-"""AgentDecisionOutput v5 models and a strict parser (OUTPUT_ASSEMBLY.md; ADR-0011).
+"""AgentDecisionOutput v6 models and a strict parser (OUTPUT_ASSEMBLY.md; ADR-0011, ADR-0028).
 
-Field-for-field mirror of `prompts/agent_decision_output.v5.schema.json` (parity is tested).
+Field-for-field mirror of `prompts/agent_decision_output.v6.schema.json` (parity is tested).
 The model emits choices, rationale, and existing reference selections only. Extra fields are
 rejected on every object (so `schema_version`, quantities, statuses, broker IDs, or
 `rejected_candidates` fail parsing). The version comes from trusted prompt configuration,
 never from the model. `limit_price` must be a JSON decimal string and is parsed to Decimal;
-JSON numbers anywhere are rejected.
+JSON numbers anywhere are rejected. `next_run.at` (v6, ADR-0028) is an RFC 3339 string with an
+explicit offset, parsed to a UTC datetime; it is a scheduling request, never a financial fact.
 
 Context-dependent semantic validation (reference resolution, action/leg compatibility) is
 a separate, later step and is not performed here.
@@ -14,6 +15,7 @@ a separate, later step and is not performed here.
 import json
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Final, Literal, Self
 
@@ -29,9 +31,13 @@ from pydantic import (
 from wheelta_robinhood_agent.domain.base import DomainModel, require_unique
 from wheelta_robinhood_agent.domain.enums import DecisionAction
 
-SCHEMA_VERSION: Final = 5
+SCHEMA_VERSION: Final = 6
 LIMIT_PRICE_PATTERN: Final = r"^(0|[1-9][0-9]*)(\.[0-9]+)?$"
 _LIMIT_PRICE_RE = re.compile(LIMIT_PRICE_PATTERN)
+NEXT_RUN_AT_PATTERN: Final = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$"
+)
+_NEXT_RUN_AT_RE = re.compile(NEXT_RUN_AT_PATTERN)
 
 Reference = Annotated[StrictStr, StringConstraints(min_length=1)]
 """`$defs/reference`: a non-empty string naming a code-issued reference."""
@@ -52,6 +58,26 @@ LimitPrice = Annotated[
     Decimal,
     PlainValidator(_parse_limit_price),
     PlainSerializer(lambda d: str(d), return_type=str),
+]
+
+
+def _parse_next_run_at(value: object) -> datetime:
+    """An RFC 3339 string with seconds and an explicit offset, normalized to UTC."""
+    if not isinstance(value, str):
+        raise ValueError("next_run.at must be an RFC 3339 string")
+    if not _NEXT_RUN_AT_RE.fullmatch(value):
+        raise ValueError("next_run.at must look like 2026-09-28T15:30:00Z (offset required)")
+    try:
+        # OverflowError: an offset pushes a year-1 or year-9999 time out of range in UTC.
+        return datetime.fromisoformat(value).astimezone(UTC)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"next_run.at is not a valid date and time: {exc}") from None
+
+
+NextRunAt = Annotated[
+    datetime,
+    PlainValidator(_parse_next_run_at),
+    PlainSerializer(lambda d: d.isoformat(), return_type=str),
 ]
 
 
@@ -110,12 +136,24 @@ class ResearchQuestion(DomainModel):
         return self
 
 
+class NextRun(DomainModel):
+    """`$defs/next_run` (ADR-0028): when the agent wants its next session, and why.
+
+    Code moves a time outside the NYSE regular session to the next session's open; the
+    session starts at the first 5-minute tick at or after the result.
+    """
+
+    at: NextRunAt
+    rationale: Text
+
+
 class AgentDecisionOutput(DomainModel):
-    """Top-level AgentDecisionOutput v5."""
+    """Top-level AgentDecisionOutput v6. `next_run` null means no preference (the fallback)."""
 
     decisions: tuple[Decision, ...]
     cancellation_rationales: tuple[CancellationRationale, ...]
     unresolved_questions: tuple[ResearchQuestion, ...]
+    next_run: NextRun | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,7 +253,7 @@ def validation_issues(exc: ValidationError) -> tuple[ParseIssue, ...]:
 
 
 def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
-    """Strictly parse the model's final response into AgentDecisionOutput v5.
+    """Strictly parse the model's final response into AgentDecisionOutput v6.
 
     Never raises on bad model output: returns `DecisionOutputParseFailure` with the raw text
     and typed issues. The response must be exactly one JSON object (surrounding whitespace

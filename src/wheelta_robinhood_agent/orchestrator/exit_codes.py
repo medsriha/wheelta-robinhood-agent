@@ -29,6 +29,8 @@ _EXIT_CODES: Final = MappingProxyType(
         RunStatus.SKIPPED_MARKET_CLOSED: EXIT_OK,
         # ADR-0024: production waits for live mode; an off-mode fire there is expected.
         RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL: EXIT_OK,
+        # ADR-0028: most ticks are not due; that is the normal outcome, not a failure.
+        RunStatus.SKIPPED_NOT_DUE: EXIT_OK,
         # Deliberate operator stop; alerted separately, not a failure.
         RunStatus.SKIPPED_KILLED: EXIT_OK,
         # CLAUDE.md §14: non-zero for failures; distinct so alerting can tell them apart.

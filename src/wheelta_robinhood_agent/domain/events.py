@@ -19,6 +19,8 @@ class RunEventType(StrEnum):
     MARKET_SESSION = "market_session"
     METADATA = "metadata"
     AUDIT_STATUS = "audit_status"
+    # ADR-0028: the earliest time the next session may start (fallback or agent-chosen).
+    SCHEDULE = "schedule"
 
 
 class ToolCallEventType(StrEnum):

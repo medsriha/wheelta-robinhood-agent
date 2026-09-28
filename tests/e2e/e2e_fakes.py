@@ -290,7 +290,12 @@ FIXTURE_SCOPE_TABLE: dict[str, AccountScopeSpec] = {
 # -- scripted agents ---------------------------------------------------------------------------
 
 
-def decision_json(candidate_ref: str, facts_ref: str, limit_price: str = "1.25") -> str:
+def decision_json(
+    candidate_ref: str,
+    facts_ref: str,
+    limit_price: str = "1.25",
+    next_run: dict[str, str] | None = None,
+) -> str:
     return json.dumps(
         {
             "decisions": [
@@ -309,6 +314,7 @@ def decision_json(candidate_ref: str, facts_ref: str, limit_price: str = "1.25")
             ],
             "cancellation_rationales": [],
             "unresolved_questions": [],
+            "next_run": next_run,
         }
     )
 

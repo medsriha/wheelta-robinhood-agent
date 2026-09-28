@@ -31,6 +31,7 @@ def _market(session: MarketSession) -> MarketSessionResult:
 
 def _decide(kill: bool, session: MarketSession, **kw: object) -> object:
     args: dict[str, object] = {
+        "due": True,
         "requested_mode": ExecutionMode.OFF,
         "armed": False,
         "ceiling": ExecutionMode.OFF,
@@ -39,17 +40,25 @@ def _decide(kill: bool, session: MarketSession, **kw: object) -> object:
     return decide_preflight(kill_switch=kill, market=_market(session), **args)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("due", [True, False])
 @pytest.mark.parametrize("session", list(MarketSession))
-def test_kill_switch_checked_first(session: MarketSession) -> None:
-    assert _decide(True, session) == PreflightSkip(
+def test_kill_switch_checked_first(session: MarketSession, due: bool) -> None:
+    assert _decide(True, session, due=due) == PreflightSkip(
         RunStatus.SKIPPED_KILLED, PreflightReason.KILL_SWITCH_ENGAGED
     )
 
 
+@pytest.mark.parametrize("due", [True, False])
 @pytest.mark.parametrize("session", [MarketSession.PRE, MarketSession.POST, MarketSession.CLOSED])
-def test_outside_regular_session_skips(session: MarketSession) -> None:
-    assert _decide(False, session) == PreflightSkip(
+def test_outside_regular_session_skips(session: MarketSession, due: bool) -> None:
+    assert _decide(False, session, due=due) == PreflightSkip(
         RunStatus.SKIPPED_MARKET_CLOSED, PreflightReason.OUTSIDE_REGULAR_SESSION
+    )
+
+
+def test_not_due_skips_inside_the_session() -> None:
+    assert _decide(False, MarketSession.REGULAR, due=False) == PreflightSkip(
+        RunStatus.SKIPPED_NOT_DUE, PreflightReason.NOT_DUE
     )
 
 

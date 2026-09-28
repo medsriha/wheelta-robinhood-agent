@@ -1,7 +1,8 @@
 """Preflight gating decision (ARCHITECTURE.md "Run lifecycle" step 4; CLAUDE.md §18).
 
 Pure: decides from explicit inputs only. MCP status, tool discovery, and the single-flight
-lock are handled by other stages. Order: kill switch first, then market session.
+lock are handled by other stages. Order: kill switch first, then market session, then whether
+the tick is due (ADR-0028; orchestrator/schedule.py decides `due`).
 """
 
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from wheelta_robinhood_agent.orchestrator.market_session import MarketSessionRes
 class PreflightReason(StrEnum):
     KILL_SWITCH_ENGAGED = "kill_switch_engaged"
     OUTSIDE_REGULAR_SESSION = "outside_regular_session"
+    NOT_DUE = "not_due"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +42,7 @@ def decide_preflight(
     *,
     kill_switch: bool,
     market: MarketSessionResult,
+    due: bool,
     requested_mode: ExecutionMode,
     armed: bool,
     ceiling: ExecutionMode,
@@ -50,7 +53,8 @@ def decide_preflight(
        INTERFACES.md "Run and RunControl").
     2. Outside the NYSE regular session -> skipped_market_closed (ARCHITECTURE.md
        "Market-session gating").
-    3. Otherwise proceed with the effective mode: live only if requested live, armed, and the
+    3. Before the recorded next-run time -> skipped_not_due (ADR-0028).
+    4. Otherwise proceed with the effective mode: live only if requested live, armed, and the
        phase ceiling permits it (domain.gating; INTERFACES.md "Run and RunControl").
     """
     if kill_switch:
@@ -59,6 +63,8 @@ def decide_preflight(
         return PreflightSkip(
             RunStatus.SKIPPED_MARKET_CLOSED, PreflightReason.OUTSIDE_REGULAR_SESSION
         )
+    if not due:
+        return PreflightSkip(RunStatus.SKIPPED_NOT_DUE, PreflightReason.NOT_DUE)
     return PreflightProceed(
         requested_mode=requested_mode,
         effective_mode=effective_execution_mode(requested_mode, armed=armed, ceiling=ceiling),

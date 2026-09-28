@@ -29,7 +29,8 @@ from wheelta_robinhood_agent.domain.gating import effective_execution_mode
 # ADR-0013: phase 1 caps the effective mode at off, whatever the environment requests.
 PHASE_EXECUTION_CEILING = ExecutionMode.OFF
 
-# The cron interval is hourly; the run budget must leave room before the next fire.
+# The run budget stays below the hourly fallback cadence (ADR-0028). The cron ticks every 5
+# minutes; Railway skips ticks that overlap a running run, and the lock backs that up.
 _CRON_INTERVAL_SECONDS = 3600
 # Model aliases the Agent SDK/CLI would resolve to a moving target; settings pin exact IDs.
 # An exact model ID: lowercase alphanumerics and dots in hyphen-separated parts (it must fit
@@ -116,7 +117,7 @@ class Settings(BaseSettings):
     @classmethod
     def _run_budget_below_cron_interval(cls, value: int) -> int:
         if value >= _CRON_INTERVAL_SECONDS:
-            raise ValueError(f"must be below the {_CRON_INTERVAL_SECONDS} s cron interval")
+            raise ValueError(f"must be below {_CRON_INTERVAL_SECONDS} s (the fallback run cadence)")
         return value
 
     @field_validator(

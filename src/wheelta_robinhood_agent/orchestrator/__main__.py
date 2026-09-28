@@ -4,4 +4,4 @@ import sys
 
 from wheelta_robinhood_agent.orchestrator.main import main
 
-sys.exit(main())
+sys.exit(main(sys.argv[1:]))
