@@ -5,7 +5,9 @@ import pytest
 from wheelta_robinhood_agent.config.prompts import (
     ACTIVE_PROMPT_ID,
     ACTIVE_PROMPT_VERSION,
+    MIGNON_PROMPTS,
     PromptError,
+    load_mignon_prompts,
     load_prompt,
     render_prompt,
 )
@@ -28,10 +30,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v6_with_expected_placeholders() -> None:
+def test_active_prompt_is_v7_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 6
+    assert template.version == 7
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -93,3 +95,19 @@ def test_missing_or_invalid_prompt(tmp_path: Path) -> None:
         load_prompt("../etc", 1, tmp_path)
     with pytest.raises(PromptError, match="invalid prompt identity"):
         load_prompt("wheel_agent", 0)
+
+
+def test_every_mignon_type_has_a_loadable_prompt() -> None:
+    templates = load_mignon_prompts()
+    assert set(templates) == set(MIGNON_PROMPTS)
+    for mignon, template in templates.items():
+        assert (template.prompt_id, template.version) == MIGNON_PROMPTS[mignon]
+        assert template.placeholders == {"as_of", "policy_version", "policy", "available_tools"}
+        rendered = render_prompt(template, _values(set(template.placeholders)))
+        assert "MignonReport v1" in rendered.text and "{{" not in rendered.text
+
+
+def test_orchestrator_prompt_delegates_research() -> None:
+    body = load_prompt().body
+    assert "## Research through Mignons" in body
+    assert "a Mignon's quote" in body and "is research, not the price you order on" in body

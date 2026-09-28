@@ -15,6 +15,7 @@ from wheelta_robinhood_agent.agent.local_server import (
     LocalServerError,
     build_local_server,
 )
+from wheelta_robinhood_agent.agent.mignons import MignonLimits, Role
 from wheelta_robinhood_agent.agent.options import AgentOptionsError, build_agent_options
 from wheelta_robinhood_agent.agent.session import (
     RemoteSource,
@@ -27,7 +28,7 @@ from wheelta_robinhood_agent.agent.session import (
 from wheelta_robinhood_agent.agent.tool_access import ToolAccess
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME, WEB_CACHE_TOOL_NAME
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, SourceStatus
+from wheelta_robinhood_agent.domain.enums import ExecutionMode, MignonType, SourceStatus
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     LIVE_ORDER_TOOLS,
     ROBINHOOD_REGISTRY,
@@ -68,7 +69,7 @@ def test_nothing_accepted_withholds_every_remote_source_and_blocks_the_session()
     assert plan.required_unavailable == ("robinhood",)
     assert not plan.may_start
     assert plan.servers == ()
-    assert set(plan.tool_access.allowed_tools) == {"WebSearch", "WebFetch", *LOCAL_TOOLS}
+    assert set(plan.tool_access.allowed_tools) == {"Agent", "WebSearch", "WebFetch", *LOCAL_TOOLS}
     assert {o.status for o in plan.observations} == {SourceStatus.DISABLED}
 
 
@@ -232,6 +233,8 @@ def _options(**overrides: Any) -> Any:
         "mcp_timeout_ms": 1000,
         "mcp_tool_timeout_ms": 1000,
         "sdk_servers": {LOCAL_SERVER_NAME: _local()},
+        "mignon_prompts": {m: f"{m.value} prompt" for m in MignonType},
+        "mignon_limits": MignonLimits(8, 4, 40),
     }
     kwargs.update(overrides)
     return build_agent_options(**kwargs)
@@ -255,3 +258,33 @@ def test_local_server_must_match_its_registry() -> None:
 
     with pytest.raises(LocalServerError):
         build_local_server([tool(WEB_CACHE_TOOL_NAME, "d", {"type": "object"})(_noop)])
+
+
+def test_orchestrator_table_lists_its_tools_and_each_mignon() -> None:
+    plan = _plan()
+    table = available_tools_table(plan)
+    head = table.split("Mignon `")[0]
+    assert "| `Agent` | D |" in head
+    assert "`mcp__robinhood__get_option_positions`" in head
+    assert "WebSearch" not in head and "wheelta_board_query" not in head
+    for mignon in MignonType:
+        assert f"Mignon `{mignon.value}`" in table
+
+
+def test_mignon_table_lists_only_its_role() -> None:
+    plan = _plan()
+    table = available_tools_table(plan, Role.COMPANY)
+    assert "`WebFetch`" in table and "get_option_positions" not in table
+    assert "Agent" not in table and "Mignon `" not in table
+
+
+def test_disabled_mignons_leave_the_table_without_a_roster() -> None:
+    plan = plan_session(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=False,
+        sources=(RemoteSource(ROBINHOOD_REGISTRY, RH, required=True),),
+        observed_at=NOW,
+        mignons=False,
+    )
+    table = available_tools_table(plan)
+    assert "Agent" not in table and "Mignon `" not in table

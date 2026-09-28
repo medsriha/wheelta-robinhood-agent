@@ -4,7 +4,9 @@ Pure: builds configuration only, no I/O. The session:
 
 - sees only `tool_access` (layers 1 and 2), with `permission_mode="dontAsk"`, never
   `bypassPermissions` (it ignores `allowed_tools`);
-- has built-ins restricted to WebSearch/WebFetch through `tools`;
+- has built-ins restricted to `Agent` (spawns Mignons) and WebSearch/WebFetch (Mignons only)
+  through `tools`, and carries exactly the Mignon definitions built from `agent/mignons.py`
+  (ADR-0025) plus the CLI variables that design depends on (`mignons.cli_env`);
 - loads no filesystem settings or CLAUDE.md (`setting_sources=[]`) and only the MCP servers
   given here (`strict_mcp_config=True`): remote HTTP servers (direct delivery, ADR-0019 local
   dry runs only) plus in-process SDK servers named in `LOCAL_SDK_SERVER_NAMES` (`wra_local`:
@@ -24,18 +26,29 @@ from typing import Final, Literal, cast
 
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import (
+    AgentDefinition,
     HookEvent,
     McpHttpServerConfig,
     McpSdkServerConfig,
     McpServerConfig,
 )
 
+from wheelta_robinhood_agent.agent.mignons import (
+    DELEGATION_TOOL,
+    MignonLimits,
+    Role,
+    build_agent_definitions,
+    cli_env,
+    role_allowed,
+)
 from wheelta_robinhood_agent.agent.tool_access import (
-    ALLOWED_BUILTINS,
     DISALLOWED_BUILTINS,
+    SESSION_BUILTINS,
     ToolAccess,
 )
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
+from wheelta_robinhood_agent.config.settings import MODEL_ALIASES
+from wheelta_robinhood_agent.domain.enums import MignonType
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
 from wheelta_robinhood_agent.integrations.status import McpHttpServer
 from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
@@ -76,13 +89,18 @@ def build_agent_options(
     mcp_timeout_ms: int,
     mcp_tool_timeout_ms: int,
     sdk_servers: Mapping[str, McpSdkServerConfig] | None = None,
+    mignon_prompts: Mapping[MignonType, str] | None = None,
+    mignon_limits: MignonLimits | None = None,
+    mignon_model: str | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble the session options. Raises `AgentOptionsError` on any unsafe input.
 
     `max_budget_usd` is a Decimal in our code and converted to the SDK's float only here.
     `sdk_servers` maps a name in `LOCAL_SDK_SERVER_NAMES` or `PROXY_SDK_SERVER_NAMES` to its
     in-process server config; the name must match the config's own name and no HTTP server
-    may share it.
+    may share it. Mignons are configured only with both `mignon_prompts` (one rendered prompt
+    per type) and `mignon_limits`, and only when `Agent` is allowed. `mignon_model` is their
+    pinned model (`Settings.mignon_model`); None means the session's `model`.
     """
     if not model.strip():
         raise AgentOptionsError("model must be pinned")
@@ -103,8 +121,23 @@ def build_agent_options(
     if allowed & set(tool_access.disallowed_tools):
         raise AgentOptionsError("a tool is both allowed and disallowed")
     builtins_allowed = {t for t in allowed if not t.startswith("mcp__")}
-    if not builtins_allowed <= set(ALLOWED_BUILTINS):
-        raise AgentOptionsError(f"built-ins beyond {ALLOWED_BUILTINS} are allowed")
+    if not builtins_allowed <= set(SESSION_BUILTINS):
+        raise AgentOptionsError(f"built-ins beyond {SESSION_BUILTINS} are allowed")
+    delegating = DELEGATION_TOOL in allowed
+    if delegating and (mignon_prompts is None or mignon_limits is None):
+        raise AgentOptionsError("Agent is allowed but no Mignons are configured")
+    agents: dict[str, AgentDefinition] | None = None
+    if delegating and mignon_prompts is not None and mignon_limits is not None:
+        if set(mignon_prompts) != set(MignonType) or not all(
+            p.strip() for p in mignon_prompts.values()
+        ):
+            raise AgentOptionsError("every Mignon type needs a non-empty rendered prompt")
+        agents = build_agent_definitions(
+            prompts=mignon_prompts,
+            allowed_tools=tool_access.allowed_tools,
+            model=mignon_model if mignon_model is not None else model,
+            limits=mignon_limits,
+        )
     if not set(DISALLOWED_BUILTINS) <= set(tool_access.disallowed_tools):
         raise AgentOptionsError("not every unneeded built-in is disallowed")
     names = [s.name for s in mcp_servers]
@@ -117,7 +150,7 @@ def build_agent_options(
     servers: dict[str, McpServerConfig] = {s.name: _sdk_server(s) for s in mcp_servers}
     servers.update(local)
     options = ClaudeAgentOptions(
-        tools=list(ALLOWED_BUILTINS),
+        tools=list(SESSION_BUILTINS),
         allowed_tools=list(tool_access.allowed_tools),
         disallowed_tools=list(tool_access.disallowed_tools),
         permission_mode=PERMISSION_MODE,
@@ -130,7 +163,12 @@ def build_agent_options(
         cwd=scratch_dir,
         max_turns=max_turns,
         max_budget_usd=float(max_budget_usd) if max_budget_usd is not None else None,
-        env={"MCP_TIMEOUT": str(mcp_timeout_ms), "MCP_TOOL_TIMEOUT": str(mcp_tool_timeout_ms)},
+        agents=agents,
+        env={
+            "MCP_TIMEOUT": str(mcp_timeout_ms),
+            "MCP_TOOL_TIMEOUT": str(mcp_tool_timeout_ms),
+            **cli_env(mignon_limits if agents else None),
+        },
     )
     assert_safe_options(options)
     return options
@@ -144,14 +182,55 @@ def assert_safe_options(options: ClaudeAgentOptions) -> None:
         raise AgentOptionsError(f"permission_mode must be {PERMISSION_MODE}")
     if options.setting_sources != []:
         raise AgentOptionsError("filesystem settings must not load")
-    if options.tools != list(ALLOWED_BUILTINS):
-        raise AgentOptionsError("built-in tools must be limited to WebSearch/WebFetch")
-    if options.can_use_tool is not None or options.skills is not None or options.agents:
-        raise AgentOptionsError("no permission callback, skills, or sub-agents")
+    if options.tools != list(SESSION_BUILTINS):
+        raise AgentOptionsError(f"built-in tools must be exactly {SESSION_BUILTINS}")
+    if options.can_use_tool is not None or options.skills is not None:
+        raise AgentOptionsError("no permission callback or skills")
+    for key, value in cli_env(None).items():
+        if options.env.get(key) != value:
+            raise AgentOptionsError(f"CLI variable {key} must be {value}")
+    _check_agents(options)
     if not isinstance(options.mcp_servers, dict):
         raise AgentOptionsError("MCP servers must be given inline, never as a config file path")
     for name, config in options.mcp_servers.items():
         _check_server(name, config)
+
+
+def _check_agents(options: ClaudeAgentOptions) -> None:
+    """Sub-agents are only the Mignons: known types, their role's allowed tools, one shared
+    pinned model ID (never an alias such as `inherit`), no permission/MCP/skill/memory
+    overrides, never in background."""
+    agents = options.agents or {}
+    if agents and DELEGATION_TOOL not in options.allowed_tools:
+        raise AgentOptionsError("sub-agents are defined but Agent is not allowed")
+    for name, definition in agents.items():
+        try:
+            role = Role(MignonType(name).value)
+        except ValueError:
+            raise AgentOptionsError(f"sub-agent {name!r} is not a Mignon type") from None
+        if definition.tools is None or tuple(definition.tools) != role_allowed(
+            role, options.allowed_tools
+        ):
+            raise AgentOptionsError(f"Mignon {name} tools differ from its role")
+        model = definition.model
+        if not isinstance(model, str) or not model.strip() or model.lower() in MODEL_ALIASES:
+            raise AgentOptionsError(f"Mignon {name} must use a pinned model ID")
+        if definition.background is not False:
+            raise AgentOptionsError(f"Mignon {name} must not run in the background")
+        if not isinstance(definition.maxTurns, int) or definition.maxTurns < 1:
+            raise AgentOptionsError(f"Mignon {name} needs a positive turn cap")
+        overrides = (
+            definition.disallowedTools,
+            definition.mcpServers,
+            definition.skills,
+            definition.memory,
+            definition.permissionMode,
+            definition.initialPrompt,
+        )
+        if any(o is not None for o in overrides):
+            raise AgentOptionsError(f"Mignon {name} overrides a session setting")
+    if len({d.model for d in agents.values()}) > 1:
+        raise AgentOptionsError("every Mignon must use the same pinned model")
 
 
 def _check_server(name: str, config: McpServerConfig) -> None:

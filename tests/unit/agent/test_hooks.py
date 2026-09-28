@@ -45,6 +45,9 @@ RULES = load_rules().rules
 RH = "mcp__robinhood__"
 BOARD = "mcp__wheelta__wheelta_board_query"
 PLACE = RH + "place_option_order"
+# Hook-input attribution of a Mignon's call (ADR-0025); absent on the orchestrator's thread.
+MARKET = {"agent_id": "a-market-1", "agent_type": "mignon-market"}
+COMPANY = {"agent_id": "a-company-1", "agent_type": "mignon-company"}
 W, A = WorkspaceKind.WATCHLIST, WorkspaceKind.ALERT
 
 # Test tables stand in for a captured tools/list (the shipped tables are all unverified).
@@ -300,9 +303,9 @@ def assert_allowed(s: Session, out: Any) -> None:
 # ---- structure ----------------------------------------------------------------------------
 
 
-def test_build_hooks_registers_three_events_matching_all_tools() -> None:
+def test_build_hooks_registers_four_events_matching_all_tools() -> None:
     s = session(hook_timeout_seconds=12.0)
-    assert set(s.hooks) == {"PreToolUse", "PostToolUse", "PostToolUseFailure"}
+    assert set(s.hooks) == {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart"}
     for matchers in s.hooks.values():
         assert len(matchers) == 1 and matchers[0].matcher is None
         assert matchers[0].timeout == 12.0
@@ -369,12 +372,12 @@ def test_tier_r_allowed_with_no_decision_and_recorded_before_dispatch() -> None:
 @pytest.mark.parametrize("tool", ["WebSearch", "WebFetch"])
 def test_web_builtins_allowed(tool: str) -> None:
     s = session()
-    out = s.pre(tool, {"query": "AAPL earnings"})
+    out = s.pre(tool, {"query": "AAPL earnings"}, **COMPANY)
     assert_allowed(s, out)
     assert s.rec.event("requested")["server"] == "builtin"
 
 
-@pytest.mark.parametrize("tool", ["Bash", "Read", "Write", "Agent", "Skill", ""])
+@pytest.mark.parametrize("tool", ["Bash", "Read", "Write", "Task", "SendMessage", "Skill", ""])
 def test_other_builtins_denied(tool: str) -> None:
     s = session()
     assert_denied(s, s.pre(tool, {"command": "ls"}), "built-in tool not permitted")
@@ -609,7 +612,7 @@ def test_board_query_filters_appended_and_both_arg_sets_recorded() -> None:
     s = session()
     agent_filters = [{"field": "symbol", "op": "in", "value": ["AAPL"]}]
     requested = {"filters": agent_filters, "limit": 10}
-    out = s.pre(BOARD, requested)
+    out = s.pre(BOARD, requested, **MARKET)
     spec = out["hookSpecificOutput"]
     assert spec["hookEventName"] == "PreToolUse"
     assert "permissionDecision" not in spec  # normal permission evaluation still applies
@@ -625,18 +628,18 @@ def test_board_query_filters_appended_and_both_arg_sets_recorded() -> None:
 
 def test_board_query_without_agent_filters() -> None:
     s = session()
-    out = s.pre(BOARD, {})
+    out = s.pre(BOARD, {}, **MARKET)
     assert len(out["hookSpecificOutput"]["updatedInput"]["filters"]) >= 1
 
 
 def test_board_filter_error_denies() -> None:
     s = session()
-    assert_denied(s, s.pre(BOARD, {"filters": "not a list"}), "could not be appended")
+    assert_denied(s, s.pre(BOARD, {"filters": "not a list"}, **MARKET), "could not be appended")
 
 
 def test_other_wheelta_tools_pass_unchanged() -> None:
     s = session()
-    out = s.pre("mcp__wheelta__wheelta_board_status", {})
+    out = s.pre("mcp__wheelta__wheelta_board_status", {}, **MARKET)
     assert out == {}
 
 
@@ -667,9 +670,16 @@ def test_non_object_input_denied() -> None:
     assert_denied(s, s.pre(RH + "get_option_quotes", ["x"]), "not an object")
 
 
-def test_sub_agent_calls_denied() -> None:
+def test_unknown_sub_agent_type_denied() -> None:
     s = session()
-    assert_denied(s, s.pre(RH + "get_option_quotes", agent_id="sub-1"), "sub-agent")
+    out = s.pre(RH + "get_option_quotes", agent_id="sub-1", agent_type="general-purpose")
+    assert_denied(s, out, "unknown sub-agent type")
+
+
+def test_agent_type_without_agent_id_denied() -> None:
+    s = session()
+    out = s.pre(RH + "get_option_quotes", agent_type="mignon-market")
+    assert_denied(s, out, "agent_type without agent_id")
 
 
 @pytest.mark.parametrize("stage", ["requested", "outcome", "dispatched"])
@@ -724,7 +734,7 @@ def test_post_replaces_output_with_persisted_envelope() -> None:
 
 def test_post_board_query_attaches_filter_context() -> None:
     s = session()
-    s.pre(BOARD, {"limit": 5})
+    s.pre(BOARD, {"limit": 5}, **MARKET)
     out = s.post(BOARD, {"rows": []})
     context = out["hookSpecificOutput"]["additionalContext"]
     assert "ADR-0009" in context and "contract.dte" in context
@@ -800,7 +810,7 @@ def test_post_for_denied_call_has_no_state() -> None:
 
 def test_post_builtin_records_but_does_not_replace() -> None:
     s = session()
-    s.pre("WebSearch", {"query": "q"})
+    s.pre("WebSearch", {"query": "q"}, **COMPANY)
     out = s.post("WebSearch", {"results": ["r"]})
     assert out == {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
     _, payload = s.rec.results[s.rec.event("delivered")["delivered_result_ref"]]
@@ -810,7 +820,7 @@ def test_post_builtin_records_but_does_not_replace() -> None:
 
 def test_post_builtin_invalid_stops_session() -> None:
     s = session(validator=FakeValidator("invalid"))
-    s.pre("WebFetch", {"url": "https://example.com"})
+    s.pre("WebFetch", {"url": "https://example.com"}, **COMPANY)
     out = s.post("WebFetch", {"text": "x"})
     assert out["continue_"] is False
     assert "updatedToolOutput" not in out["hookSpecificOutput"]
@@ -872,10 +882,10 @@ def test_web_precheck_denies_after_request_is_recorded() -> None:
         return "identical search recorded; use the cache" if tool == "WebSearch" else None
 
     s = session(web_precheck=precheck)
-    assert_denied(s, s.pre("WebSearch", {"query": "AAPL"}), "use the cache")
+    assert_denied(s, s.pre("WebSearch", {"query": "AAPL"}, **COMPANY), "use the cache")
     assert seen == [("WebSearch", {"query": "AAPL"})]
     s2 = session(web_precheck=precheck)
-    assert_allowed(s2, s2.pre("WebFetch", {"url": "https://example.com"}))
+    assert_allowed(s2, s2.pre("WebFetch", {"url": "https://example.com"}, **COMPANY))
     s3 = session(web_precheck=precheck)
     assert_allowed(s3, s3.pre(RH + "get_option_quotes"))
     assert len(seen) == 2  # never consulted for MCP tools
@@ -888,7 +898,7 @@ def test_web_capture_receives_validated_envelope_and_its_failure_is_tolerated() 
         captured.append((call_id, tool, args, result))
 
     s = session(web_capture=capture)
-    s.pre("WebSearch", {"query": "AAPL"})
+    s.pre("WebSearch", {"query": "AAPL"}, **COMPANY)
     s.post("WebSearch", {"results": []})
     assert len(captured) == 1
     call_id, tool, args, result = captured[0]
@@ -900,7 +910,7 @@ def test_web_capture_receives_validated_envelope_and_its_failure_is_tolerated() 
         raise RuntimeError("cache down")
 
     s2 = session(web_capture=broken)
-    s2.pre("WebSearch", {"query": "AAPL"})
+    s2.pre("WebSearch", {"query": "AAPL"}, **COMPANY)
     out = s2.post("WebSearch", {"results": []})
     assert "continue_" not in out and not s2.deps.run_control.stop_requested
     assert "delivered" in s2.rec.names()
@@ -914,6 +924,6 @@ def test_web_capture_skipped_for_mcp_and_invalid_results() -> None:
     s.pre(RH + "get_option_quotes")
     s.post(RH + "get_option_quotes", {})
     s2 = session(web_capture=lambda *a: captured.append(a), validator=FakeValidator("invalid"))
-    s2.pre("WebSearch", {"query": "q"})
+    s2.pre("WebSearch", {"query": "q"}, **COMPANY)
     s2.post("WebSearch", {})
     assert captured == []

@@ -229,6 +229,17 @@ class Workspace(_Section):
     max_mutations_per_run: IntRule
 
 
+class Mignons(_Section):
+    """Run limits for research Mignons (ADR-0025). The PreToolUse hook enforces the counts;
+    `max_turns_per_mignon` is each Mignon's SDK turn cap. Any value other than an integer
+    disables Mignons for the run (agent/mignons.py `mignon_limits`)."""
+
+    notes: Notes = ()
+    max_per_run: IntRule
+    max_concurrent: IntRule
+    max_turns_per_mignon: IntRule
+
+
 class Freshness(_Section):
     notes: Notes = ()
     option_quote_max_age_seconds: IntRule
@@ -287,6 +298,7 @@ class TradingRules(_Section):
     selection: Selection
     circuit_breakers: CircuitBreakers
     workspace: Workspace
+    mignons: Mignons
     data_quality: DataQuality
 
 

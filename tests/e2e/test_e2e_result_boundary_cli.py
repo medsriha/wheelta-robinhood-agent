@@ -411,11 +411,11 @@ def test_other_account_data_never_reaches_a_model_request(
     out = run(case, monkeypatch)
     # The model's own tool inputs never name the other account, so any hit is tool output.
     assert_never_sent(out, other_number, other_name)
-    # Discovery is trusted-code-only: the model's call is denied before dispatch, so the
-    # server never ran it and nothing from it was persisted.
+    # Discovery is trusted-code-only: no role may call get_accounts (ADR-0025), so it is
+    # disallowed and the proxy never serves it; the CLI refuses the call before any hook, the
+    # server never ran it, and nothing from it was persisted.
     assert out.mcp.called("get_accounts") == 0
-    _, accounts_id = only_call(out, "get_accounts")
-    assert statuses(out.recorder, accounts_id) == [ToolCallStatus.DENIED], diagnostics(out)
+    assert not [c for c in out.recorder.requested_calls() if c["tool"] == "get_accounts"]
     # The in-scope read ran; the model gets only an envelope for it.
     use_id, portfolio_id = only_call(out, "get_portfolio")
     assert out.mcp.called("get_portfolio") == 1
@@ -492,7 +492,10 @@ def test_init_message_and_mcp_status_shapes_match_the_parsers(
     obs = observations[0]
     assert obs.status is SourceStatus.CONNECTED, obs
     access = build_tool_access(
-        effective_mode=ExecutionMode.OFF, workspace_writes=False, registries=(ROBINHOOD_REGISTRY,)
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=False,
+        registries=(ROBINHOOD_REGISTRY,),
+        mignons=False,  # as the harness session ran (Case.mignons is None)
     )
     # The proxy serves only this run's allowed tools (in-process servers are shown to the
     # model regardless of disallowed_tools), so the status list lacks every disallowed one.

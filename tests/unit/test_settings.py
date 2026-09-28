@@ -320,3 +320,25 @@ def test_credential_seed_settings_reject_malformed_values(
     env.setenv(name, bad)
     with pytest.raises(SettingsError, match=name):
         load_credential_seed_settings()
+
+
+def test_mignon_model_defaults_to_agent_model_and_can_be_pinned_apart(
+    env: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0025: MIGNON_AGENT_MODEL is optional; blank or unset means AGENT_MODEL."""
+    s = load_settings()
+    assert s.MIGNON_AGENT_MODEL is None and s.mignon_model == s.AGENT_MODEL
+    env.setenv("MIGNON_AGENT_MODEL", "")
+    assert load_settings().mignon_model == s.AGENT_MODEL
+    env.setenv("MIGNON_AGENT_MODEL", "claude-opus-4-8")
+    pinned = load_settings()
+    assert pinned.mignon_model == "claude-opus-4-8"
+    assert pinned.config_snapshot()["mignon_agent_model"] == "claude-opus-4-8"
+
+
+@pytest.mark.parametrize("name", ["AGENT_MODEL", "MIGNON_AGENT_MODEL"])
+@pytest.mark.parametrize("alias", ["opus", "Sonnet", "inherit"])
+def test_model_aliases_are_rejected(env: pytest.MonkeyPatch, name: str, alias: str) -> None:
+    env.setenv(name, alias)
+    with pytest.raises(SettingsError, match=name):
+        load_settings()

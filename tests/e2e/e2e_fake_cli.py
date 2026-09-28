@@ -19,6 +19,14 @@ Mirrored and verified against the real CLI 2.1.283 (tests/e2e/cli_harness/): an 
 `tools/call` to an in-process server carries `_meta["claudecode/toolUseId"]`, and in-process
 servers are absent from `get_mcp_status` until the first query.
 
+Mignons (ADR-0025), mirrored from the real CLI with CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
+(tests/e2e/test_e2e_mignons_cli.py): `FakeModel.spawn` is an `Agent` tool call. PreToolUse
+runs on the main thread; SubagentStart fires; the Mignon's own script runs with every hook
+input carrying `agent_id`/`agent_type`, and a tool outside its `AgentDefinition.tools` is
+refused before any hook ("No such tool available"); PostToolUse(Agent) receives the
+completed response object, and a dict `updatedToolOutput` replaces what the orchestrator
+reads. A script that raises ends the session with an error result instead of hanging it.
+
 Remote servers are served as production serves them (ADR-0023): the session's validating
 proxy is an in-process server here too, and `world_upstreams(world)` is its upstream
 (`OrchestratorDeps.upstream_factory`), answering from the world's handlers.
@@ -101,11 +109,31 @@ Script = Callable[["FakeModel"], Awaitable[str | None]]
 
 
 class FakeModel:
-    def __init__(self, cli: FakeCli) -> None:
+    """The orchestrator's model, or with `agent` = (agent_id, agent_type) a Mignon's."""
+
+    def __init__(self, cli: FakeCli, agent: tuple[str, str] | None = None) -> None:
         self._cli = cli
+        self.agent = agent
 
     async def call(self, name: str, tool_input: dict[str, Any]) -> ToolTurn:
-        return await self._cli.tool_call(name, tool_input)
+        return await self._cli.tool_call(name, tool_input, self.agent)
+
+    async def spawn(
+        self,
+        subagent_type: str,
+        prompt: str,
+        mignon: Script,
+        description: str = "research",
+        **extra: Any,
+    ) -> ToolTurn:
+        """An `Agent` call whose Mignon runs `mignon`; `extra` adds tool inputs."""
+        tool_input = {
+            "description": description,
+            "prompt": prompt,
+            "subagent_type": subagent_type,
+            **extra,
+        }
+        return await self._cli.agent_call(tool_input, mignon, self.agent)
 
     @property
     def interrupted(self) -> bool:
@@ -134,6 +162,7 @@ class FakeCli(Transport):
         self._local_ready = False
         self._use_counter = 0
         self._current_use_id = ""
+        self.script_error: Exception | None = None
 
     # -- Transport ------------------------------------------------------------------------
 
@@ -324,13 +353,26 @@ class FakeCli(Transport):
                 )
         return outputs
 
-    async def tool_call(self, name: str, tool_input: dict[str, Any]) -> ToolTurn:
+    def _agent_tools(self, agent: tuple[str, str] | None) -> set[str] | None:
+        if agent is None:
+            return None
+        definition = (self.options.agents or {}).get(agent[1])
+        return set(definition.tools or []) if definition is not None else set()
+
+    async def tool_call(
+        self, name: str, tool_input: dict[str, Any], agent: tuple[str, str] | None = None
+    ) -> ToolTurn:
         if self.interrupted.is_set():
             raise ScriptStopped("interrupted")
         self._use_counter += 1
         use_id = f"toolu_{self._use_counter:04d}"
         self._current_use_id = use_id
-        base = {"tool_name": name, "tool_input": tool_input, "tool_use_id": use_id}
+        base: dict[str, Any] = {"tool_name": name, "tool_input": tool_input, "tool_use_id": use_id}
+        mignon_tools = self._agent_tools(agent)
+        if agent is not None:
+            base |= {"agent_id": agent[0], "agent_type": agent[1]}
+            if name not in (mignon_tools or set()):
+                return self._deliver(ToolTurn(name, True, f"No such tool available: {name}"))
         effective = tool_input
         for out in await self._hook("PreToolUse", name, base):
             specific = out.get("hookSpecificOutput") or {}
@@ -362,6 +404,57 @@ class FakeCli(Transport):
             context = specific.get("additionalContext") or context
             stop = stop or out.get("continue") is False
         return self._deliver(ToolTurn(name, False, output=visible, context=context), stop=stop)
+
+    async def agent_call(
+        self, tool_input: dict[str, Any], mignon: Script, caller: tuple[str, str] | None
+    ) -> ToolTurn:
+        """One `Agent` call: hooks, the Mignon's run, and its hand-back (module docstring)."""
+        name = "Agent"
+        if self.interrupted.is_set():
+            raise ScriptStopped("interrupted")
+        if caller is not None:  # a Mignon's definition never lists Agent
+            return self._deliver(ToolTurn(name, True, "No such tool available: Agent"))
+        self._use_counter += 1
+        use_id = f"toolu_{self._use_counter:04d}"
+        base: dict[str, Any] = {"tool_name": name, "tool_input": tool_input, "tool_use_id": use_id}
+        for out in await self._hook("PreToolUse", name, base):
+            specific = out.get("hookSpecificOutput") or {}
+            if specific.get("permissionDecision") == "deny":
+                turn = ToolTurn(name, True, specific.get("permissionDecisionReason"))
+                return self._deliver(turn, stop=out.get("continue") is False)
+            if out.get("continue") is False:
+                return self._deliver(ToolTurn(name, True, out.get("stopReason")), stop=True)
+        allowed = set(self.options.allowed_tools)
+        if name in set(self.options.disallowed_tools) or name not in allowed:
+            return self._deliver(ToolTurn(name, True, "permission denied (dontAsk)"))
+        agent_type = str(tool_input.get("subagent_type"))
+        if agent_type not in (self.options.agents or {}):
+            return self._deliver(ToolTurn(name, True, f"Agent type '{agent_type}' not found"))
+        self.world.calls.append((name, tool_input))
+        agent_id = f"a{self._use_counter:04d}"
+        start = {"agent_id": agent_id, "agent_type": agent_type}
+        if any(o.get("continue") is False for o in await self._hook("SubagentStart", name, start)):
+            raise ScriptStopped("SubagentStart stopped the session")
+        text = await mignon(FakeModel(self, (agent_id, agent_type)))
+        response = {
+            "status": "completed",
+            "prompt": tool_input.get("prompt"),
+            "agentId": agent_id,
+            "agentType": agent_type,
+            "content": [{"type": "text", "text": text or ""}],
+            "totalToolUseCount": 0,
+        }
+        visible: Any = response
+        stop = False
+        for out in await self._hook("PostToolUse", name, {**base, "tool_response": response}):
+            specific = out.get("hookSpecificOutput") or {}
+            replaced = specific.get("updatedToolOutput")
+            if isinstance(replaced, dict):
+                visible = _decode_mcp_output(replaced.get("content"))
+            elif replaced is not None:
+                visible = _decode_mcp_output(replaced)
+            stop = stop or out.get("continue") is False
+        return self._deliver(ToolTurn(name, False, output=visible), stop=stop)
 
     def _deliver(self, turn: ToolTurn, stop: bool = False) -> ToolTurn:
         self.turns.append(turn)
@@ -421,6 +514,9 @@ class FakeCli(Transport):
         try:
             text = await self.script(FakeModel(self))
         except ScriptStopped:
+            stopped = True
+        except Exception as exc:  # noqa: BLE001 - a broken script must end, not hang, the run
+            self.script_error = exc
             stopped = True
         if self.interrupted.is_set() or stopped:
             # A real CLI keeps the stream open until it winds down; emit the aborted result.

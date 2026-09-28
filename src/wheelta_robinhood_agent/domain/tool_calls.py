@@ -38,6 +38,8 @@ class ToolCallIdentity(DomainModel):
     """Inserted once, before dispatch. Unique per (run_id, sdk_tool_use_id).
 
     `tier` is None for a tool absent from the registry; such a call is always denied.
+    `agent_id`/`agent_type` name the Mignon that made the call (ADR-0025); both are None
+    for the orchestrator.
     """
 
     tool_call_id: UUID
@@ -49,6 +51,14 @@ class ToolCallIdentity(DomainModel):
     tier: ToolTier | None
     requested_at: UtcDatetime
     arguments_redacted: RedactedArguments
+    agent_id: NonEmptyStr | None = None
+    agent_type: NonEmptyStr | None = None
+
+    @model_validator(mode="after")
+    def _check_agent(self) -> Self:
+        if (self.agent_id is None) != (self.agent_type is None):
+            raise ValueError("agent_id and agent_type are set together")
+        return self
 
 
 _TERMINAL_WITH_COMPLETION = frozenset(

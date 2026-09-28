@@ -2,9 +2,11 @@ import itertools
 
 import pytest
 
+from wheelta_robinhood_agent.agent.mignons import ROLE_TOOLS, Role
 from wheelta_robinhood_agent.agent.tool_access import (
     ALLOWED_BUILTINS,
     DISALLOWED_BUILTINS,
+    SESSION_BUILTINS,
     build_tool_access,
 )
 from wheelta_robinhood_agent.config.settings import PHASE_EXECUTION_CEILING
@@ -25,6 +27,7 @@ DENIED_X = {
 }
 TIER_S = {ROBINHOOD_REGISTRY.qualified(t.name) for t in ROBINHOOD_REGISTRY.by_tier(ToolTier.S)}
 TIER_R = {r.qualified(t.name) for r in REGISTRIES for t in r.by_tier(ToolTier.R)}
+ALL_ROLES = frozenset().union(*ROLE_TOOLS.values())
 
 
 def _access(mode: ExecutionMode, writes: bool = True):  # type: ignore[no-untyped-def]
@@ -52,10 +55,12 @@ def test_invariants_in_every_mode(mode: ExecutionMode, writes: bool) -> None:
     allowed, disallowed = set(access.allowed_tools), set(access.disallowed_tools)
     assert not allowed & disallowed
     assert DENIED_X <= disallowed
-    assert TIER_R <= allowed
+    assert TIER_R & ALL_ROLES <= allowed
+    assert TIER_R - ALL_ROLES <= disallowed  # no role uses them (e.g. trusted-only get_accounts)
     assert set(DISALLOWED_BUILTINS) <= disallowed
-    assert set(ALLOWED_BUILTINS) <= allowed
+    assert set(SESSION_BUILTINS) <= allowed
     assert list(access.allowed_tools) == sorted(access.allowed_tools)
+    assert "Task" not in disallowed  # the CLI alias of Agent: disallowing it disables Agent
     if writes:
         assert TIER_S <= allowed
     else:
@@ -77,3 +82,12 @@ def test_unregistered_tool_is_in_neither_list() -> None:
     name = "mcp__robinhood__brand_new_tool"
     assert name not in access.allowed_tools
     assert name not in access.disallowed_tools
+
+
+@pytest.mark.parametrize("mode", list(ExecutionMode))
+def test_without_mignons_only_the_orchestrator_tools_remain(mode: ExecutionMode) -> None:
+    access = build_tool_access(
+        effective_mode=mode, workspace_writes=True, registries=REGISTRIES, mignons=False
+    )
+    assert set(access.allowed_tools) <= ROLE_TOOLS[Role.ORCHESTRATOR]
+    assert {"Agent", *ALLOWED_BUILTINS} <= set(access.disallowed_tools)

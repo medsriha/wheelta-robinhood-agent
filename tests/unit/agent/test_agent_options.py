@@ -12,13 +12,14 @@ import pytest
 from claude_agent_sdk import HookMatcher
 from pydantic import SecretStr
 
+from wheelta_robinhood_agent.agent.mignons import MignonLimits, Role, role_allowed
 from wheelta_robinhood_agent.agent.options import (
     AgentOptionsError,
     assert_safe_options,
     build_agent_options,
 )
 from wheelta_robinhood_agent.agent.tool_access import ToolAccess, build_tool_access
-from wheelta_robinhood_agent.domain.enums import ExecutionMode
+from wheelta_robinhood_agent.domain.enums import ExecutionMode, MignonType
 from wheelta_robinhood_agent.domain.gating import effective_execution_mode
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     LIVE_ORDER_TOOLS,
@@ -30,6 +31,8 @@ from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGIST
 REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
 ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
 SCRATCH = Path("/private/tmp/wra-scratch")
+PROMPTS = {m: f"rendered {m.value} prompt" for m in MignonType}
+LIMITS = MignonLimits(max_per_run=8, max_concurrent=4, max_turns_per_mignon=40)
 
 
 async def _noop(*_: Any) -> Any:
@@ -63,6 +66,8 @@ def _build(**overrides: Any) -> Any:
         "max_budget_usd": Decimal("2.50"),
         "mcp_timeout_ms": 30000,
         "mcp_tool_timeout_ms": 60000,
+        "mignon_prompts": PROMPTS,
+        "mignon_limits": LIMITS,
     }
     kwargs.update(overrides)
     return build_agent_options(**kwargs)
@@ -73,14 +78,21 @@ def test_options_contract() -> None:
     assert o.permission_mode == "dontAsk"
     assert o.setting_sources == []
     assert o.strict_mcp_config is True
-    assert o.tools == ["WebSearch", "WebFetch"]
+    assert o.tools == ["Agent", "WebSearch", "WebFetch"]
     assert o.model == "claude-test-model"
     assert o.cwd == SCRATCH
     assert o.max_turns == 40 and o.max_budget_usd == 2.5
     assert o.hooks is HOOKS
     assert o.system_prompt == "rendered wheel_agent prompt"
-    assert o.env == {"MCP_TIMEOUT": "30000", "MCP_TOOL_TIMEOUT": "60000"}
-    assert o.can_use_tool is None and o.skills is None and not o.agents
+    assert o.env == {
+        "MCP_TIMEOUT": "30000",
+        "MCP_TOOL_TIMEOUT": "60000",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+        "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1",
+        "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4",
+    }
+    assert o.can_use_tool is None and o.skills is None
+    assert set(o.agents) == {m.value for m in MignonType}
     assert o.mcp_servers == {
         "robinhood": {
             "type": "http",
@@ -168,3 +180,98 @@ def test_assert_safe_options_rejects_unsafe(change: dict[str, Any], fragment: st
     unsafe = dataclasses.replace(_build(), **change)
     with pytest.raises(AgentOptionsError, match=fragment):
         assert_safe_options(unsafe)
+
+
+def test_mignon_definitions_follow_their_roles() -> None:
+    o = _build()
+    for mignon in MignonType:
+        d = o.agents[mignon.value]
+        assert d.prompt == PROMPTS[mignon]
+        assert tuple(d.tools) == role_allowed(Role(mignon.value), o.allowed_tools)
+        assert d.model == o.model and d.maxTurns == 40 and d.background is False
+        assert not {"Agent", *ORDER_TOOLS} & set(d.tools)
+        assert not any("get_option_positions" in t or "get_portfolio" in t for t in d.tools)
+    assert "WebSearch" not in o.agents["mignon-market"].tools
+    assert "WebFetch" in o.agents["mignon-company"].tools
+
+
+def test_disabled_mignons_leave_no_agents_and_no_web() -> None:
+    access = build_tool_access(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=True,
+        registries=REGISTRIES,
+        mignons=False,
+    )
+    o = _build(tool_access=access, mignon_prompts=None, mignon_limits=None)
+    assert not o.agents
+    assert {"Agent", "WebSearch", "WebFetch"} <= set(o.disallowed_tools)
+    assert o.env["CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"] == "1"
+    assert "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS" not in o.env
+
+
+@pytest.mark.parametrize(
+    ("override", "fragment"),
+    [
+        ({"mignon_prompts": None}, "no Mignons are configured"),
+        ({"mignon_limits": None}, "no Mignons are configured"),
+        ({"mignon_prompts": {MignonType.MARKET: "p"}}, "every Mignon type"),
+        ({"mignon_prompts": {**PROMPTS, MignonType.MACRO: " "}}, "every Mignon type"),
+    ],
+)
+def test_mignon_configuration_rejected(override: dict[str, Any], fragment: str) -> None:
+    with pytest.raises(AgentOptionsError, match=fragment):
+        _build(**override)
+
+
+def _with_agent(o: Any, name: str, **changes: Any) -> Any:
+    agents = dict(o.agents)
+    agents[name] = dataclasses.replace(agents.get(name) or agents["mignon-market"], **changes)
+    return dataclasses.replace(o, agents=agents)
+
+
+@pytest.mark.parametrize(
+    ("name", "changes", "fragment"),
+    [
+        ("general-purpose", {}, "not a Mignon type"),
+        ("mignon-market", {"tools": ["WebSearch"]}, "tools differ"),
+        ("mignon-market", {"tools": None}, "tools differ"),
+        ("mignon-market", {"model": "inherit"}, "pinned model ID"),
+        ("mignon-market", {"model": "opus"}, "pinned model ID"),
+        ("mignon-market", {"model": None}, "pinned model ID"),
+        ("mignon-market", {"model": "claude-other"}, "same pinned model"),
+        ("mignon-market", {"background": True}, "background"),
+        ("mignon-market", {"background": None}, "background"),
+        ("mignon-market", {"maxTurns": None}, "turn cap"),
+        ("mignon-market", {"permissionMode": "bypassPermissions"}, "overrides"),
+        ("mignon-market", {"mcpServers": ["other"]}, "overrides"),
+        ("mignon-market", {"skills": ["x"]}, "overrides"),
+    ],
+)
+def test_assert_safe_options_rejects_unsafe_mignons(
+    name: str, changes: dict[str, Any], fragment: str
+) -> None:
+    with pytest.raises(AgentOptionsError, match=fragment):
+        assert_safe_options(_with_agent(_build(), name, **changes))
+
+
+@pytest.mark.parametrize(
+    "key", ["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS"]
+)
+def test_assert_safe_options_requires_the_cli_variables(key: str) -> None:
+    o = _build()
+    env = {k: v for k, v in o.env.items() if k != key}
+    with pytest.raises(AgentOptionsError, match=key):
+        assert_safe_options(dataclasses.replace(o, env=env))
+
+
+def test_agents_without_the_agent_tool_rejected() -> None:
+    o = _build()
+    allowed = [t for t in o.allowed_tools if t != "Agent"]
+    with pytest.raises(AgentOptionsError, match="Agent is not allowed"):
+        assert_safe_options(dataclasses.replace(o, allowed_tools=allowed))
+
+
+def test_mignons_may_use_their_own_pinned_model() -> None:
+    o = _build(mignon_model="claude-opus-4-8")
+    assert o.model == "claude-test-model"
+    assert {d.model for d in o.agents.values()} == {"claude-opus-4-8"}

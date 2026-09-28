@@ -21,6 +21,14 @@ PostToolUse only records the delivery of the proxy's envelope (and stops the ses
 CLI reports anything else), and PostToolUseFailure adds no outcome for a call the proxy
 already handled.
 
+Orchestrator and Mignons (ADR-0025, agent/mignons.py): every call is attributed by the hook
+input's `agent_id`/`agent_type` (absent on the orchestrator's main thread) and allowed only if
+its tool is in that role's `ROLE_TOOLS`. `Agent` (Tier D) is the orchestrator's alone and is
+gated on the Mignon type, its inputs, the kill switch/stop latch, and `rules.mignons` per-run
+and concurrent counts. PostToolUse(Agent) parses the Mignon's final text as a MignonReport,
+resolves its refs/URLs against what that Mignon was delivered, records it, and replaces the
+Agent result with a validated or missing envelope (`mignon_report_output`).
+
 Any recording, lookup, or validation failure sets the stop latch, denies or replaces the
 output with an error envelope, and returns `continue_=False`. Raw tool output is never
 passed through for an MCP tool. SDK keys verified against claude-agent-sdk 0.2.160
@@ -29,6 +37,7 @@ passed through for an MCP tool. SDK keys verified against claude-agent-sdk 0.2.1
 
 import contextlib
 import json
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -55,6 +64,14 @@ from wheelta_robinhood_agent.agent.account_scope import (
     account_scope_for,
     check_account_scope,
 )
+from wheelta_robinhood_agent.agent.mignons import (
+    AGENT_INPUT_KEYS,
+    DELEGATION_TOOL,
+    ROLE_TOOLS,
+    MignonLimits,
+    Role,
+    role_of,
+)
 from wheelta_robinhood_agent.agent.proxy_dispatch import (
     CallState,
     ProxyCall,
@@ -68,7 +85,17 @@ from wheelta_robinhood_agent.agent.tool_access import ALLOWED_BUILTINS
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
 from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules
 from wheelta_robinhood_agent.config.settings import Settings
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolCallStatus, ToolTier
+from wheelta_robinhood_agent.domain.enums import (
+    ExecutionMode,
+    MignonType,
+    ToolCallStatus,
+    ToolTier,
+)
+from wheelta_robinhood_agent.domain.mignon_report import (
+    REF_PREFIXES,
+    check_report_sources,
+    parse_mignon_report,
+)
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry, ToolSpec
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
@@ -282,6 +309,8 @@ class HookDeps:
     withheld: ServerWithholding | None = None
     # Servers served through the validating proxy (ADR-0023) and the call handoff to it.
     proxy_dispatch: ProxyDispatch | None = None
+    # `rules.mignons` as integers (agent/mignons.py `mignon_limits`); None: no Mignons.
+    mignon_limits: MignonLimits | None = None
 
     @classmethod
     def from_settings(
@@ -298,6 +327,7 @@ class HookDeps:
         clock: Callable[[], datetime],
         web_precheck: WebPrecheck | None = None,
         web_capture: WebCapture | None = None,
+        mignon_limits: MignonLimits | None = None,
     ) -> "HookDeps":
         return cls(
             effective_mode=settings.effective_execution_mode,
@@ -315,6 +345,7 @@ class HookDeps:
             clock=clock,
             web_precheck=web_precheck,
             web_capture=web_capture,
+            mignon_limits=mignon_limits,
         )
 
 
@@ -325,6 +356,10 @@ class _Resolved:
     tier: ToolTier | None
     spec: ToolSpec | None
     builtin: bool
+
+    @property
+    def qualified(self) -> str:
+        return self.tool if self.builtin else f"mcp__{self.server}__{self.tool}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +373,8 @@ class _Call:
     builtin: bool
     effective_input: dict[str, Any]
     appended_filters: tuple[JsonValue, ...]
+    # The Mignon that made the call (hook `agent_id`); None on the orchestrator's thread.
+    agent_id: str | None = None
 
 
 class _Denied(Exception):
@@ -345,10 +382,13 @@ class _Denied(Exception):
 
 
 def _resolve(name: str, registries: tuple[ToolRegistry, ...]) -> _Resolved:
-    """Map an SDK tool name to server/tool/tier. WebSearch/WebFetch are research (Tier R);
-    any other built-in and any unregistered MCP tool has no tier."""
+    """Map an SDK tool name to server/tool/tier. WebSearch/WebFetch are research (Tier R),
+    `Agent` is delegation (Tier D); any other built-in (the `Task` alias included) and any
+    unregistered MCP tool has no tier."""
     if name in ALLOWED_BUILTINS:
         return _Resolved(BUILTIN_SERVER, name, ToolTier.R, None, True)
+    if name == DELEGATION_TOOL:
+        return _Resolved(BUILTIN_SERVER, name, ToolTier.D, None, True)
     parts = name.split("__", 2)
     if len(parts) == 3 and parts[0] == "mcp" and parts[1] and parts[2]:
         server, tool = parts[1], parts[2]
@@ -394,9 +434,60 @@ def mcp_tool_output(envelope: Mapping[str, Any]) -> list[dict[str, str]]:
     return [{"type": "text", "text": json.dumps(envelope, sort_keys=True)}]
 
 
+def mignon_report_output(tool_response: Mapping[str, Any], envelope: Mapping[str, Any]) -> Any:
+    """The replacement Agent result: the CLI's own response object with its `content`
+    swapped for one text block holding the envelope JSON. A bare block list is ignored for
+    `Agent` (real CLI 2.1.283, tests/e2e/test_e2e_mignons_cli.py); the CLI then frames the
+    text as a subagent hand-back."""
+    return {**tool_response, "content": mcp_tool_output(envelope)}
+
+
+def _refs_in(value: object, out: set[str]) -> None:
+    """Collect every code-issued ref string anywhere in a delivered JSON value."""
+    if isinstance(value, str):
+        if value.startswith(REF_PREFIXES):
+            out.add(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _refs_in(item, out)
+    elif isinstance(value, list):
+        for item in value:
+            _refs_in(item, out)
+
+
+def _mentions(text: str, ref: str) -> bool:
+    """Whether `ref` appears in `text` as a whole token (not as a prefix of a longer ref)."""
+    return re.search(re.escape(ref) + r"(?![A-Za-z0-9_\-])", text) is not None
+
+
+def _report_text(tool_response: object) -> tuple[str, str, str] | None:
+    """(agent_id, agent_type, final text) of a completed synchronous Agent result, or None
+    for any other shape (e.g. an asynchronous launch)."""
+    if not isinstance(tool_response, Mapping) or tool_response.get("status") != "completed":
+        return None
+    agent_id, agent_type = tool_response.get("agentId"), tool_response.get("agentType")
+    content = tool_response.get("content")
+    if not (isinstance(agent_id, str) and agent_id and isinstance(agent_type, str)):
+        return None
+    if not isinstance(content, list) or not content:
+        return None
+    texts = [b.get("text") for b in content if isinstance(b, Mapping)]
+    if not all(isinstance(t, str) for t in texts) or len(texts) != len(content):
+        return None
+    return agent_id, agent_type, "".join(cast(list[str], texts))
+
+
 def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
-    """Build the PreToolUse, PostToolUse, and PostToolUseFailure hooks for one session."""
+    """Build the PreToolUse, PostToolUse, PostToolUseFailure, and SubagentStart hooks."""
     calls: dict[str, _Call] = {}
+    # Mignon bookkeeping: spawns so far, Agent calls in flight, and per Mignon (`agent_id`)
+    # the refs delivered to it and the URLs it fetched. `run_refs` is every ref delivered to
+    # any role this session (the orchestrator may hand a known ref to a follow-up Mignon).
+    spawned = 0
+    active: set[str] = set()
+    mignon_refs: dict[str, set[str]] = {}
+    mignon_urls: dict[str, set[str]] = {}
+    run_refs: set[str] = set()
     ws = deps.rules.workspace
     prefix = deps.workspace_prefix
     owned_caps = {
@@ -448,12 +539,40 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 deps.counter.items_in(object_id),
             )
 
+    def caller_role(data: Mapping[str, Any]) -> Role:
+        """The orchestrator without `agent_id`; a Mignon role by `agent_type` otherwise."""
+        agent_id, agent_type = data.get("agent_id"), data.get("agent_type")
+        if agent_id is None:
+            if agent_type is not None:
+                raise _Denied("agent_type without agent_id on the main thread")
+            return Role.ORCHESTRATOR
+        role = role_of(agent_type)
+        if not isinstance(agent_id, str) or not agent_id or role is None:
+            raise _Denied("tool call from an unknown sub-agent type")
+        return role
+
+    def check_spawn(tool_input: Mapping[str, object]) -> None:
+        """An `Agent` call must spawn a known Mignon, change nothing else, and fit the caps."""
+        limits = deps.mignon_limits
+        if limits is None:
+            raise _Denied("Mignons are disabled this run (rules.mignons is not set)")
+        extra = set(tool_input) - AGENT_INPUT_KEYS
+        if extra:
+            raise _Denied(f"Agent inputs not permitted: {sorted(extra)}")
+        kind = tool_input.get("subagent_type")
+        if kind not in {m.value for m in MignonType}:
+            raise _Denied("subagent_type must be a Mignon type")
+        for arg in ("description", "prompt"):
+            _required_str(tool_input, arg)
+        if spawned >= limits.max_per_run:
+            raise _Denied(f"mignons.max_per_run={limits.max_per_run} reached")
+        if len(active) >= limits.max_concurrent:
+            raise _Denied(f"mignons.max_concurrent={limits.max_concurrent} reached")
+
     def decide(
         resolved: _Resolved, tool_input: dict[str, Any], data: Mapping[str, Any]
     ) -> tuple[ToolTier, dict[str, Any], tuple[JsonValue, ...]]:
         """Raise `_Denied` or return (tier, effective input, appended filters)."""
-        if data.get("agent_id") is not None:
-            raise _Denied("sub-agent tool calls are not permitted")
         tier = resolved.tier
         if tier is None:
             raise _Denied(
@@ -470,13 +589,20 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             raise _Denied("denied Tier X tool")
         if tier is ToolTier.X and deps.effective_mode is not ExecutionMode.LIVE:
             raise _Denied("order tools are not available outside armed live mode")
-        if resolved.builtin and deps.web_precheck is not None:
+        role = caller_role(data)
+        if tier is ToolTier.D and role is not Role.ORCHESTRATOR:
+            raise _Denied("Mignons cannot spawn Mignons")
+        if resolved.qualified not in ROLE_TOOLS[role]:
+            raise _Denied(f"{resolved.qualified} is not available to the {role.value}")
+        if tier is ToolTier.D:
+            check_spawn(tool_input)
+        if resolved.tool in ALLOWED_BUILTINS and deps.web_precheck is not None:
             web_reason = deps.web_precheck(resolved.tool, tool_input)
             if web_reason is not None:
                 raise _Denied(web_reason)
         if tier is ToolTier.S and not deps.workspace_writes:
             raise _Denied("workspace writes are disabled")
-        if tier in (ToolTier.S, ToolTier.X):
+        if tier in (ToolTier.S, ToolTier.X, ToolTier.D):
             if deps.kill_switch:
                 raise _Denied("kill switch engaged")
             if deps.run_control.stop_requested:
@@ -523,6 +649,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     async def pre_tool_use(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
+        nonlocal spawned
         data = cast(Mapping[str, Any], input_data)
         now = deps.clock()
         use_id = data.get("tool_use_id")
@@ -532,6 +659,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         resolved = _resolve(raw_name if isinstance(raw_name, str) else "", deps.registries)
         raw_input = data.get("tool_input")
         tool_input: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+        agent_id = data.get("agent_id")
+        agent_type = data.get("agent_type")
         try:
             tool_call_id = deps.recorder.requested(
                 sdk_tool_use_id=use_id,
@@ -540,6 +669,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 tier=resolved.tier,
                 arguments_redacted=deps.redactor.redact_mapping(tool_input),
                 requested_at=now,
+                agent_id=agent_id if isinstance(agent_id, str) else None,
+                agent_type=agent_type if isinstance(agent_type, str) else None,
             )
         except Exception as exc:
             return deny_and_stop(f"recording failed ({type(exc).__name__})", now)
@@ -604,7 +735,11 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             builtin=resolved.builtin,
             effective_input=effective,
             appended_filters=appended,
+            agent_id=agent_id if isinstance(agent_id, str) else None,
         )
+        if tier is ToolTier.D:
+            spawned += 1
+            active.add(use_id)
         if effective is tool_input:
             # No permissionDecision: allowed_tools + dontAsk still evaluate the call.
             return SyncHookJSONOutput()
@@ -659,6 +794,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                     ),
                 ),
             )
+        if call.tier is ToolTier.D:
+            return agent_post(call, cast(str, use_id), data.get("tool_response"), now)
         if proxied(call.server, call.builtin):
             return proxied_post(call, cast(str, use_id), data.get("tool_response"), now)
         try:
@@ -738,6 +875,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             deps.recorder.delivered(
                 call.tool_call_id, delivered_result_ref=delivered_ref, observed_at=now
             )
+            note_delivered(call, payload)
         except Exception as exc:
             stop(now)
             reason = f"result validation or recording failed ({type(exc).__name__})"
@@ -797,6 +935,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 },
             )
             deps.recorder.delivered(call.tool_call_id, delivered_result_ref=ref, observed_at=now)
+            note_delivered(call, delivered_payload(delivered))
         except Exception as exc:
             stop(now)
             reason = f"proxied delivery check or recording failed ({type(exc).__name__})"
@@ -832,6 +971,146 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             out["stopReason"] = "run stop requested"
         return out
 
+    def note_delivered(call: _Call, envelope: object) -> None:
+        """Remember the refs a validated result delivered, per Mignon, and its fetched URL."""
+        if not isinstance(envelope, Mapping) or envelope.get("kind") != EnvelopeKind.VALIDATED:
+            return
+        refs: set[str] = set()
+        _refs_in(envelope.get("data"), refs)
+        run_refs.update(refs)
+        if call.agent_id is None:
+            return
+        mignon_refs.setdefault(call.agent_id, set()).update(refs)
+        url = call.effective_input.get("url")
+        if call.tool == "WebFetch" and isinstance(url, str):
+            mignon_urls.setdefault(call.agent_id, set()).add(url)
+
+    def agent_post(
+        call: _Call, use_id: str, tool_response: object, now: datetime
+    ) -> SyncHookJSONOutput:
+        """Validate, record, and replace a Mignon's hand-back (module docstring)."""
+        active.discard(use_id)
+        parts = _report_text(tool_response)
+        try:
+            if parts is None:
+                raise ValueError("the Agent result is not a completed synchronous Mignon report")
+            agent_id, agent_type, text = parts
+            issues: list[str] = []
+            if agent_type != call.effective_input.get("subagent_type"):
+                issues.append("agent type differs from the requested Mignon type")
+            parsed = parse_mignon_report(text)
+            report_data: JsonValue = None
+            if parsed.ok:
+                prompt = call.effective_input.get("prompt")
+                handed = {
+                    r
+                    for r in parsed.report.cited_refs() & run_refs
+                    if isinstance(prompt, str) and _mentions(prompt, r)
+                }
+                known = mignon_refs.get(agent_id, set()) | handed
+                found = check_report_sources(parsed.report, known, mignon_urls.get(agent_id, set()))
+                issues.extend(f"{i.loc}: {i.message}" for i in found)
+                report_data = deps.redactor.redact(parsed.report.model_dump(mode="json"))
+            else:
+                issues.extend(f"{i.loc}: {i.message}" for i in parsed.issues)
+            valid = not issues
+            if not valid:
+                deps.recorder.store_result(
+                    call.tool_call_id,
+                    ResultKind.RAW_INVALID,
+                    {"agent_id": agent_id, "text": deps.redactor.redact_text(text)},
+                )
+            envelope = ResultEnvelope(
+                tool_call_id=call.tool_call_id,
+                server=BUILTIN_SERVER,
+                tool=DELEGATION_TOOL,
+                kind=EnvelopeKind.VALIDATED if valid else EnvelopeKind.MISSING,
+                data={"mignon_type": agent_type, "agent_id": agent_id, "report": report_data}
+                if valid
+                else None,
+                gaps=tuple(deps.redactor.redact_text(i) for i in issues),
+                retrieved_at=now,
+            )
+            payload = envelope.model_dump(mode="json")
+            ref = deps.recorder.store_result(
+                call.tool_call_id, ResultKind.VALIDATED if valid else ResultKind.ERROR, payload
+            )
+            if valid:
+                deps.recorder.outcome(
+                    call.tool_call_id,
+                    ToolCallStatus.SUCCEEDED,
+                    observed_at=now,
+                    dedup_key=_RESULT_DEDUP_KEY,
+                    result_ref=ref,
+                )
+            else:
+                deps.recorder.outcome(
+                    call.tool_call_id,
+                    ToolCallStatus.FAILED,
+                    observed_at=now,
+                    dedup_key=_RESULT_DEDUP_KEY,
+                    reason="invalid Mignon report",
+                    error_ref=ref,
+                )
+            delivered_ref = deps.recorder.store_result(
+                call.tool_call_id,
+                ResultKind.DELIVERED,
+                {
+                    "replaced": True,
+                    "tool_output": payload,
+                    # mignon_report_output: the CLI's Agent response with `content` set to
+                    # one text block holding the envelope's sorted-key JSON.
+                    "wire_format": "agent_content_text_block_json",
+                    "agent_id": agent_id,
+                    "additional_context": None,
+                },
+            )
+            deps.recorder.delivered(
+                call.tool_call_id, delivered_result_ref=delivered_ref, observed_at=now
+            )
+        except Exception as exc:
+            stop(now)
+            reason = f"Mignon report handling failed ({type(exc).__name__}: {exc})"
+            with contextlib.suppress(Exception):
+                deps.recorder.outcome(
+                    call.tool_call_id,
+                    ToolCallStatus.FAILED,
+                    observed_at=now,
+                    dedup_key=_RESULT_DEDUP_KEY,
+                    reason=reason,
+                )
+            error = error_envelope(call, call.server, call.tool, reason, now)
+            return SyncHookJSONOutput(
+                continue_=False,
+                stopReason=reason,
+                hookSpecificOutput=PostToolUseHookSpecificOutput(
+                    hookEventName="PostToolUse",
+                    updatedToolOutput=mignon_report_output(tool_response, error)
+                    if isinstance(tool_response, Mapping)
+                    else mcp_tool_output(error),
+                ),
+            )
+        return SyncHookJSONOutput(
+            hookSpecificOutput=PostToolUseHookSpecificOutput(
+                hookEventName="PostToolUse",
+                updatedToolOutput=mignon_report_output(
+                    cast(Mapping[str, Any], tool_response), payload
+                ),
+            )
+        )
+
+    async def subagent_start(
+        input_data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> HookJSONOutput:
+        """Only Mignons may start; anything else stops the run (fail closed)."""
+        data = cast(Mapping[str, Any], input_data)
+        if role_of(data.get("agent_type")) is None or deps.mignon_limits is None:
+            stop(deps.clock())
+            return SyncHookJSONOutput(
+                continue_=False, stopReason="a sub-agent other than a Mignon started"
+            )
+        return SyncHookJSONOutput()
+
     async def post_tool_use_failure(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
     ) -> HookJSONOutput:
@@ -844,6 +1123,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             return SyncHookJSONOutput(
                 continue_=False, stopReason="failure for a call with no recorded dispatch"
             )
+        if call.tier is ToolTier.D:
+            active.discard(cast(str, use_id))
         status = unresolved_status(call.tier)
         error_text = deps.redactor.redact_text(str(data.get("error", "")))
         interrupted = data.get("is_interrupt") is True
@@ -897,4 +1178,5 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         "PostToolUseFailure": [
             HookMatcher(matcher=None, hooks=[post_tool_use_failure], timeout=timeout)
         ],
+        "SubagentStart": [HookMatcher(matcher=None, hooks=[subagent_start], timeout=timeout)],
     }

@@ -174,23 +174,17 @@ def _failure(raw_text: str, *issues: ParseIssue) -> DecisionOutputParseFailure:
     return DecisionOutputParseFailure(ok=False, raw_text=raw_text, issues=tuple(issues))
 
 
-def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
-    """Strictly parse the model's final response into AgentDecisionOutput v5.
+def load_strict_json(raw: str | bytes) -> tuple[str, object] | ParseIssue:
+    """Decode model text as exactly one strict JSON value, or return the first issue.
 
-    Never raises on bad model output: returns `DecisionOutputParseFailure` with the raw text
-    and typed issues. The response must be exactly one JSON object (surrounding whitespace
-    allowed; no code fences or prose). Duplicate keys, JSON numbers, NaN/Infinity, invalid
-    UTF-8, unknown fields, and type mismatches are all failures (INTERFACES.md: forbid extra
-    fields recursively; preserve the raw response on failure).
+    Returns (text, value). Duplicate keys, JSON numbers, NaN/Infinity, and invalid UTF-8 are
+    issues. Shared by every strict model-output parser (this module, `mignon_report.py`).
     """
     if isinstance(raw, bytes):
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
-            return _failure(
-                raw.decode("utf-8", errors="replace"),
-                ParseIssue(loc="", message=str(exc), kind="invalid_utf8"),
-            )
+            return ParseIssue(loc="", message=str(exc), kind="invalid_utf8")
     else:
         text = raw
     try:
@@ -202,9 +196,38 @@ def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
             parse_constant=_reject_constant,
         )
     except _RejectedJson as exc:
-        return _failure(text, ParseIssue(loc="", message=str(exc), kind=exc.kind))
+        return ParseIssue(loc="", message=str(exc), kind=exc.kind)
     except (ValueError, RecursionError) as exc:
-        return _failure(text, ParseIssue(loc="", message=str(exc), kind="invalid_json"))
+        return ParseIssue(loc="", message=str(exc), kind="invalid_json")
+    return text, data
+
+
+def validation_issues(exc: ValidationError) -> tuple[ParseIssue, ...]:
+    """Pydantic errors as typed parse issues."""
+    return tuple(
+        ParseIssue(
+            loc=".".join(str(part) for part in err["loc"]),
+            message=err["msg"],
+            kind=err["type"],
+        )
+        for err in exc.errors()
+    )
+
+
+def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
+    """Strictly parse the model's final response into AgentDecisionOutput v5.
+
+    Never raises on bad model output: returns `DecisionOutputParseFailure` with the raw text
+    and typed issues. The response must be exactly one JSON object (surrounding whitespace
+    allowed; no code fences or prose). Duplicate keys, JSON numbers, NaN/Infinity, invalid
+    UTF-8, unknown fields, and type mismatches are all failures (INTERFACES.md: forbid extra
+    fields recursively; preserve the raw response on failure).
+    """
+    loaded = load_strict_json(raw)
+    if isinstance(loaded, ParseIssue):
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        return _failure(text, loaded)
+    text, data = loaded
     if not isinstance(data, dict):
         return _failure(
             text, ParseIssue(loc="", message="top level must be a JSON object", kind="not_object")
@@ -212,15 +235,7 @@ def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
     try:
         output = AgentDecisionOutput.model_validate(data)
     except ValidationError as exc:
-        issues = tuple(
-            ParseIssue(
-                loc=".".join(str(part) for part in err["loc"]),
-                message=err["msg"],
-                kind=err["type"],
-            )
-            for err in exc.errors()
-        )
-        return _failure(text, *issues)
+        return _failure(text, *validation_issues(exc))
     except RecursionError as exc:
         return _failure(text, ParseIssue(loc="", message=str(exc), kind="too_deep"))
     return DecisionOutputParsed(ok=True, output=output)

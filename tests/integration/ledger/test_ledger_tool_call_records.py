@@ -209,3 +209,46 @@ def test_contradictory_events_raise_instead_of_guessing(conn: Conn, run_id: uuid
     append_tool_call_outcome(conn, call, ToolCallStatus.DENIED, observed_at=T0, reason="late")
     with pytest.raises(LedgerError, match="inconsistent"):
         tool_call_records(conn, run_id)
+
+
+def test_mignon_calls_are_attributed_and_delegation_is_tier_d(
+    conn: Conn, run_id: uuid.UUID
+) -> None:
+    """ADR-0025 / migration 0003: agent_id/agent_type project onto the identity."""
+    spawn = record_tool_call_requested(
+        conn,
+        run_id=run_id,
+        sdk_tool_use_id="toolu_agent",
+        stage="agent",
+        server="builtin",
+        tool="Agent",
+        tier=ToolTier.D,
+        arguments_redacted={"subagent_type": "mignon-market"},
+        requested_at=T0,
+    ).tool_call_id
+    quote = record_tool_call_requested(
+        conn,
+        run_id=run_id,
+        sdk_tool_use_id="toolu_q",
+        stage="agent",
+        server="robinhood",
+        tool="get_option_quotes",
+        tier=ToolTier.R,
+        arguments_redacted={},
+        requested_at=T0 + timedelta(seconds=1),
+        agent_id="a-market-1",
+        agent_type="mignon-market",
+    ).tool_call_id
+    records = {r.identity.tool_call_id: r.identity for r in tool_call_records(conn, run_id)}
+    assert records[spawn].tier is ToolTier.D and records[spawn].agent_id is None
+    assert (records[quote].agent_id, records[quote].agent_type) == ("a-market-1", "mignon-market")
+
+
+def test_agent_attribution_is_all_or_nothing(conn: Conn, run_id: uuid.UUID) -> None:
+    with pytest.raises(psycopg.errors.CheckViolation, match="agent_attribution"):
+        conn.execute(
+            "INSERT INTO tool_calls (tool_call_id, run_id, sdk_tool_use_id, stage, server, tool, "
+            "tier, requested_at, arguments_redacted, agent_id) VALUES "
+            "(%s, %s, 'toolu_x', 'agent', 's', 't', 'R', now(), '{}', 'a-1')",
+            (uuid.uuid4(), run_id),
+        )

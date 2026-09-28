@@ -28,11 +28,11 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 6
+version = 7
 status = "signed_off"
-adr = "ADR-0020"
+adr = "ADR-0025"
 signed_off_by = "medsriha (account owner)"
-signed_off_on = "2026-09-26"
+signed_off_on = "2026-09-27"
 
 [conventions]
 value_conventions = [
@@ -294,6 +294,20 @@ max_items_per_owned_watchlist = 50
 max_owned_scans = 5
 max_owned_alerts = 50
 max_mutations_per_run = 25
+
+# ---------------------------------------------------------------------------------------------
+# Research Mignons (ADR-0025). The PreToolUse hook enforces the counts; the turn cap is set on
+# each Mignon's SDK definition. A value other than an integer disables Mignons for the run.
+# ---------------------------------------------------------------------------------------------
+
+[mignons]
+notes = [
+  "The orchestrator delegates research to Mignons and makes every decision itself.",
+  "Every spawn counts toward max_per_run, follow-ups included. Mignons never spawn Mignons.",
+]
+max_per_run = 8
+max_concurrent = 4
+max_turns_per_mignon = 40
 
 # ---------------------------------------------------------------------------------------------
 # Data quality (docs/DATA_QUALITY.md explains the pipeline these values feed)

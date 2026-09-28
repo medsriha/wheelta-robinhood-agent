@@ -43,6 +43,7 @@ from wheelta_robinhood_agent.agent.account_scope import (
     account_scope_id,
 )
 from wheelta_robinhood_agent.agent.audit.runner import AuditResult, run_audit
+from wheelta_robinhood_agent.agent.mignons import DELEGATION_TOOL, Role, mignon_limits
 from wheelta_robinhood_agent.agent.result_boundary import VERIFIED_MAPPERS, EvidenceMapper
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
 from wheelta_robinhood_agent.agent.run_loader import (
@@ -71,6 +72,7 @@ from wheelta_robinhood_agent.config.prompts import (
     PromptError,
     PromptTemplate,
     RenderedPrompt,
+    load_mignon_prompts,
     load_prompt,
     render_prompt,
 )
@@ -88,6 +90,7 @@ from wheelta_robinhood_agent.domain.enums import (
     AppEnv,
     AuditOutcome,
     ExecutionMode,
+    MignonType,
     RunStatus,
     SourceStatus,
     ToolCallStatus,
@@ -271,8 +274,14 @@ def run_once(
     rules: LoadedRules,
     template: PromptTemplate,
     deps: OrchestratorDeps,
+    mignon_templates: Mapping[MignonType, PromptTemplate] | None = None,
 ) -> int:
-    """Run one cron fire and return the process exit code (exit_codes.py)."""
+    """Run one cron fire and return the process exit code (exit_codes.py).
+
+    `mignon_templates` defaults to the packaged Mignon prompts (`main` loads them at startup
+    so a missing file fails before any network call)."""
+    if mignon_templates is None:
+        mignon_templates = load_mignon_prompts()
     started = deps.clock()
     slot = slot_for(started)
     run_id = run_id_for(settings.APP_ENV, slot)
@@ -295,6 +304,7 @@ def run_once(
             log.info("slot already finalized; nothing to do", extra={"status": "noop"})
             return EXIT_OK
         run = _Run(settings, rules, template, deps, conn, run_id, slot, started, log)
+        run.mignon_templates = dict(mignon_templates)
         if run_slot.state is SlotState.INTERRUPTED:
             return run.recover()
         return run.execute()
@@ -318,6 +328,9 @@ class _Run:
         self.settings = settings
         self.rules = rules
         self.template = template
+        # ADR-0025: set by run_once; rendered per run in _render when Mignons are allowed.
+        self.mignon_templates: dict[MignonType, PromptTemplate] = {}
+        self.mignon_prompts: dict[MignonType, RenderedPrompt] = {}
         self.deps = deps
         self.conn = conn
         self.run_id = run_id
@@ -535,6 +548,7 @@ class _Run:
             remote_boundary_accepted=(
                 self.deps.remote_boundary_accepted or self.settings.remote_result_risk_accepted
             ),
+            mignons=mignon_limits(self.rules.rules) is not None,
         )
         self.event(
             RunEventType.METADATA,
@@ -566,6 +580,7 @@ class _Run:
             "recent_decisions": "[]",
         }
         rendered = render_prompt(self.template, values)
+        self.mignon_prompts = self._render_mignons(plan, now)
         self.event(
             RunEventType.METADATA,
             {
@@ -574,11 +589,39 @@ class _Run:
                 "prompt_template_hash": rendered.template_sha256,
                 "rendered_prompt_hash": rendered.sha256,
                 "model_id": self.settings.AGENT_MODEL,
+                "mignon_model_id": self.settings.mignon_model if self.mignon_prompts else None,
                 "position_book": book.model_dump(mode="json"),
+                "mignon_prompts": {
+                    mignon.value: {
+                        "prompt_id": r.prompt_id,
+                        "prompt_version": r.version,
+                        "prompt_template_hash": r.template_sha256,
+                        "rendered_prompt_hash": r.sha256,
+                    }
+                    for mignon, r in self.mignon_prompts.items()
+                },
             },
             key="metadata:prompt",
         )
         return rendered
+
+    def _render_mignons(self, plan: SessionPlan, now: datetime) -> dict[MignonType, RenderedPrompt]:
+        """Each Mignon type's prompt with its own tool table (ADR-0025); none when `Agent` is
+        not allowed this run (rules.mignons unset)."""
+        if DELEGATION_TOOL not in plan.tool_access.allowed_tools:
+            return {}
+        return {
+            mignon: render_prompt(
+                self.mignon_templates[mignon],
+                {
+                    "as_of": now.isoformat(),
+                    "policy_version": str(self.rules.version),
+                    "policy": self.rules.rendered,
+                    "available_tools": available_tools_table(plan, Role(mignon.value)),
+                },
+            )
+            for mignon in MignonType
+        }
 
     def dry_run_outside_local(self, effective_mode: ExecutionMode) -> bool:
         """ADR-0024: a dry run (effective mode off) never starts a session outside local."""
@@ -644,6 +687,7 @@ class _Run:
             rules=self.rules,
             plan=plan,
             system_prompt=prompt.text,
+            mignon_prompts={m: r.text for m, r in self.mignon_prompts.items()},
             run_control=self.control,
             clock=self.deps.clock,
             redactor=self.redactor,
@@ -839,7 +883,12 @@ class _Run:
             if call.status is not ToolCallStatus.REQUESTED:
                 continue
             tier = call.identity.tier
-            status = ToolCallStatus.FAILED if tier is ToolTier.R else ToolCallStatus.UNKNOWN
+            # Reads and Mignon spawns are not actions with an outside effect: failed.
+            status = (
+                ToolCallStatus.FAILED
+                if tier in (ToolTier.R, ToolTier.D)
+                else ToolCallStatus.UNKNOWN
+            )
             append_tool_call_outcome(
                 self.conn,
                 call.identity.tool_call_id,
@@ -868,6 +917,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings = load_settings()
         rules = load_rules()
         template = load_prompt()
+        mignon_templates = load_mignon_prompts()
     except (SettingsError, RulesError, PromptError) as exc:
         logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
         _LOG.error("startup configuration invalid: %s", exc)
@@ -879,7 +929,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     notifier = HttpNotifier(settings.ALERT_WEBHOOK_URL, settings.HEARTBEAT_URL)
     try:
-        return run_once(settings, rules, template, OrchestratorDeps(notifier=notifier))
+        return run_once(
+            settings, rules, template, OrchestratorDeps(notifier=notifier), mignon_templates
+        )
     except psycopg.errors.UndefinedTable:
         # The ledger schema is missing: migrations haven't run on this database.
         _LOG.error(

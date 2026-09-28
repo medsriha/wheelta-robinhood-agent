@@ -4,9 +4,11 @@ Every HTTP request the CLI sends is recorded (path, auth headers, JSON body). `P
 /v1/messages` answers from a script, streaming (SSE) or not, per the request's `stream` flag;
 `count_tokens` gets a benign count; any other path a 404 JSON error.
 
-The script only drives the main agent loop, recognised by `SYSTEM_MARKER` in the system
-prompt. Any auxiliary model call the CLI makes (titles, summaries, ...) gets a short text
-reply and is recorded like the rest, so assertions cover every request, not only the loop.
+The script drives the main agent loop, recognised by `SYSTEM_MARKER` in the system
+prompt, and optionally a Mignon's loop (`mignon_steps`, recognised by `MIGNON_MARKER` in the
+Mignon's system prompt, ADR-0025). Any auxiliary model call the CLI makes (titles,
+summaries, ...) gets a short text reply and is recorded like the rest, so assertions cover
+every request, not only the loop.
 The step index is the number of assistant turns already in the request's `messages`.
 """
 
@@ -20,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 SYSTEM_MARKER = "WRA-HARNESS-SYSTEM-PROMPT"
+MIGNON_MARKER = "WRA-HARNESS-MIGNON-PROMPT"
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,14 @@ class RecordedRequest:
     def is_main_loop(self) -> bool:
         return self.is_messages and SYSTEM_MARKER in json.dumps(self.body.get("system", ""))
 
+    @property
+    def is_mignon_loop(self) -> bool:
+        return self.is_messages and MIGNON_MARKER in json.dumps(self.body.get("system", ""))
+
+    def tool_names(self) -> list[str]:
+        """The tools this request offered the model."""
+        return [t.get("name") for t in self.body.get("tools", []) if isinstance(t, dict)]
+
     def text(self) -> str:
         """The whole request body as sent (JSON), for substring assertions."""
         return json.dumps(self.body, ensure_ascii=False)
@@ -75,6 +86,7 @@ class RecordingModel:
     """The ASGI app. `steps` is the main-loop script; after it ends, a final text is sent."""
 
     steps: Sequence[Step] = ()
+    mignon_steps: Sequence[Step] = ()
     requests: list[RecordedRequest] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _ids: int = 0
@@ -87,6 +99,9 @@ class RecordingModel:
 
     def main_loop(self) -> list[RecordedRequest]:
         return [r for r in self.snapshot() if r.is_main_loop]
+
+    def mignon_loop(self) -> list[RecordedRequest]:
+        return [r for r in self.snapshot() if r.is_mignon_loop]
 
     # -- ASGI ------------------------------------------------------------------------------
 
@@ -140,12 +155,16 @@ class RecordingModel:
             await self._json(send, 200, self._message(model, reply))
 
     def _reply(self, request: RecordedRequest) -> Reply:
-        if not request.is_main_loop:
+        if request.is_mignon_loop:
+            steps = self.mignon_steps
+        elif request.is_main_loop:
+            steps = self.steps
+        else:
             return FinalText("ok")
         index = _assistant_turns(request.body)
-        if index >= len(self.steps):
+        if index >= len(steps):
             return FinalText("harness script finished")
-        step = self.steps[index]
+        step = steps[index]
         return step if isinstance(step, ToolUse | FinalText) else step(request.body)
 
     def _next_id(self) -> str:

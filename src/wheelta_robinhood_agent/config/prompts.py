@@ -8,14 +8,26 @@ import hashlib
 import re
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 from pydantic import BaseModel, ConfigDict
 
+from wheelta_robinhood_agent.domain.enums import MignonType
+
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-# ADR-0018: the active prompt (v5 plus position notes); paired with AgentDecisionOutput v5.
+# ADR-0025: the orchestrator prompt (v6 plus Mignon delegation); paired with
+# AgentDecisionOutput v5.
 ACTIVE_PROMPT_ID = "wheel_agent"
-ACTIVE_PROMPT_VERSION = 6
+ACTIVE_PROMPT_VERSION = 7
+# ADR-0025: one prompt per Mignon type; each returns MignonReport v1.
+MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
+    {
+        MignonType.MARKET: ("mignon_market", 1),
+        MignonType.COMPANY: ("mignon_company", 1),
+        MignonType.MACRO: ("mignon_macro", 1),
+    }
+)
 
 _PLACEHOLDER_RE = re.compile(r"\{\{([a-z_]+)\}\}")
 _ANY_BRACES_RE = re.compile(r"\{\{.*?\}\}")
@@ -74,6 +86,14 @@ def load_prompt(
         text=data.decode("utf-8"),
         sha256=hashlib.sha256(data).hexdigest(),
     )
+
+
+def load_mignon_prompts(prompts_dir: Path = PROMPTS_DIR) -> dict[MignonType, PromptTemplate]:
+    """Every Mignon type's active prompt (`MIGNON_PROMPTS`). Raises PromptError."""
+    return {
+        mignon: load_prompt(prompt_id, version, prompts_dir)
+        for mignon, (prompt_id, version) in MIGNON_PROMPTS.items()
+    }
 
 
 def render_prompt(template: PromptTemplate, values: Mapping[str, str]) -> RenderedPrompt:

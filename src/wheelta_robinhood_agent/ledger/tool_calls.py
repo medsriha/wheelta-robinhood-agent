@@ -63,10 +63,14 @@ def record_tool_call_requested(
     tier: ToolTier | None,
     arguments_redacted: Mapping[str, object],
     requested_at: datetime,
+    agent_id: str | None = None,
+    agent_type: str | None = None,
 ) -> ToolCallRef:
     """Persist the identity and `requested` event before dispatch. Idempotent per SDK ID.
 
     `tier` is None for a tool missing from the registry. Arguments must already be redacted.
+    `agent_id`/`agent_type` attribute a Mignon's call (ADR-0025); both None for the
+    orchestrator.
     Raises IdentityConflict if the SDK ID exists for a different server/tool.
     """
     if requested_at.tzinfo is None:
@@ -86,7 +90,8 @@ def record_tool_call_requested(
         tool_call_id = new_id()
         conn.execute(
             "INSERT INTO tool_calls (tool_call_id, run_id, sdk_tool_use_id, stage, server, tool, "
-            "tier, requested_at, arguments_redacted) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "tier, requested_at, arguments_redacted, agent_id, agent_type) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 tool_call_id,
                 run_id,
@@ -97,6 +102,8 @@ def record_tool_call_requested(
                 tier.value if tier is not None else None,
                 requested_at,
                 Jsonb(dict(arguments_redacted)),
+                agent_id,
+                agent_type,
             ),
         )
         append_event(
@@ -251,7 +258,8 @@ def tool_call_records(
     with conn.cursor(row_factory=dict_row) as cur:
         identities = cur.execute(
             "SELECT tool_call_id, sdk_tool_use_id, run_id, stage, server, tool, tier, "
-            "requested_at, arguments_redacted FROM tool_calls WHERE run_id = %s "
+            "requested_at, arguments_redacted, agent_id, agent_type FROM tool_calls "
+            "WHERE run_id = %s "
             "ORDER BY requested_at, tool_call_id",
             (run_id,),
         ).fetchall()
@@ -323,6 +331,8 @@ def _record(identity: dict[str, Any], events: list[dict[str, Any]]) -> ToolCallR
                 tier=ToolTier(identity["tier"]) if identity["tier"] is not None else None,
                 requested_at=identity["requested_at"],
                 arguments_redacted=identity["arguments_redacted"],
+                agent_id=identity["agent_id"],
+                agent_type=identity["agent_type"],
             ),
             **fields,
         )

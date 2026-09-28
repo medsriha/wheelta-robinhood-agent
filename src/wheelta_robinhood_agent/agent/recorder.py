@@ -52,8 +52,13 @@ class ToolEventRecorder(Protocol):
         tier: ToolTier | None,
         arguments_redacted: Mapping[str, JsonValue],
         requested_at: datetime,
+        agent_id: str | None = None,
+        agent_type: str | None = None,
     ) -> uuid.UUID:
-        """Persist the identity and `requested` event; return the tool_call_id."""
+        """Persist the identity and `requested` event; return the tool_call_id.
+
+        `agent_id`/`agent_type` attribute a Mignon's call (ADR-0025); None: the orchestrator.
+        """
         ...
 
     def dispatched(
@@ -133,6 +138,8 @@ class LedgerToolEventRecorder:
         tier: ToolTier | None,
         arguments_redacted: Mapping[str, JsonValue],
         requested_at: datetime,
+        agent_id: str | None = None,
+        agent_type: str | None = None,
     ) -> uuid.UUID:
         ref = ledger_tool_calls.record_tool_call_requested(
             self._conn,
@@ -144,6 +151,8 @@ class LedgerToolEventRecorder:
             tier=tier,
             arguments_redacted=arguments_redacted,
             requested_at=requested_at,
+            agent_id=agent_id,
+            agent_type=agent_type,
         )
         return ref.tool_call_id
 

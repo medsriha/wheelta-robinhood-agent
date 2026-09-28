@@ -71,6 +71,13 @@ from wheelta_robinhood_agent.agent.ledger_adapters import (
     ledger_result_writer,
 )
 from wheelta_robinhood_agent.agent.local_server import LOCAL_REGISTRY, build_local_server
+from wheelta_robinhood_agent.agent.mignons import (
+    DELEGATION_TOOL,
+    MIGNON_DESCRIPTIONS,
+    ROLE_TOOLS,
+    Role,
+    mignon_limits,
+)
 from wheelta_robinhood_agent.agent.options import build_agent_options
 from wheelta_robinhood_agent.agent.proxy import (
     ValidatingProxy,
@@ -112,6 +119,7 @@ from wheelta_robinhood_agent.domain.decision_output import (
 )
 from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
+    MignonType,
     SourceStatus,
     ToolCallStatus,
     ToolTier,
@@ -225,6 +233,7 @@ def plan_session(
     remote_boundary_accepted: bool = REMOTE_RESULT_BOUNDARY_ACCEPTED,
     proxy_accepted: bool = PROXY_RESULT_BOUNDARY_ACCEPTED,
     local_registry: ToolRegistry = LOCAL_REGISTRY,
+    mignons: bool = True,
 ) -> SessionPlan:
     """Decide the exposed servers and tools before connecting (fail closed).
 
@@ -233,7 +242,10 @@ def plan_session(
     """
     registries = (*(s.registry for s in sources), local_registry)
     base = build_tool_access(
-        effective_mode=effective_mode, workspace_writes=workspace_writes, registries=registries
+        effective_mode=effective_mode,
+        workspace_writes=workspace_writes,
+        registries=registries,
+        mignons=mignons,
     )
     withheld: dict[str, str] = {}
     observations: list[SourceObservation] = []
@@ -293,6 +305,7 @@ def plan_session(
 
 
 _TOOL_PURPOSES: Final[dict[str, str]] = {
+    DELEGATION_TOOL: "Spawn one research Mignon (subagent_type, description, prompt)",
     "WebSearch": "Public web context the structured tools lack (source tiers apply)",
     "WebFetch": "Read one page from a trusted source (source tiers apply)",
     f"mcp__{LOCAL_SERVER_NAME}__{WEB_CACHE_TOOL_NAME}": (
@@ -304,17 +317,14 @@ _TOOL_PURPOSES: Final[dict[str, str]] = {
 }
 
 
-def available_tools_table(plan: SessionPlan) -> str:
-    """The prompt's `{{available_tools}}`: every allowed tool, fully qualified, with its tier.
-
-    Only allowed tools of verified registries (plus the two built-ins) are listed; withheld
-    sources are named separately so the model does not look for them.
-    """
-    lines = ["| Tool | Tier | Purpose |", "|---|---|---|"]
-    allowed = set(plan.tool_access.allowed_tools)
-    for name in ALLOWED_BUILTINS:
+def _role_rows(plan: SessionPlan, role: Role) -> list[str]:
+    """Table rows for the role's tools allowed this run (built-ins first, then registries)."""
+    allowed = set(plan.tool_access.allowed_tools) & ROLE_TOOLS[role]
+    rows = []
+    for name in (DELEGATION_TOOL, *ALLOWED_BUILTINS):
         if name in allowed:
-            lines.append(f"| `{name}` | R | {_TOOL_PURPOSES[name]} |")
+            tier = "D" if name == DELEGATION_TOOL else "R"
+            rows.append(f"| `{name}` | {tier} | {_TOOL_PURPOSES[name]} |")
     for registry in plan.registries:
         if not registry.verified or registry.server in plan.withheld:
             continue
@@ -322,12 +332,34 @@ def available_tools_table(plan: SessionPlan) -> str:
             qualified = registry.qualified(spec.name)
             if qualified in allowed:
                 purpose = _TOOL_PURPOSES.get(qualified, f"{registry.server} tool")
-                lines.append(f"| `{qualified}` | {spec.tier.value} | {purpose} |")
-    if plan.withheld:
-        lines.append("")
-        lines.append("Sources withheld this run (their tools are unavailable):")
-        for server, reason in sorted(plan.withheld.items()):
-            lines.append(f"- {server}: {reason}")
+                rows.append(f"| `{qualified}` | {spec.tier.value} | {purpose} |")
+    return rows
+
+
+def _withheld_lines(plan: SessionPlan) -> list[str]:
+    if not plan.withheld:
+        return []
+    lines = ["", "Sources withheld this run (their tools are unavailable):"]
+    lines.extend(f"- {server}: {reason}" for server, reason in sorted(plan.withheld.items()))
+    return lines
+
+
+def available_tools_table(plan: SessionPlan, role: Role = Role.ORCHESTRATOR) -> str:
+    """A prompt's `{{available_tools}}`: the role's allowed tools, fully qualified, with tier.
+
+    Only allowed tools of verified registries (plus allowed built-ins) are listed; withheld
+    sources are named separately so the model does not look for them. The orchestrator's
+    table also lists each Mignon type it can spawn this run and that type's tools.
+    """
+    lines = ["| Tool | Tier | Purpose |", "|---|---|---|", *_role_rows(plan, role)]
+    if role is Role.ORCHESTRATOR and DELEGATION_TOOL in plan.tool_access.allowed_tools:
+        for mignon in MignonType:
+            rows = _role_rows(plan, Role(mignon.value))
+            if not rows:
+                continue
+            lines.extend(["", f"Mignon `{mignon.value}`: {MIGNON_DESCRIPTIONS[mignon]}"])
+            lines.extend(["", "| Tool | Tier | Purpose |", "|---|---|---|", *rows])
+    lines.extend(_withheld_lines(plan))
     return "\n".join(lines)
 
 
@@ -373,6 +405,8 @@ class SessionDeps:
     )
     max_turns: int = DEFAULT_MAX_TURNS
     max_budget_usd: Decimal | None = None
+    # One rendered prompt per Mignon type (ADR-0025); empty when Mignons are disabled.
+    mignon_prompts: Mapping[MignonType, str] = field(default_factory=dict)
     status_poll_interval: float = STATUS_POLL_INTERVAL_SECONDS
     interrupt_grace_seconds: float = INTERRUPT_GRACE_SECONDS
 
@@ -432,6 +466,7 @@ def build_session_options(
 
     `account_eligible` is the result of the session's trusted `get_accounts` check."""
     precheck, capture, lookup_tool = _web_cache_parts(deps)
+    limits = mignon_limits(deps.rules.rules)
     recorder = LedgerToolEventRecorder(
         deps.conn, run_id=deps.run_id, result_writer=ledger_result_writer
     )
@@ -462,6 +497,7 @@ def build_session_options(
         web_capture=capture,
         withheld=withholding,
         proxy_dispatch=dispatch,
+        mignon_limits=limits,
     )
     facts_service = DecisionFactsService(
         conn=deps.conn,
@@ -504,6 +540,9 @@ def build_session_options(
         max_budget_usd=deps.max_budget_usd,
         mcp_timeout_ms=settings.MCP_TIMEOUT,
         mcp_tool_timeout_ms=settings.MCP_TOOL_TIMEOUT,
+        mignon_prompts=deps.mignon_prompts or None,
+        mignon_limits=limits,
+        mignon_model=settings.mignon_model,
     )
 
 
@@ -757,7 +796,11 @@ async def _converse(
                 if isinstance(message, SystemMessage) and message.subtype == "init":
                     _init_check(message, deps, configured, withholding, result)
                 elif isinstance(message, AssistantMessage):
-                    result.model_id = message.model or result.model_id
+                    # Mignon turns carry their spawning Agent call's id; the run records the
+                    # orchestrator's model (Mignons run on MIGNON_AGENT_MODEL, recorded in the
+                    # prompt metadata).
+                    if message.parent_tool_use_id is None:
+                        result.model_id = message.model or result.model_id
                 elif isinstance(message, ResultMessage):
                     _record_usage(message, deps.metrics)
                     if isinstance(message.result, str) and not message.is_error:

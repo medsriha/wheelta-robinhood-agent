@@ -313,10 +313,39 @@ def decision_json(candidate_ref: str, facts_ref: str, limit_price: str = "1.25")
     )
 
 
-async def research(model: FakeModel) -> tuple[str, str]:
-    """Collect evidence and facts for one CSP candidate; return (candidate_ref, facts_ref)."""
+def mignon_report(task: str, *findings: tuple[str, list[str]]) -> str:
+    """A MignonReport v1 JSON text (domain/mignon_report.py)."""
+    return json.dumps(
+        {
+            "task": task,
+            "findings": [{"claim": c, "refs": refs, "web_urls": []} for c, refs in findings],
+            "gaps": [],
+            "follow_up_questions": [],
+        }
+    )
+
+
+async def market_mignon(model: FakeModel) -> str:
+    """A market Mignon: screen AAPL puts from the chain and a live quote (ADR-0025)."""
     chains = await model.call("mcp__robinhood__get_option_chains", {"symbol": "AAPL"})
     candidate_ref = chains.data["evidence"]["candidates"][0]["candidate_ref"]
+    quotes = await model.call(
+        "mcp__robinhood__get_option_quotes", {"instrument_ids": [INSTRUMENT_ID]}
+    )
+    return mignon_report(
+        "Screen AAPL cash-secured puts.",
+        ("The AAPL put candidate from the chain.", [chains.data["evidence_ref"], candidate_ref]),
+        ("Its live quote was returned.", [quotes.data["evidence_ref"]]),
+    )
+
+
+async def research(model: FakeModel) -> tuple[str, str]:
+    """Delegate screening to a market Mignon, then establish state and facts as the
+    orchestrator; return (candidate_ref, facts_ref)."""
+    turn = await model.spawn("mignon-market", "Screen AAPL cash-secured puts.", market_mignon)
+    assert turn.output["kind"] == "validated", turn.output
+    refs = [r for f in turn.data["report"]["findings"] for r in f["refs"]]
+    candidate_ref = next(r for r in refs if r.startswith("candidate:"))
     await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": [INSTRUMENT_ID]})
     account = {"account_number": ACCOUNT_NUMBER}
     await model.call("mcp__robinhood__get_portfolio", account)

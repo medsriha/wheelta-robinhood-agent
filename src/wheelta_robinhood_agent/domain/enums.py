@@ -14,13 +14,23 @@ class ToolTier(StrEnum):
     """Robinhood tool tiers (ADR-0005, amended by ADR-0006).
 
     R: read/research. S: Agentic workspace writes on owned objects. X: financial actions.
-    EXCLUDED: out of scope (crypto); never allowlisted.
+    D: delegation, the built-in `Agent` tool the orchestrator uses to spawn a Mignon
+    (ADR-0025). EXCLUDED: out of scope (crypto); never allowlisted.
     """
 
     R = "R"
     S = "S"
     X = "X"
+    D = "D"
     EXCLUDED = "excluded"
+
+
+class MignonType(StrEnum):
+    """Research subagent types the orchestrator may spawn (ADR-0025, `agent/mignons.py`)."""
+
+    MARKET = "mignon-market"
+    COMPANY = "mignon-company"
+    MACRO = "mignon-macro"
 
 
 class OptionRight(StrEnum):

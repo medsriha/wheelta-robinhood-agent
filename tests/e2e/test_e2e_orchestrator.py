@@ -26,6 +26,8 @@ from e2e_fakes import (
     RAW_MARKER,
     build_world,
     dry_run_script,
+    market_mignon,
+    mignon_report,
     research,
 )
 from e2e_support import SESSION_TIME, WEEKEND_TIME, FakeClock, RecordingNotifier
@@ -324,7 +326,8 @@ def test_invalid_agent_output_still_assembles_from_events(harness: Callable[...,
     assert output.raw_redacted == "I would sell the AAPL put."
     assert stored.record.decisions == ()
     assert stored.record.decision_output_status.value != "valid"
-    assert len(calls) == 6
+    # Agent + the Mignon's chain and quote + the orchestrator's re-quote, 3 account reads, facts.
+    assert len(calls) == 8
 
 
 def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness]) -> None:
@@ -495,13 +498,18 @@ def test_unmapped_remote_result_never_reaches_the_model(harness: Callable[..., H
 
 
 def test_web_cache_hit_denies_an_identical_search(harness: Callable[..., Harness]) -> None:
-    async def script(model: FakeModel) -> str | None:
+    async def company(model: FakeModel) -> str:
         first = await model.call("WebSearch", {"query": "AAPL earnings date"})
         assert not first.denied
         second = await model.call("WebSearch", {"query": "  aapl   EARNINGS date "})
         assert second.denied and "web_cache_lookup" in (second.reason or "")
         cached = await model.call("mcp__wra_local__web_cache_lookup", {"ticker": "AAPL"})
         assert cached.data["entries"][0]["query"] == "AAPL earnings date"
+        return mignon_report("Find the AAPL earnings date.")
+
+    async def script(model: FakeModel) -> str | None:
+        turn = await model.spawn("mignon-company", "Find the AAPL earnings date.", company)
+        assert turn.output["kind"] == "validated", turn.output
         return await dry_run_script(model)
 
     h = harness()
@@ -514,7 +522,7 @@ def test_web_cache_hit_denies_an_identical_search(harness: Callable[..., Harness
 
 def test_sigterm_latches_stop_and_interrupts_the_session(harness: Callable[..., Harness]) -> None:
     async def script(model: FakeModel) -> str | None:
-        await model.call("mcp__robinhood__get_option_chains", {"symbol": "AAPL"})
+        await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": ["x"]})
         signal.raise_signal(signal.SIGTERM)
         for _ in range(200):  # the orchestrator interrupts; the next call is refused
             if model.interrupted:
@@ -534,12 +542,12 @@ def test_sigterm_latches_stop_and_interrupts_the_session(harness: Callable[..., 
     with h.conn() as c:
         tools = [r.identity.tool for r in tool_call_records(c, h.run_id)]
         assert ledger_evidence.run_records_for_run(c, h.run_id)
-    assert tools == ["get_option_chains"]
+    assert tools == ["get_option_quotes"]
 
 
 def test_deadline_times_out_the_session(harness: Callable[..., Harness]) -> None:
     async def script(model: FakeModel) -> str | None:
-        await model.call("mcp__robinhood__get_option_chains", {"symbol": "AAPL"})
+        await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": ["x"]})
         h.clock.advance(2000)  # past RUN_TIMEOUT_SECONDS
         for _ in range(200):
             if model.interrupted:
@@ -602,3 +610,119 @@ def test_interrupted_slot_is_finalized_without_a_new_session(
         assert ledger_evidence.run_records_for_run(c, h.run_id)
     assert call.status is ToolCallStatus.FAILED
     assert h.events(RunEventType.RECOVERY_STARTED)
+
+
+# -- orchestrator and Mignons (ADR-0025) ---------------------------------------------------------
+
+
+def test_dry_run_delegates_research_and_the_ledger_attributes_every_call(
+    harness: Callable[..., Harness],
+) -> None:
+    h = harness()
+    assert h.run() == 0, h.notifier.alert_kinds()
+    (cli,) = h.clis
+    assert set(cli.options.agents or {}) == {"mignon-market", "mignon-company", "mignon-macro"}
+    assert cli.options.env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+    assert "Mignon `mignon-market`" in str(cli.options.system_prompt)
+    with h.conn() as c:
+        calls = tool_call_records(c, h.run_id)
+        prompt_meta = next(e for e in h.events(RunEventType.METADATA) if "mignon_prompts" in e)[
+            "mignon_prompts"
+        ]
+    spawn, chain, mignon_quote, requote, *rest = calls
+    assert (spawn.identity.tool, spawn.identity.tier.value if spawn.identity.tier else None) == (
+        "Agent",
+        "D",
+    )
+    assert spawn.status is ToolCallStatus.SUCCEEDED and spawn.identity.agent_id is None
+    for call in (chain, mignon_quote):
+        assert call.identity.agent_type == "mignon-market" and call.identity.agent_id
+    assert requote.identity.tool == "get_option_quotes" and requote.identity.agent_id is None
+    assert all(c.identity.agent_id is None for c in rest)
+    assert set(prompt_meta) == {"mignon-market", "mignon-company", "mignon-macro"}
+
+
+def test_follow_up_mignon_may_cite_refs_handed_over_by_the_orchestrator(
+    harness: Callable[..., Harness],
+) -> None:
+    async def script(model: FakeModel) -> str | None:
+        first = await model.spawn("mignon-market", "Screen AAPL puts.", market_mignon)
+        ref = first.data["report"]["findings"][0]["refs"][0]
+
+        async def follow_up(m: FakeModel) -> str:
+            return mignon_report("Check the spread.", ("The screened contract.", [ref]))
+
+        second = await model.spawn("mignon-market", f"Follow up on {ref}: spread?", follow_up)
+        assert second.output["kind"] == "validated", second.output
+        return await dry_run_script(model)
+
+    h = harness()
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+
+
+def test_invalid_mignon_report_is_missing_research_not_a_failed_run(
+    harness: Callable[..., Harness],
+) -> None:
+    async def liar(model: FakeModel) -> str:
+        return mignon_report("Screen.", ("The bid is 9.99.", ["evidence:invented"]))
+
+    async def script(model: FakeModel) -> str | None:
+        turn = await model.spawn("mignon-market", "Screen AAPL puts.", liar)
+        assert turn.output["kind"] == "missing"
+        assert any("not delivered" in g for g in turn.output["gaps"])
+        return await dry_run_script(model)
+
+    h = harness()
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    (cli,) = h.clis
+    assert "9.99" not in repr(cli.model_inputs[0])  # the unsupported claim never reached it
+    with h.conn() as c:
+        spawn = tool_call_records(c, h.run_id)[0]
+    assert spawn.identity.tool == "Agent" and spawn.status is ToolCallStatus.FAILED
+
+
+def test_roles_are_enforced_both_ways(harness: Callable[..., Harness]) -> None:
+    async def nosy(model: FakeModel) -> str:
+        positions = await model.call(
+            "mcp__robinhood__get_option_positions", {"account_number": ACCOUNT_NUMBER}
+        )
+        assert positions.denied
+        nested = await model.spawn("mignon-macro", "Recurse.", nosy)
+        assert nested.denied
+        return mignon_report("Nothing.")
+
+    async def script(model: FakeModel) -> str | None:
+        web = await model.call("WebSearch", {"query": "AAPL"})
+        assert web.denied and "not available to the orchestrator" in (web.reason or "")
+        general = await model.spawn("general-purpose", "Do anything.", nosy)
+        assert general.denied and "Mignon type" in (general.reason or "")
+        background = await model.spawn(
+            "mignon-market", "Screen.", market_mignon, run_in_background=True
+        )
+        assert background.denied
+        await model.spawn("mignon-company", "Poke around.", nosy)
+        return await dry_run_script(model)
+
+    h = harness()
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    assert ("mcp__robinhood__get_option_positions", {"account_number": ACCOUNT_NUMBER}) in (
+        h.world.calls
+    )  # only the orchestrator's own read reached the broker
+    positions_calls = [n for n, _ in h.world.calls if n.endswith("get_option_positions")]
+    assert len(positions_calls) == 1
+
+
+def test_spawns_stop_at_max_per_run(harness: Callable[..., Harness]) -> None:
+    async def empty(model: FakeModel) -> str:
+        return mignon_report("Nothing to report.")
+
+    async def script(model: FakeModel) -> str | None:
+        turns = [await model.spawn("mignon-macro", f"Task {i}.", empty) for i in range(8)]
+        assert not any(t.denied for t in turns)
+        ninth = await model.spawn("mignon-macro", "Task 9.", empty)
+        assert ninth.denied and "max_per_run=8" in (ninth.reason or "")
+        return "{}"
+
+    h = harness()
+    h.run(script)
+    assert [n for n, _ in h.world.calls].count("Agent") == 8
