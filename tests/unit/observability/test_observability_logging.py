@@ -64,6 +64,33 @@ def test_one_json_object_per_line_with_fixed_fields() -> None:
     assert str(first["timestamp"]).endswith("+00:00")
 
 
+def test_message_carries_event_and_fields_for_railway() -> None:
+    # Railway's log viewer and log API show only `message`; every other field is hidden there.
+    logger, stream, _ = _logger("message")
+    log = bind(logger, run_id="run-1", stage="preflight")
+    log.info("source_status", extra={"server": "wheelta", "detail": {"ok": True}})
+    logger.info("bare")
+    first, second = _lines(stream)
+    assert first["message"] == (
+        'source_status run_id=run-1 stage=preflight server=wheelta detail={"ok": true}'
+    )
+    assert second["message"] == "bare"
+
+
+def test_message_is_redacted_and_includes_exception() -> None:
+    logger, stream, _ = _logger("message_redact")
+    try:
+        raise RuntimeError(f"boom {TOKEN}")
+    except RuntimeError:
+        logger.exception("failed", extra={"account_number": ACCOUNT, "token": TOKEN})
+    (line,) = _lines(stream)
+    message = str(line["message"])
+    assert message.startswith("failed ")
+    assert "RuntimeError: boom" in message
+    assert TOKEN not in message and ACCOUNT not in message
+    assert mask_account(ACCOUNT) in message
+
+
 def test_bind_merges_call_site_extras_and_rebinds() -> None:
     logger, stream, _ = _logger("bind")
     log = bind(logger, run_id="r", stage="a", tool="x").bind(stage="b")

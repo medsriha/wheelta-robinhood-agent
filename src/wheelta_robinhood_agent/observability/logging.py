@@ -1,8 +1,10 @@
 """Structured JSON logging on the stdlib ``logging`` module (CLAUDE.md §16, §7).
 
 One JSON object per line with ``timestamp`` (UTC ISO 8601), ``level``, ``event``, ``logger``,
-``run_id``, ``stage`` and any extra fields. Every record, including third-party library records
-(httpx logs request URLs), passes through a :class:`Redactor` before it is written.
+``run_id``, ``stage``, ``message`` and any extra fields. ``message`` repeats the event, run id,
+stage, extras (``key=value``) and exception as one line of text, because Railway's log viewer and
+log API show only ``message`` and hide the other fields. Every record, including third-party
+library records (httpx logs request URLs), passes through a :class:`Redactor` before it is written.
 
 Usage::
 
@@ -54,7 +56,7 @@ _RESERVED_RECORD_ATTRS = frozenset(
         "threadName",
     }
 )
-_FIXED_FIELDS = ("timestamp", "level", "event", "logger", "run_id", "stage")
+_FIXED_FIELDS = ("timestamp", "level", "event", "logger", "run_id", "stage", "message")
 
 
 class JsonFormatter(logging.Formatter):
@@ -90,6 +92,7 @@ class JsonFormatter(logging.Formatter):
             payload["exception"] = self._redactor.redact_text(self.formatException(record.exc_info))
         if record.stack_info:
             payload["stack"] = self._redactor.redact_text(self.formatStack(record.stack_info))
+        payload["message"] = _message(payload)
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
@@ -158,3 +161,22 @@ def bind(
 ) -> RunLoggerAdapter:
     """Bind ``run_id``, ``stage`` and other fields to every record logged through the result."""
     return RunLoggerAdapter(logger, {"run_id": run_id, "stage": stage, **fields})
+
+
+def _message(payload: Mapping[str, JsonValue]) -> str:
+    """Render an already-redacted payload as Railway's display text: the event, then every field
+    except timestamp/level/logger (Railway shows those itself) as ``key=value``, then any
+    exception or stack. Built only from redacted values, so it adds no new exposure."""
+    parts = [str(payload["event"])]
+    for key, value in payload.items():
+        if key in ("timestamp", "level", "event", "logger", "exception", "stack") or value is None:
+            continue
+        text = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        )
+        parts.append(f"{key}={text}")
+    message = " ".join(parts)
+    for key in ("exception", "stack"):
+        if payload.get(key) is not None:
+            message += f"\n{payload[key]}"
+    return message
