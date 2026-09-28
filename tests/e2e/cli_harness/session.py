@@ -258,6 +258,8 @@ class Case:
     # every Mignon's loop with `mignon_steps`. Off: the session has no Agent tool.
     mignons: MignonLimits | None = None
     mignon_steps: Sequence[Step] = ()
+    # Exact model IDs the orchestrator may assign; empty means the session model only.
+    mignon_models: tuple[str, ...] = ()
 
 
 @dataclass
@@ -389,6 +391,7 @@ async def _session(case: Case, outcome: SessionOutcome, model_url: str, mcp_url:
         registries=(ROBINHOOD_REGISTRY,),
         hook_timeout_seconds=case.hook_timeout_seconds,
         mignon_limits=case.mignons,
+        mignon_models=case.mignon_models or (MODEL,),
     )
     upstream_server = McpHttpServer(
         name=SERVER, url=f"{mcp_url}/mcp", token=SecretStr("harness-token")
@@ -456,6 +459,7 @@ async def _converse(
         if case.mignons is not None
         else None,
         mignon_limits=case.mignons,
+        mignon_models=case.mignon_models or None,
     )
     env = {
         **options.env,

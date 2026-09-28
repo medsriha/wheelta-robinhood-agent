@@ -322,23 +322,40 @@ def test_credential_seed_settings_reject_malformed_values(
         load_credential_seed_settings()
 
 
-def test_mignon_model_defaults_to_agent_model_and_can_be_pinned_apart(
+def test_mignon_models_default_to_agent_model_and_parse_an_allowlist(
     env: pytest.MonkeyPatch,
 ) -> None:
-    """ADR-0025: MIGNON_AGENT_MODEL is optional; blank or unset means AGENT_MODEL."""
+    """ADR-0025: MIGNON_AGENT_MODELS is optional; blank or unset means AGENT_MODEL only."""
     s = load_settings()
-    assert s.MIGNON_AGENT_MODEL is None and s.mignon_model == s.AGENT_MODEL
-    env.setenv("MIGNON_AGENT_MODEL", "")
-    assert load_settings().mignon_model == s.AGENT_MODEL
-    env.setenv("MIGNON_AGENT_MODEL", "claude-opus-4-8")
+    assert s.MIGNON_AGENT_MODELS is None and s.mignon_models == (s.AGENT_MODEL,)
+    env.setenv("MIGNON_AGENT_MODELS", "")
+    assert load_settings().mignon_models == (s.AGENT_MODEL,)
+    env.setenv("MIGNON_AGENT_MODELS", " claude-haiku-4-5, claude-sonnet-5,claude-opus-4-8 ")
     pinned = load_settings()
-    assert pinned.mignon_model == "claude-opus-4-8"
-    assert pinned.config_snapshot()["mignon_agent_model"] == "claude-opus-4-8"
+    assert pinned.mignon_models == ("claude-haiku-4-5", "claude-sonnet-5", "claude-opus-4-8")
+    assert pinned.config_snapshot()["mignon_agent_models"] == list(pinned.mignon_models)
 
 
-@pytest.mark.parametrize("name", ["AGENT_MODEL", "MIGNON_AGENT_MODEL"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "opus",
+        "claude-opus-4-8,Sonnet",
+        "claude-opus-4-8,inherit",
+        "claude-x,claude-x",
+        "claude-x,",
+        "Claude Opus",
+        "claude--x",
+    ],
+)
+def test_bad_mignon_model_allowlists_are_rejected(env: pytest.MonkeyPatch, value: str) -> None:
+    env.setenv("MIGNON_AGENT_MODELS", value)
+    with pytest.raises(SettingsError, match="MIGNON_AGENT_MODELS"):
+        load_settings()
+
+
 @pytest.mark.parametrize("alias", ["opus", "Sonnet", "inherit"])
-def test_model_aliases_are_rejected(env: pytest.MonkeyPatch, name: str, alias: str) -> None:
-    env.setenv(name, alias)
-    with pytest.raises(SettingsError, match=name):
+def test_agent_model_aliases_are_rejected(env: pytest.MonkeyPatch, alias: str) -> None:
+    env.setenv("AGENT_MODEL", alias)
+    with pytest.raises(SettingsError, match="AGENT_MODEL"):
         load_settings()

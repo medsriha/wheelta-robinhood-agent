@@ -17,6 +17,7 @@ from test_hooks import (
     PLACE,
     RH,
     SCOPE,
+    TEST_MODEL,
     FakeRecorder,
     ResultEnvelope,
     Session,
@@ -40,9 +41,11 @@ from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGIST
 
 LIMITS = MignonLimits(max_per_run=8, max_concurrent=4, max_turns_per_mignon=40)
 MARKET_ID, COMPANY_ID = "a-market-1", "a-company-1"
-MARKET = {"agent_id": MARKET_ID, "agent_type": "mignon-market"}
-COMPANY = {"agent_id": COMPANY_ID, "agent_type": "mignon-company"}
-SPAWN = {"description": "screen", "prompt": "Screen AAPL puts.", "subagent_type": "mignon-market"}
+MARKET_T, COMPANY_T = f"mignon-market--{TEST_MODEL}", f"mignon-company--{TEST_MODEL}"
+MACRO_T = f"mignon-macro--{TEST_MODEL}"
+MARKET = {"agent_id": MARKET_ID, "agent_type": MARKET_T}
+COMPANY = {"agent_id": COMPANY_ID, "agent_type": COMPANY_T}
+SPAWN = {"description": "screen", "prompt": "Screen AAPL puts.", "subagent_type": MARKET_T}
 EVIDENCE, CANDIDATE = "evidence:e-1", "candidate:c-1"
 URL = "https://investor.example.com/q3"
 
@@ -74,7 +77,7 @@ def session(**overrides: Any) -> Session:
     return Session(make_deps(**overrides))
 
 
-def agent_response(text: str, agent_id: str = MARKET_ID, agent_type: str = "mignon-market") -> Any:
+def agent_response(text: str, agent_id: str = MARKET_ID, agent_type: str = MARKET_T) -> Any:
     """The CLI's completed synchronous Agent result (real CLI 2.1.283 shape)."""
     return {
         "status": "completed",
@@ -164,7 +167,7 @@ def test_mignon_call_is_attributed_when_recorded() -> None:
     s = session()
     s.pre(RH + "get_option_quotes", {}, **MARKET)
     req = s.rec.event("requested")
-    assert req["agent_id"] == MARKET_ID and req["agent_type"] == "mignon-market"
+    assert req["agent_id"] == MARKET_ID and req["agent_type"] == MARKET_T
     s2 = session()
     s2.pre(RH + "get_option_quotes", {})
     assert s2.rec.event("requested")["agent_id"] is None
@@ -197,6 +200,9 @@ def test_spawn_denied_when_mignons_disabled() -> None:
         ({"model": "claude-other"}, "not permitted"),
         ({"cwd": "/"}, "not permitted"),
         ({"subagent_type": "general-purpose"}, "must be a Mignon type"),
+        ({"subagent_type": "mignon-market"}, "on an allowed model"),
+        ({"subagent_type": "mignon-market--claude-other"}, "on an allowed model"),
+        ({"subagent_type": "mignon-market--opus"}, "on an allowed model"),
         ({"prompt": ""}, "'prompt' missing"),
         ({"description": 3}, "'description' missing"),
     ],
@@ -314,12 +320,12 @@ def test_ref_handed_over_in_the_task_is_citable() -> None:
 
 def test_fetched_url_is_citable_by_the_mignon_that_fetched_it() -> None:
     s = session()
-    spawn = {**SPAWN, "subagent_type": "mignon-company"}
+    spawn = {**SPAWN, "subagent_type": COMPANY_T}
     assert_ok(s.pre("Agent", spawn, use_id="toolu_agent"))
     assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
     s.post("WebFetch", {"text": "page"}, use_id="toolu_f")
     text = report(finding("Management reaffirmed guidance.", urls=[URL]))
-    out = s.post("Agent", agent_response(text, COMPANY_ID, "mignon-company"), use_id="toolu_agent")
+    out = s.post("Agent", agent_response(text, COMPANY_ID, COMPANY_T), use_id="toolu_agent")
     assert delivered_envelope(out)["kind"] == "validated"
 
 
@@ -327,7 +333,7 @@ def test_report_from_a_different_mignon_type_is_invalid() -> None:
     s = session()
     spawn_and_research(s)
     text = report(finding("Bid is 1.20.", [EVIDENCE]))
-    out = s.post("Agent", agent_response(text, MARKET_ID, "mignon-macro"), use_id="toolu_agent")
+    out = s.post("Agent", agent_response(text, MARKET_ID, MACRO_T), use_id="toolu_agent")
     assert any("agent type" in g for g in delivered_envelope(out)["gaps"])
 
 
@@ -336,7 +342,7 @@ def test_report_from_a_different_mignon_type_is_invalid() -> None:
     [
         {"isAsync": True, "status": "async_launched", "agentId": "a-1"},
         [{"type": "text", "text": "report"}],
-        {"status": "completed", "agentId": "a-1", "agentType": "mignon-market", "content": []},
+        {"status": "completed", "agentId": "a-1", "agentType": MARKET_T, "content": []},
     ],
 )
 def test_non_synchronous_or_malformed_agent_result_stops_the_run(response: Any) -> None:
@@ -367,8 +373,21 @@ def start(s: Session, agent_type: str) -> Any:
 
 def test_only_mignons_may_start() -> None:
     s = session()
-    assert start(s, "mignon-macro") == {}
+    assert start(s, MACRO_T) == {}
+    assert start(session(), "mignon-macro")["continue_"] is False  # no model
+    assert start(session(), "mignon-macro--claude-other")["continue_"] is False
     assert start(s, "general-purpose")["continue_"] is False
     assert s.deps.run_control.stop_requested
     s2 = session(mignon_limits=None)
-    assert start(s2, "mignon-market")["continue_"] is False
+    assert start(s2, MARKET_T)["continue_"] is False
+
+
+def test_a_mignon_on_a_model_outside_the_allowlist_is_unknown() -> None:
+    s = session()
+    out = s.pre(RH + "get_option_quotes", agent_id="a-1", agent_type="mignon-market--claude-x")
+    assert_denied(s, out, "unknown sub-agent type")
+
+
+def test_the_orchestrator_picks_among_allowed_models() -> None:
+    s = session(mignon_models=(TEST_MODEL, "claude-haiku-4-5"))
+    assert_ok(s.pre("Agent", {**SPAWN, "subagent_type": "mignon-company--claude-haiku-4-5"}))

@@ -18,6 +18,12 @@ three layers (CLAUDE.md §8):
 Known limit: built-ins a Mignon uses must be in the session's `tools`, so the orchestrator
 also *sees* WebSearch/WebFetch; the hook denies them on the main thread.
 
+Model choice (ADR-0025 amendment): each Mignon type is offered once per model in the owner's
+allowlist (`Settings.mignon_models`), as agent name `<type>--<model id>`
+(`agent_name`/`parse_agent_name`). The orchestrator picks a model by picking the
+`subagent_type`; each definition carries its exact pinned ID. The Agent tool's own `model`
+input takes only aliases the CLI resolves itself (`sonnet`, `opus`, …), so it stays denied.
+
 CLI behaviour this relies on (tests/e2e/test_e2e_mignons_cli.py):
 
 - `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` makes `Agent` synchronous, so PostToolUse(Agent)
@@ -30,7 +36,7 @@ CLI behaviour this relies on (tests/e2e/test_e2e_mignons_cli.py):
   `disallowed_tools`; it has no tier and the hook denies it.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -40,11 +46,13 @@ from claude_agent_sdk.types import AgentDefinition
 
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME, WEB_CACHE_TOOL_NAME
 from wheelta_robinhood_agent.config.rules import TradingRules
+from wheelta_robinhood_agent.config.settings import MODEL_ID_PATTERN
 from wheelta_robinhood_agent.domain.enums import MignonType
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
 from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
 
 DELEGATION_TOOL: Final = "Agent"
+AGENT_NAME_SEP: Final = "--"
 WEB_TOOLS: Final = ("WebSearch", "WebFetch")
 # Agent tool inputs the hook accepts; `model`, `cwd`, `run_in_background`, `name` etc. are
 # denied so the orchestrator cannot change a Mignon's model, directory, or mode.
@@ -208,14 +216,42 @@ MIGNON_DESCRIPTIONS: Mapping[MignonType, str] = MappingProxyType(
 )
 
 
-def role_of(agent_type: object) -> Role | None:
-    """The Mignon role named by a hook's `agent_type`, or None for anything else."""
-    if not isinstance(agent_type, str):
+# Orchestrator-facing guidance per known model ID: price per 1M input/output tokens from
+# Anthropic's model table (cached 2026-06-24, docs/REFERENCES.md) and typical use. An ID
+# without an entry is offered with no guidance.
+MODEL_GUIDANCE: Mapping[str, str] = MappingProxyType(
+    {
+        "claude-haiku-4-5": "$1/$5 per 1M tokens; fastest and cheapest; simple lookups",
+        "claude-sonnet-5": "$2/$10 per 1M tokens; routine screening and structured research",
+        "claude-opus-4-8": "$5/$25 per 1M tokens; deep analysis and judgment",
+        "claude-opus-5": "$5/$25 per 1M tokens; newest Opus; the hardest analysis",
+    }
+)
+
+
+def agent_name(mignon: MignonType, model: str) -> str:
+    """The `subagent_type` of one Mignon type on one pinned model."""
+    return f"{mignon.value}{AGENT_NAME_SEP}{model}"
+
+
+def parse_agent_name(name: object) -> tuple[MignonType, str] | None:
+    """(type, model) from an agent name, or None when it is not `<Mignon type>--<model id>`."""
+    if not isinstance(name, str) or AGENT_NAME_SEP not in name:
         return None
+    kind, model = name.split(AGENT_NAME_SEP, 1)
     try:
-        return Role(MignonType(agent_type).value)
+        mignon = MignonType(kind)
     except ValueError:
         return None
+    return (mignon, model) if MODEL_ID_PATTERN.fullmatch(model) else None
+
+
+def role_of(agent_type: object, models: Iterable[str]) -> Role | None:
+    """The Mignon role named by a hook's `agent_type` on an allowed model, else None."""
+    parsed = parse_agent_name(agent_type)
+    if parsed is None or parsed[1] not in frozenset(models):
+        return None
+    return Role(parsed[0].value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,23 +296,26 @@ def build_agent_definitions(
     *,
     prompts: Mapping[MignonType, str],
     allowed_tools: Iterable[str],
-    model: str,
+    models: Sequence[str],
     limits: MignonLimits,
 ) -> dict[str, AgentDefinition]:
-    """One `AgentDefinition` per Mignon type: its rendered prompt, its allowed tools, the
-    pinned model, and the turn cap. A type with no allowed tool is not offered."""
+    """One `AgentDefinition` per Mignon type and allowed model: the type's rendered prompt and
+    allowed tools, that exact model ID, and the turn cap. A type with no allowed tool is not
+    offered."""
     allowed = tuple(allowed_tools)
     definitions: dict[str, AgentDefinition] = {}
     for mignon in MignonType:
         tools = role_allowed(Role(mignon.value), allowed)
         if not tools:
             continue
-        definitions[mignon.value] = AgentDefinition(
-            description=MIGNON_DESCRIPTIONS[mignon],
-            prompt=prompts[mignon],
-            tools=list(tools),
-            model=model,
-            maxTurns=limits.max_turns_per_mignon,
-            background=False,
-        )
+        for model in models:
+            guidance = MODEL_GUIDANCE.get(model, "no guidance recorded")
+            definitions[agent_name(mignon, model)] = AgentDefinition(
+                description=f"{MIGNON_DESCRIPTIONS[mignon]} Model: {model} ({guidance}).",
+                prompt=prompts[mignon],
+                tools=list(tools),
+                model=model,
+                maxTurns=limits.max_turns_per_mignon,
+                background=False,
+            )
     return definitions

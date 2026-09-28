@@ -74,8 +74,10 @@ from wheelta_robinhood_agent.agent.local_server import LOCAL_REGISTRY, build_loc
 from wheelta_robinhood_agent.agent.mignons import (
     DELEGATION_TOOL,
     MIGNON_DESCRIPTIONS,
+    MODEL_GUIDANCE,
     ROLE_TOOLS,
     Role,
+    agent_name,
     mignon_limits,
 )
 from wheelta_robinhood_agent.agent.options import build_agent_options
@@ -344,12 +346,17 @@ def _withheld_lines(plan: SessionPlan) -> list[str]:
     return lines
 
 
-def available_tools_table(plan: SessionPlan, role: Role = Role.ORCHESTRATOR) -> str:
+def available_tools_table(
+    plan: SessionPlan,
+    role: Role = Role.ORCHESTRATOR,
+    mignon_models: Sequence[str] = (),
+) -> str:
     """A prompt's `{{available_tools}}`: the role's allowed tools, fully qualified, with tier.
 
     Only allowed tools of verified registries (plus allowed built-ins) are listed; withheld
     sources are named separately so the model does not look for them. The orchestrator's
-    table also lists each Mignon type it can spawn this run and that type's tools.
+    table also lists each Mignon type it can spawn this run, one `subagent_type` per model in
+    `mignon_models` (with that model's guidance), and the type's tools.
     """
     lines = ["| Tool | Tier | Purpose |", "|---|---|---|", *_role_rows(plan, role)]
     if role is Role.ORCHESTRATOR and DELEGATION_TOOL in plan.tool_access.allowed_tools:
@@ -357,7 +364,11 @@ def available_tools_table(plan: SessionPlan, role: Role = Role.ORCHESTRATOR) -> 
             rows = _role_rows(plan, Role(mignon.value))
             if not rows:
                 continue
-            lines.extend(["", f"Mignon `{mignon.value}`: {MIGNON_DESCRIPTIONS[mignon]}"])
+            lines.extend(["", f"Mignon `{mignon.value}`: {MIGNON_DESCRIPTIONS[mignon]}", ""])
+            lines.append("Spawn it as one of these `subagent_type` values:")
+            for model in mignon_models:
+                guidance = MODEL_GUIDANCE.get(model, "no guidance recorded")
+                lines.append(f"- `{agent_name(mignon, model)}`: {guidance}")
             lines.extend(["", "| Tool | Tier | Purpose |", "|---|---|---|", *rows])
     lines.extend(_withheld_lines(plan))
     return "\n".join(lines)
@@ -498,6 +509,7 @@ def build_session_options(
         withheld=withholding,
         proxy_dispatch=dispatch,
         mignon_limits=limits,
+        mignon_models=settings.mignon_models,
     )
     facts_service = DecisionFactsService(
         conn=deps.conn,
@@ -542,7 +554,7 @@ def build_session_options(
         mcp_tool_timeout_ms=settings.MCP_TOOL_TIMEOUT,
         mignon_prompts=deps.mignon_prompts or None,
         mignon_limits=limits,
-        mignon_model=settings.mignon_model,
+        mignon_models=settings.mignon_models,
     )
 
 
@@ -797,8 +809,7 @@ async def _converse(
                     _init_check(message, deps, configured, withholding, result)
                 elif isinstance(message, AssistantMessage):
                     # Mignon turns carry their spawning Agent call's id; the run records the
-                    # orchestrator's model (Mignons run on MIGNON_AGENT_MODEL, recorded in the
-                    # prompt metadata).
+                    # orchestrator's model (a Mignon's model is part of its agent_type).
                     if message.parent_tool_use_id is None:
                         result.model_id = message.model or result.model_id
                 elif isinstance(message, ResultMessage):

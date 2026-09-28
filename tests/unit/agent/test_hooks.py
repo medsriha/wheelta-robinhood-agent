@@ -46,8 +46,10 @@ RH = "mcp__robinhood__"
 BOARD = "mcp__wheelta__wheelta_board_query"
 PLACE = RH + "place_option_order"
 # Hook-input attribution of a Mignon's call (ADR-0025); absent on the orchestrator's thread.
-MARKET = {"agent_id": "a-market-1", "agent_type": "mignon-market"}
-COMPANY = {"agent_id": "a-company-1", "agent_type": "mignon-company"}
+# A Mignon's agent_type is `<type>--<model>` on an allowed model (HookDeps.mignon_models).
+TEST_MODEL = "claude-test-model"
+MARKET = {"agent_id": "a-market-1", "agent_type": f"mignon-market--{TEST_MODEL}"}
+COMPANY = {"agent_id": "a-company-1", "agent_type": f"mignon-company--{TEST_MODEL}"}
 W, A = WorkspaceKind.WATCHLIST, WorkspaceKind.ALERT
 
 # Test tables stand in for a captured tools/list (the shipped tables are all unverified).
@@ -192,6 +194,7 @@ def make_deps(**overrides: Any) -> HookDeps:
         clock=lambda: NOW,
         account_scope_table=SCOPE,
         workspace_targets=TARGETS,
+        mignon_models=(TEST_MODEL,),
     )
     return dataclasses.replace(base, **overrides)
 

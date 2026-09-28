@@ -87,7 +87,6 @@ from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
-    MignonType,
     ToolCallStatus,
     ToolTier,
 )
@@ -311,6 +310,9 @@ class HookDeps:
     proxy_dispatch: ProxyDispatch | None = None
     # `rules.mignons` as integers (agent/mignons.py `mignon_limits`); None: no Mignons.
     mignon_limits: MignonLimits | None = None
+    # Exact model IDs a Mignon may run on (`Settings.mignon_models`); an agent name on any
+    # other model is not a Mignon.
+    mignon_models: tuple[str, ...] = ()
 
     @classmethod
     def from_settings(
@@ -346,6 +348,7 @@ class HookDeps:
             web_precheck=web_precheck,
             web_capture=web_capture,
             mignon_limits=mignon_limits,
+            mignon_models=settings.mignon_models,
         )
 
 
@@ -546,7 +549,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             if agent_type is not None:
                 raise _Denied("agent_type without agent_id on the main thread")
             return Role.ORCHESTRATOR
-        role = role_of(agent_type)
+        role = role_of(agent_type, deps.mignon_models)
         if not isinstance(agent_id, str) or not agent_id or role is None:
             raise _Denied("tool call from an unknown sub-agent type")
         return role
@@ -559,9 +562,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         extra = set(tool_input) - AGENT_INPUT_KEYS
         if extra:
             raise _Denied(f"Agent inputs not permitted: {sorted(extra)}")
-        kind = tool_input.get("subagent_type")
-        if kind not in {m.value for m in MignonType}:
-            raise _Denied("subagent_type must be a Mignon type")
+        if role_of(tool_input.get("subagent_type"), deps.mignon_models) is None:
+            raise _Denied("subagent_type must be a Mignon type on an allowed model")
         for arg in ("description", "prompt"):
             _required_str(tool_input, arg)
         if spawned >= limits.max_per_run:
@@ -1104,7 +1106,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     ) -> HookJSONOutput:
         """Only Mignons may start; anything else stops the run (fail closed)."""
         data = cast(Mapping[str, Any], input_data)
-        if role_of(data.get("agent_type")) is None or deps.mignon_limits is None:
+        if role_of(data.get("agent_type"), deps.mignon_models) is None or (
+            deps.mignon_limits is None
+        ):
             stop(deps.clock())
             return SyncHookJSONOutput(
                 continue_=False, stopReason="a sub-agent other than a Mignon started"

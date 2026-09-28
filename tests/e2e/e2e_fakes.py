@@ -313,6 +313,12 @@ def decision_json(candidate_ref: str, facts_ref: str, limit_price: str = "1.25")
     )
 
 
+# Mignon agent names on the e2e session model (tests/e2e/conftest.py AGENT_MODEL), the
+# default allowlist when MIGNON_AGENT_MODELS is unset (ADR-0025).
+E2E_MODEL = "claude-test-model"
+MARKET, COMPANY, MACRO = (f"mignon-{t}--{E2E_MODEL}" for t in ("market", "company", "macro"))
+
+
 def mignon_report(task: str, *findings: tuple[str, list[str]]) -> str:
     """A MignonReport v1 JSON text (domain/mignon_report.py)."""
     return json.dumps(
@@ -342,7 +348,7 @@ async def market_mignon(model: FakeModel) -> str:
 async def research(model: FakeModel) -> tuple[str, str]:
     """Delegate screening to a market Mignon, then establish state and facts as the
     orchestrator; return (candidate_ref, facts_ref)."""
-    turn = await model.spawn("mignon-market", "Screen AAPL cash-secured puts.", market_mignon)
+    turn = await model.spawn(MARKET, "Screen AAPL cash-secured puts.", market_mignon)
     assert turn.output["kind"] == "validated", turn.output
     refs = [r for f in turn.data["report"]["findings"] for r in f["refs"]]
     candidate_ref = next(r for r in refs if r.startswith("candidate:"))

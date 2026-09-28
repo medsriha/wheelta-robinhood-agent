@@ -14,8 +14,10 @@ from wheelta_robinhood_agent.agent.mignons import (
     WEB_TOOLS,
     MignonLimits,
     Role,
+    agent_name,
     cli_env,
     mignon_limits,
+    parse_agent_name,
     role_of,
 )
 from wheelta_robinhood_agent.config.rules import RuleMarker, load_rules
@@ -67,10 +69,28 @@ def test_every_account_scoped_read_belongs_to_the_orchestrator_only() -> None:
             assert qualified in ROLE_TOOLS[Role.ORCHESTRATOR], name
 
 
-def test_role_of_accepts_only_mignon_types() -> None:
-    assert role_of("mignon-macro") is Role.MACRO
-    for other in ("orchestrator", "general-purpose", "Explore", None, 3):
-        assert role_of(other) is None
+def test_role_of_accepts_only_mignon_types_on_allowed_models() -> None:
+    models = ("claude-opus-4-8",)
+    assert role_of("mignon-macro--claude-opus-4-8", models) is Role.MACRO
+    for other in (
+        "mignon-macro",
+        "mignon-macro--claude-haiku-4-5",
+        "mignon-macro--opus",
+        "orchestrator--claude-opus-4-8",
+        "general-purpose",
+        None,
+        3,
+    ):
+        assert role_of(other, models) is None, other
+
+
+def test_agent_names_round_trip() -> None:
+    for mignon in MignonType:
+        assert parse_agent_name(agent_name(mignon, "claude-sonnet-5")) == (
+            mignon,
+            "claude-sonnet-5",
+        )
+    assert parse_agent_name("mignon-market--Claude Opus") is None
 
 
 def test_limits_come_from_the_rules() -> None:

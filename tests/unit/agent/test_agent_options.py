@@ -33,6 +33,7 @@ ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
 SCRATCH = Path("/private/tmp/wra-scratch")
 PROMPTS = {m: f"rendered {m.value} prompt" for m in MignonType}
 LIMITS = MignonLimits(max_per_run=8, max_concurrent=4, max_turns_per_mignon=40)
+MK = "mignon-market--claude-test-model"  # the default: every Mignon on the session model
 
 
 async def _noop(*_: Any) -> Any:
@@ -92,7 +93,7 @@ def test_options_contract() -> None:
         "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4",
     }
     assert o.can_use_tool is None and o.skills is None
-    assert set(o.agents) == {m.value for m in MignonType}
+    assert set(o.agents) == {f"{m.value}--claude-test-model" for m in MignonType}
     assert o.mcp_servers == {
         "robinhood": {
             "type": "http",
@@ -185,14 +186,14 @@ def test_assert_safe_options_rejects_unsafe(change: dict[str, Any], fragment: st
 def test_mignon_definitions_follow_their_roles() -> None:
     o = _build()
     for mignon in MignonType:
-        d = o.agents[mignon.value]
+        d = o.agents[f"{mignon.value}--claude-test-model"]
         assert d.prompt == PROMPTS[mignon]
         assert tuple(d.tools) == role_allowed(Role(mignon.value), o.allowed_tools)
         assert d.model == o.model and d.maxTurns == 40 and d.background is False
         assert not {"Agent", *ORDER_TOOLS} & set(d.tools)
         assert not any("get_option_positions" in t or "get_portfolio" in t for t in d.tools)
-    assert "WebSearch" not in o.agents["mignon-market"].tools
-    assert "WebFetch" in o.agents["mignon-company"].tools
+    assert "WebSearch" not in o.agents[MK].tools
+    assert "WebFetch" in o.agents["mignon-company--claude-test-model"].tools
 
 
 def test_disabled_mignons_leave_no_agents_and_no_web() -> None:
@@ -225,7 +226,7 @@ def test_mignon_configuration_rejected(override: dict[str, Any], fragment: str) 
 
 def _with_agent(o: Any, name: str, **changes: Any) -> Any:
     agents = dict(o.agents)
-    agents[name] = dataclasses.replace(agents.get(name) or agents["mignon-market"], **changes)
+    agents[name] = dataclasses.replace(agents.get(name) or agents[MK], **changes)
     return dataclasses.replace(o, agents=agents)
 
 
@@ -233,18 +234,19 @@ def _with_agent(o: Any, name: str, **changes: Any) -> Any:
     ("name", "changes", "fragment"),
     [
         ("general-purpose", {}, "not a Mignon type"),
-        ("mignon-market", {"tools": ["WebSearch"]}, "tools differ"),
-        ("mignon-market", {"tools": None}, "tools differ"),
-        ("mignon-market", {"model": "inherit"}, "pinned model ID"),
-        ("mignon-market", {"model": "opus"}, "pinned model ID"),
-        ("mignon-market", {"model": None}, "pinned model ID"),
-        ("mignon-market", {"model": "claude-other"}, "same pinned model"),
-        ("mignon-market", {"background": True}, "background"),
-        ("mignon-market", {"background": None}, "background"),
-        ("mignon-market", {"maxTurns": None}, "turn cap"),
-        ("mignon-market", {"permissionMode": "bypassPermissions"}, "overrides"),
-        ("mignon-market", {"mcpServers": ["other"]}, "overrides"),
-        ("mignon-market", {"skills": ["x"]}, "overrides"),
+        ("mignon-market", {}, "not a Mignon type"),
+        (MK, {"tools": ["WebSearch"]}, "tools differ"),
+        (MK, {"tools": None}, "tools differ"),
+        (MK, {"model": "inherit"}, "pinned model its name names"),
+        (MK, {"model": "opus"}, "pinned model its name names"),
+        (MK, {"model": None}, "pinned model its name names"),
+        (MK, {"model": "claude-other"}, "pinned model its name names"),
+        (MK, {"background": True}, "background"),
+        (MK, {"background": None}, "background"),
+        (MK, {"maxTurns": None}, "turn cap"),
+        (MK, {"permissionMode": "bypassPermissions"}, "overrides"),
+        (MK, {"mcpServers": ["other"]}, "overrides"),
+        (MK, {"skills": ["x"]}, "overrides"),
     ],
 )
 def test_assert_safe_options_rejects_unsafe_mignons(
@@ -271,7 +273,16 @@ def test_agents_without_the_agent_tool_rejected() -> None:
         assert_safe_options(dataclasses.replace(o, allowed_tools=allowed))
 
 
-def test_mignons_may_use_their_own_pinned_model() -> None:
-    o = _build(mignon_model="claude-opus-4-8")
+def test_each_mignon_type_is_offered_once_per_allowed_model() -> None:
+    o = _build(mignon_models=("claude-haiku-4-5", "claude-opus-4-8"))
     assert o.model == "claude-test-model"
-    assert {d.model for d in o.agents.values()} == {"claude-opus-4-8"}
+    assert set(o.agents) == {
+        f"{m.value}--{model}"
+        for m in MignonType
+        for model in ("claude-haiku-4-5", "claude-opus-4-8")
+    }
+    for name, d in o.agents.items():
+        assert d.model == name.split("--", 1)[1]
+    haiku = o.agents["mignon-company--claude-haiku-4-5"]
+    assert haiku.tools == o.agents["mignon-company--claude-opus-4-8"].tools
+    assert "$1/$5" in haiku.description

@@ -39,6 +39,7 @@ from wheelta_robinhood_agent.agent.mignons import (
     Role,
     build_agent_definitions,
     cli_env,
+    parse_agent_name,
     role_allowed,
 )
 from wheelta_robinhood_agent.agent.tool_access import (
@@ -91,7 +92,7 @@ def build_agent_options(
     sdk_servers: Mapping[str, McpSdkServerConfig] | None = None,
     mignon_prompts: Mapping[MignonType, str] | None = None,
     mignon_limits: MignonLimits | None = None,
-    mignon_model: str | None = None,
+    mignon_models: Sequence[str] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble the session options. Raises `AgentOptionsError` on any unsafe input.
 
@@ -99,8 +100,8 @@ def build_agent_options(
     `sdk_servers` maps a name in `LOCAL_SDK_SERVER_NAMES` or `PROXY_SDK_SERVER_NAMES` to its
     in-process server config; the name must match the config's own name and no HTTP server
     may share it. Mignons are configured only with both `mignon_prompts` (one rendered prompt
-    per type) and `mignon_limits`, and only when `Agent` is allowed. `mignon_model` is their
-    pinned model (`Settings.mignon_model`); None means the session's `model`.
+    per type) and `mignon_limits`, and only when `Agent` is allowed. `mignon_models` are the
+    exact IDs the orchestrator may assign (`Settings.mignon_models`); None means `model`.
     """
     if not model.strip():
         raise AgentOptionsError("model must be pinned")
@@ -135,7 +136,7 @@ def build_agent_options(
         agents = build_agent_definitions(
             prompts=mignon_prompts,
             allowed_tools=tool_access.allowed_tools,
-            model=mignon_model if mignon_model is not None else model,
+            models=tuple(mignon_models) if mignon_models else (model,),
             limits=mignon_limits,
         )
     if not set(DISALLOWED_BUILTINS) <= set(tool_access.disallowed_tools):
@@ -197,24 +198,24 @@ def assert_safe_options(options: ClaudeAgentOptions) -> None:
 
 
 def _check_agents(options: ClaudeAgentOptions) -> None:
-    """Sub-agents are only the Mignons: known types, their role's allowed tools, one shared
-    pinned model ID (never an alias such as `inherit`), no permission/MCP/skill/memory
-    overrides, never in background."""
+    """Sub-agents are only the Mignons: `<type>--<model>` names, their role's allowed tools,
+    exactly the model the name pins (never an alias such as `inherit`), no
+    permission/MCP/skill/memory overrides, never in background."""
     agents = options.agents or {}
     if agents and DELEGATION_TOOL not in options.allowed_tools:
         raise AgentOptionsError("sub-agents are defined but Agent is not allowed")
     for name, definition in agents.items():
-        try:
-            role = Role(MignonType(name).value)
-        except ValueError:
-            raise AgentOptionsError(f"sub-agent {name!r} is not a Mignon type") from None
+        parsed = parse_agent_name(name)
+        if parsed is None:
+            raise AgentOptionsError(f"sub-agent {name!r} is not a Mignon type and model")
+        role = Role(parsed[0].value)
         if definition.tools is None or tuple(definition.tools) != role_allowed(
             role, options.allowed_tools
         ):
             raise AgentOptionsError(f"Mignon {name} tools differ from its role")
         model = definition.model
-        if not isinstance(model, str) or not model.strip() or model.lower() in MODEL_ALIASES:
-            raise AgentOptionsError(f"Mignon {name} must use a pinned model ID")
+        if not isinstance(model, str) or model.lower() in MODEL_ALIASES or model != parsed[1]:
+            raise AgentOptionsError(f"Mignon {name} must use the pinned model its name names")
         if definition.background is not False:
             raise AgentOptionsError(f"Mignon {name} must not run in the background")
         if not isinstance(definition.maxTurns, int) or definition.maxTurns < 1:
@@ -229,8 +230,6 @@ def _check_agents(options: ClaudeAgentOptions) -> None:
         )
         if any(o is not None for o in overrides):
             raise AgentOptionsError(f"Mignon {name} overrides a session setting")
-    if len({d.model for d in agents.values()}) > 1:
-        raise AgentOptionsError("every Mignon must use the same pinned model")
 
 
 def _check_server(name: str, config: McpServerConfig) -> None:

@@ -5,6 +5,7 @@ never hot-reload; the runtime stop latch (RunControl) is separate (ADR-0010 item
 """
 
 import base64
+import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -31,6 +32,9 @@ PHASE_EXECUTION_CEILING = ExecutionMode.OFF
 # The cron interval is hourly; the run budget must leave room before the next fire.
 _CRON_INTERVAL_SECONDS = 3600
 # Model aliases the Agent SDK/CLI would resolve to a moving target; settings pin exact IDs.
+# An exact model ID: lowercase alphanumerics and dots in hyphen-separated parts (it must fit
+# into a Mignon agent name, agent/mignons.py).
+MODEL_ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9.]+)*$")
 MODEL_ALIASES = frozenset({"sonnet", "opus", "haiku", "inherit", "default", "best"})
 _FERNET_KEY_BYTES = 32
 
@@ -78,8 +82,9 @@ class Settings(BaseSettings):
 
     ANTHROPIC_API_KEY: SecretStr
     AGENT_MODEL: str = Field(min_length=1)
-    # ADR-0025: exact model ID for the research Mignons; unset means AGENT_MODEL.
-    MIGNON_AGENT_MODEL: str | None = Field(default=None, min_length=1)
+    # ADR-0025: comma-separated exact model IDs the orchestrator may assign to a Mignon;
+    # unset or blank means AGENT_MODEL only.
+    MIGNON_AGENT_MODELS: str | None = None
     MCP_TIMEOUT: PositiveInt = 30000
     # Must exceed the proxy's 10 s margin (agent/proxy.py PROXY_TIMEOUT_MARGIN_SECONDS, ADR-0023).
     MCP_TOOL_TIMEOUT: int = Field(default=60000, gt=10000)
@@ -119,20 +124,36 @@ class Settings(BaseSettings):
         "ROBINHOOD_TOKEN_ENCRYPTION_KEY",
         "HEARTBEAT_URL",
         "ALERT_WEBHOOK_URL",
-        "MIGNON_AGENT_MODEL",
+        "MIGNON_AGENT_MODELS",
         mode="before",
     )
     @classmethod
     def _blank_is_absent(cls, value: object) -> object:
         return None if value == "" else value
 
-    @field_validator("AGENT_MODEL", "MIGNON_AGENT_MODEL")
+    @field_validator("AGENT_MODEL")
     @classmethod
-    def _model_is_pinned(cls, value: str | None) -> str | None:
+    def _model_is_pinned(cls, value: str) -> str:
         """An exact model ID, never an alias the CLI resolves itself (CLAUDE.md §8, §23)."""
-        if value is not None and value.strip().lower() in MODEL_ALIASES:
+        if value.strip().lower() in MODEL_ALIASES:
             raise ValueError(f"must be an exact model ID, not the alias {value!r}")
         return value
+
+    @field_validator("MIGNON_AGENT_MODELS")
+    @classmethod
+    def _mignon_models_are_pinned(cls, value: str | None) -> str | None:
+        """Unique exact model IDs, comma-separated; normalized to `a,b` (no spaces)."""
+        if value is None:
+            return None
+        models = [m.strip() for m in value.split(",")]
+        for model in models:
+            if model.lower() in MODEL_ALIASES:
+                raise ValueError(f"must be exact model IDs, not the alias {model!r}")
+            if not MODEL_ID_PATTERN.fullmatch(model):
+                raise ValueError(f"not an exact model ID: {model!r}")
+        if len(set(models)) != len(models):
+            raise ValueError("model IDs must be unique")
+        return ",".join(models)
 
     @field_validator(
         "ANTHROPIC_API_KEY", "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "WHEELTA_MCP_TOKEN", "DATABASE_URL"
@@ -208,9 +229,12 @@ class Settings(BaseSettings):
         )
 
     @property
-    def mignon_model(self) -> str:
-        """The research Mignons' pinned model (ADR-0025): MIGNON_AGENT_MODEL or AGENT_MODEL."""
-        return self.MIGNON_AGENT_MODEL or self.AGENT_MODEL
+    def mignon_models(self) -> tuple[str, ...]:
+        """Models the orchestrator may assign to a Mignon (ADR-0025): MIGNON_AGENT_MODELS in
+        order, or AGENT_MODEL alone."""
+        if self.MIGNON_AGENT_MODELS:
+            return tuple(self.MIGNON_AGENT_MODELS.split(","))
+        return (self.AGENT_MODEL,)
 
     @property
     def account_last4(self) -> str:
@@ -230,7 +254,7 @@ class Settings(BaseSettings):
             "execution_armed": self.EXECUTION_ARMED,
             "kill_switch": self.KILL_SWITCH,
             "agent_model": self.AGENT_MODEL,
-            "mignon_agent_model": self.mignon_model,
+            "mignon_agent_models": list(self.mignon_models),
             "mcp_timeout_ms": self.MCP_TIMEOUT,
             "mcp_tool_timeout_ms": self.MCP_TOOL_TIMEOUT,
             "robinhood_mcp_url": str(self.ROBINHOOD_MCP_URL),

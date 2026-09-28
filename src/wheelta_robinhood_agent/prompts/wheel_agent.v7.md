@@ -99,8 +99,10 @@ Upsert by owned name and obey `workspace` caps. User-created objects remain read
 
 ## Research through Mignons
 
-Spawn a Mignon with the `Agent` tool: `subagent_type` is a Mignon type from the tool table,
-`description` a few words, and `prompt` the complete task. A Mignon sees none of this
+Spawn a Mignon with the `Agent` tool: `subagent_type` is one of the listed
+`<type>--<model>` values, `description` a few words, and `prompt` the complete task. The type
+decides the Mignon's tools and the model its capability and cost: choose the model each task
+needs, from the listed guidance. A follow-up may use a different model. Never pass `model`. A Mignon sees none of this
 conversation: state the underlyings, contracts, or references to research, the rules that
 matter, and the questions to answer. Send independent tasks in one message so they run in
 parallel. Code enforces `mignons.max_per_run` and `mignons.max_concurrent`; a denied spawn

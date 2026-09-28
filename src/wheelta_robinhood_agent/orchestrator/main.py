@@ -574,7 +574,9 @@ class _Run:
             "workspace_prefix": self.settings.ROBINHOOD_WORKSPACE_PREFIX,
             "policy_version": str(self.rules.version),
             "policy": self.rules.rendered,
-            "available_tools": available_tools_table(plan),
+            "available_tools": available_tools_table(
+                plan, mignon_models=self.settings.mignon_models
+            ),
             "position_book": book.model_dump_json(),
             "owned_orders": json.dumps([r.model_dump(mode="json") for r in owned], sort_keys=True),
             "recent_decisions": "[]",
@@ -589,7 +591,7 @@ class _Run:
                 "prompt_template_hash": rendered.template_sha256,
                 "rendered_prompt_hash": rendered.sha256,
                 "model_id": self.settings.AGENT_MODEL,
-                "mignon_model_id": self.settings.mignon_model if self.mignon_prompts else None,
+                "mignon_models": list(self.settings.mignon_models) if self.mignon_prompts else [],
                 "position_book": book.model_dump(mode="json"),
                 "mignon_prompts": {
                     mignon.value: {

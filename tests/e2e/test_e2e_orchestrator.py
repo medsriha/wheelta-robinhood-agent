@@ -19,8 +19,12 @@ import pytest
 from e2e_fake_cli import FakeCli, FakeModel, FakeToolFailure, factory, world_upstreams
 from e2e_fakes import (
     ACCOUNT_NUMBER,
+    COMPANY,
+    E2E_MODEL,
     FIXTURE_MAPPERS,
     FIXTURE_SCOPE_TABLE,
+    MACRO,
+    MARKET,
     OTHER_ACCOUNT_NICKNAME,
     OTHER_ACCOUNT_NUMBER,
     RAW_MARKER,
@@ -508,7 +512,7 @@ def test_web_cache_hit_denies_an_identical_search(harness: Callable[..., Harness
         return mignon_report("Find the AAPL earnings date.")
 
     async def script(model: FakeModel) -> str | None:
-        turn = await model.spawn("mignon-company", "Find the AAPL earnings date.", company)
+        turn = await model.spawn(COMPANY, "Find the AAPL earnings date.", company)
         assert turn.output["kind"] == "validated", turn.output
         return await dry_run_script(model)
 
@@ -621,7 +625,7 @@ def test_dry_run_delegates_research_and_the_ledger_attributes_every_call(
     h = harness()
     assert h.run() == 0, h.notifier.alert_kinds()
     (cli,) = h.clis
-    assert set(cli.options.agents or {}) == {"mignon-market", "mignon-company", "mignon-macro"}
+    assert set(cli.options.agents or {}) == {MARKET, COMPANY, MACRO}
     assert cli.options.env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
     assert "Mignon `mignon-market`" in str(cli.options.system_prompt)
     with h.conn() as c:
@@ -636,7 +640,7 @@ def test_dry_run_delegates_research_and_the_ledger_attributes_every_call(
     )
     assert spawn.status is ToolCallStatus.SUCCEEDED and spawn.identity.agent_id is None
     for call in (chain, mignon_quote):
-        assert call.identity.agent_type == "mignon-market" and call.identity.agent_id
+        assert call.identity.agent_type == MARKET and call.identity.agent_id
     assert requote.identity.tool == "get_option_quotes" and requote.identity.agent_id is None
     assert all(c.identity.agent_id is None for c in rest)
     assert set(prompt_meta) == {"mignon-market", "mignon-company", "mignon-macro"}
@@ -646,13 +650,13 @@ def test_follow_up_mignon_may_cite_refs_handed_over_by_the_orchestrator(
     harness: Callable[..., Harness],
 ) -> None:
     async def script(model: FakeModel) -> str | None:
-        first = await model.spawn("mignon-market", "Screen AAPL puts.", market_mignon)
+        first = await model.spawn(MARKET, "Screen AAPL puts.", market_mignon)
         ref = first.data["report"]["findings"][0]["refs"][0]
 
         async def follow_up(m: FakeModel) -> str:
             return mignon_report("Check the spread.", ("The screened contract.", [ref]))
 
-        second = await model.spawn("mignon-market", f"Follow up on {ref}: spread?", follow_up)
+        second = await model.spawn(MARKET, f"Follow up on {ref}: spread?", follow_up)
         assert second.output["kind"] == "validated", second.output
         return await dry_run_script(model)
 
@@ -667,7 +671,7 @@ def test_invalid_mignon_report_is_missing_research_not_a_failed_run(
         return mignon_report("Screen.", ("The bid is 9.99.", ["evidence:invented"]))
 
     async def script(model: FakeModel) -> str | None:
-        turn = await model.spawn("mignon-market", "Screen AAPL puts.", liar)
+        turn = await model.spawn(MARKET, "Screen AAPL puts.", liar)
         assert turn.output["kind"] == "missing"
         assert any("not delivered" in g for g in turn.output["gaps"])
         return await dry_run_script(model)
@@ -687,7 +691,7 @@ def test_roles_are_enforced_both_ways(harness: Callable[..., Harness]) -> None:
             "mcp__robinhood__get_option_positions", {"account_number": ACCOUNT_NUMBER}
         )
         assert positions.denied
-        nested = await model.spawn("mignon-macro", "Recurse.", nosy)
+        nested = await model.spawn(MACRO, "Recurse.", nosy)
         assert nested.denied
         return mignon_report("Nothing.")
 
@@ -696,11 +700,9 @@ def test_roles_are_enforced_both_ways(harness: Callable[..., Harness]) -> None:
         assert web.denied and "not available to the orchestrator" in (web.reason or "")
         general = await model.spawn("general-purpose", "Do anything.", nosy)
         assert general.denied and "Mignon type" in (general.reason or "")
-        background = await model.spawn(
-            "mignon-market", "Screen.", market_mignon, run_in_background=True
-        )
+        background = await model.spawn(MARKET, "Screen.", market_mignon, run_in_background=True)
         assert background.denied
-        await model.spawn("mignon-company", "Poke around.", nosy)
+        await model.spawn(COMPANY, "Poke around.", nosy)
         return await dry_run_script(model)
 
     h = harness()
@@ -717,12 +719,39 @@ def test_spawns_stop_at_max_per_run(harness: Callable[..., Harness]) -> None:
         return mignon_report("Nothing to report.")
 
     async def script(model: FakeModel) -> str | None:
-        turns = [await model.spawn("mignon-macro", f"Task {i}.", empty) for i in range(8)]
+        turns = [await model.spawn(MACRO, f"Task {i}.", empty) for i in range(8)]
         assert not any(t.denied for t in turns)
-        ninth = await model.spawn("mignon-macro", "Task 9.", empty)
+        ninth = await model.spawn(MACRO, "Task 9.", empty)
         assert ninth.denied and "max_per_run=8" in (ninth.reason or "")
         return "{}"
 
     h = harness()
     h.run(script)
     assert [n for n, _ in h.world.calls].count("Agent") == 8
+
+
+def test_the_orchestrator_assigns_each_mignon_a_model_from_the_allowlist(
+    harness: Callable[..., Harness],
+) -> None:
+    async def empty(model: FakeModel) -> str:
+        return mignon_report("Nothing to report.")
+
+    async def script(model: FakeModel) -> str | None:
+        cheap = await model.spawn("mignon-macro--claude-haiku-4-5", "Calendar.", empty)
+        assert cheap.output["kind"] == "validated", cheap.output
+        outside = await model.spawn("mignon-macro--claude-sonnet-5", "Calendar.", empty)
+        assert outside.denied and "allowed model" in (outside.reason or "")
+        return await dry_run_script(model)
+
+    h = harness(MIGNON_AGENT_MODELS=f"claude-haiku-4-5,{E2E_MODEL}")
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    (cli,) = h.clis
+    agents = cli.options.agents or {}
+    assert agents["mignon-macro--claude-haiku-4-5"].model == "claude-haiku-4-5"
+    assert agents[MARKET].model == E2E_MODEL and len(agents) == 6
+    prompt = str(cli.options.system_prompt)
+    assert "`mignon-company--claude-haiku-4-5`: $1/$5 per 1M tokens" in prompt
+    with h.conn() as c:
+        types = [r.identity.agent_type for r in tool_call_records(c, h.run_id)]
+    assert "mignon-macro--claude-haiku-4-5" not in types  # the empty Mignon made no call
+    assert MARKET in types  # the dry-run research ran on the session model

@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 from cli_harness.mcp_server import Json
 from cli_harness.model_server import FinalText, RecordedRequest, ToolUse
-from cli_harness.session import ACCOUNT_NUMBER, SERVER, Case, SessionOutcome
+from cli_harness.session import ACCOUNT_NUMBER, MODEL, SERVER, Case, SessionOutcome
 from test_e2e_result_boundary_cli import (
     QUOTES,
     QUOTES_TOOL,
@@ -44,9 +44,10 @@ from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_RE
 pytestmark = [pytest.mark.requires_cli, pytest.mark.allow_hosts(["127.0.0.1"])]
 
 LIMITS = MignonLimits(max_per_run=8, max_concurrent=4, max_turns_per_mignon=10)
+MARKET_T = f"mignon-market--{MODEL}"  # the harness allowlist is the session model
 SPAWN = ToolUse(
     "Agent",
-    {"description": "screen", "prompt": "Screen AAPL puts.", "subagent_type": "mignon-market"},
+    {"description": "screen", "prompt": "Screen AAPL puts.", "subagent_type": MARKET_T},
 )
 POSITIONS_TOOL = ROBINHOOD_REGISTRY.qualified("get_option_positions")
 EVIDENCE_RE = re.compile(r"evidence:[0-9a-f-]{36}")
@@ -106,7 +107,7 @@ def test_mignon_calls_are_attributed_and_its_report_is_replaced(
     calls = {c["tool"]: c for c in out.recorder.requested_calls()}
     assert calls["Agent"].get("agent_id") is None
     quote = calls[QUOTES]
-    assert quote["agent_type"] == "mignon-market" and quote["agent_id"], diagnostics(out)
+    assert quote["agent_type"] == MARKET_T and quote["agent_id"], diagnostics(out)
     assert out.mcp.called(QUOTES) == 1  # through the proxy, correlated by toolUseId
     envelope = agent_result(out)
     assert envelope["kind"] == "validated", envelope
@@ -153,7 +154,7 @@ def test_only_mignon_types_are_offered_and_web_is_denied_to_the_orchestrator(
     (first, *_) = out.model.main_loop()
     assert "Agent" in first.tool_names()
     listing = first.text().split("Available agent types for the Agent tool:", 1)[1][:2000]
-    assert "- mignon-market:" in listing
+    assert f"- {MARKET_T}:" in listing
     for builtin in ("- general-purpose:", "- Explore:", "- Plan:", "- claude:"):
         assert builtin not in listing, listing
     (search,) = [c for c in out.recorder.requested_calls() if c["tool"] == "WebSearch"]
@@ -198,3 +199,22 @@ def test_a_model_override_is_denied_and_no_mignon_starts(monkeypatch: pytest.Mon
     outcome = out.recorder.outcomes_for(out.recorder.ids[agent["sdk_tool_use_id"]])
     assert [o["status"] for o in outcome] == [ToolCallStatus.DENIED]
     assert_never_sent(out, raw)
+
+
+def test_each_spawn_runs_on_the_exact_model_its_agent_name_pins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0025 amendment: the orchestrator picks a model by `subagent_type`; the CLI sends
+    that definition's exact ID, never an alias it resolves itself."""
+    other = "claude-haiku-4-5"
+    spawn = ToolUse("Agent", {**SPAWN.input, "subagent_type": f"mignon-market--{other}"})
+    case = Case(
+        steps=[spawn, FinalText("done")],
+        mignon_steps=[FinalText("{}")],
+        behaviors={},
+        mignons=LIMITS,
+        mignon_models=(MODEL, other),
+    )
+    out = run(case, monkeypatch)
+    assert {r.body.get("model") for r in mignon_requests(out)} == {other}
+    assert {r.body.get("model") for r in out.model.main_loop()} == {MODEL}
