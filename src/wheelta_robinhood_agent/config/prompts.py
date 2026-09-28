@@ -20,12 +20,12 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # AgentDecisionOutput v6.
 ACTIVE_PROMPT_ID = "wheel_agent"
 ACTIVE_PROMPT_VERSION = 9
-# ADR-0025: one prompt per Mignon type; each returns MignonReport v1.
+# ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {
-        MignonType.MARKET: ("mignon_market", 1),
-        MignonType.COMPANY: ("mignon_company", 1),
-        MignonType.MACRO: ("mignon_macro", 1),
+        MignonType.MARKET: ("mignon_market", 2),
+        MignonType.COMPANY: ("mignon_company", 2),
+        MignonType.MACRO: ("mignon_macro", 2),
     }
 )
 

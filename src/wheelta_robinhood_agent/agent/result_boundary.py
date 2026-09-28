@@ -30,7 +30,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from pydantic import JsonValue, ValidationError
 
@@ -170,11 +170,16 @@ class BoundaryValidator:
         if mapper is None and (request.server, request.tool) in CONTEXT_ONLY_TOOLS:
             # ADR-0026: delivered as redacted context with account values dropped. It carries
             # no evidence ref, so it can neither be cited nor back a number or a decision.
+            context = _drop_account_values(redacted)
+            gaps: tuple[str, ...] = (CONTEXT_ONLY_GAP,)
+            if request.tool == RUN_SCAN_TOOL:
+                context, scan_gaps = project_scan(context)
+                gaps += scan_gaps
             return self._envelope(
                 request,
                 EnvelopeKind.VALIDATED,
-                data={"context_only": True, "payload": _drop_account_values(redacted)},
-                gaps=(CONTEXT_ONLY_GAP,),
+                data={"context_only": True, "payload": context},
+                gaps=gaps,
             )
         if mapper is None:
             gap = f"no verified result mapping for {request.server}.{request.tool}"
@@ -256,6 +261,55 @@ def _expand_text_json(value: object, depth: int = 0) -> object:
     if isinstance(value, list | tuple):
         return [_expand_text_json(v, depth + 1) for v in value]
     return value
+
+
+RUN_SCAN_TOOL: Final = "run_scan"
+# ADR-0032: scan rows delivered per call. Well under the proxy's MAX_DELIVERED_CHARS, which
+# also has to fit the envelope around the rows.
+SCAN_CONTEXT_BUDGET_CHARS: Final = 20_000
+# Row columns that repeat a row field (`Symbol` is the row's `ticker`).
+_SCAN_DUPLICATE_COLUMNS: Final = frozenset({"Symbol"})
+
+
+def project_scan(payload: JsonValue) -> tuple[JsonValue, tuple[str, ...]]:
+    """`run_scan` context trimmed to fit delivery (ADR-0032). Pure and deterministic.
+
+    Drops the tool's `guide` prose and each row's duplicate `Symbol` column. It keeps the
+    scan's metadata and, in the scan's own order, as many rows as fit
+    `SCAN_CONTEXT_BUDGET_CHARS`, with a gap naming how many rows were kept. A payload of any
+    other shape is returned unchanged; the proxy's size cap still applies.
+    """
+    data = payload.get("data") if isinstance(payload, dict) else None
+    result = data.get("result") if isinstance(data, dict) else None
+    rows = result.get("results") if isinstance(result, dict) else None
+    if not isinstance(result, dict) or not isinstance(rows, list):
+        return payload, ()
+    trimmed: list[JsonValue] = []
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("columns"), dict):
+            columns = cast(dict[str, JsonValue], row["columns"])
+            row = {
+                **row,
+                "columns": {k: v for k, v in columns.items() if k not in _SCAN_DUPLICATE_COLUMNS},
+            }
+        trimmed.append(row)
+    meta = {k: v for k, v in result.items() if k != "results"}
+    kept: list[JsonValue] = []
+    used = len(json.dumps(meta, sort_keys=True))
+    for row in trimmed:
+        size = len(json.dumps(row, sort_keys=True)) + 2
+        if used + size > SCAN_CONTEXT_BUDGET_CHARS:
+            break
+        kept.append(row)
+        used += size
+    projected: JsonValue = {"data": {"result": {**meta, "results": kept}}}
+    if len(kept) == len(rows):
+        return projected, ()
+    gap = (
+        f"run_scan: showing the first {len(kept)} of {len(rows)} rows in the scan's own order "
+        "(delivery size limit)"
+    )
+    return projected, (gap,)
 
 
 def _drop_account_values(value: JsonValue) -> JsonValue:

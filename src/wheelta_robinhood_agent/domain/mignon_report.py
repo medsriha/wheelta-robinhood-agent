@@ -17,6 +17,7 @@ Rules (each checked here, in pure code):
   URL that was not delivered to this Mignon is an issue.
 """
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Annotated, Final, Literal, Self
@@ -88,13 +89,27 @@ class MignonReportParseFailure:
 MignonReportParseResult = MignonReportParsed | MignonReportParseFailure
 
 
+# The whole text is one fence: ```json or ```, a newline, the body, a newline, ```.
+_ENCLOSING_FENCE: Final = re.compile(r"\A```(?:json)?[ \t]*\n(.*)\n```\Z", re.DOTALL)
+
+
+def strip_json_fence(raw: str | bytes) -> str | bytes:
+    """The body of one fence enclosing the whole (stripped) text, else `raw` unchanged."""
+    if not isinstance(raw, str):
+        return raw
+    match = _ENCLOSING_FENCE.fullmatch(raw.strip())
+    return match.group(1) if match else raw
+
+
 def parse_mignon_report(raw: str | bytes) -> MignonReportParseResult:
     """Strictly parse a Mignon's final text into MignonReport v1. Never raises.
 
-    The text must be exactly one JSON object (surrounding whitespace allowed; no code fences
-    or prose), under the same strict JSON rules as AgentDecisionOutput.
+    The text must be exactly one JSON object (surrounding whitespace allowed; no prose), under
+    the same strict JSON rules as AgentDecisionOutput. ADR-0032: one enclosing ```json (or
+    bare ```) fence around the whole text is removed first; anything else outside the object
+    still fails.
     """
-    loaded = load_strict_json(raw)
+    loaded = load_strict_json(strip_json_fence(raw))
     if isinstance(loaded, ParseIssue):
         return MignonReportParseFailure(ok=False, issues=(loaded,))
     _, data = loaded

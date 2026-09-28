@@ -1041,10 +1041,15 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 }
                 known = mignon_refs.get(agent_id, set()) | handed
                 found = check_report_sources(parsed.report, known, mignon_urls.get(agent_id, set()))
-                issues.extend(f"{i.loc}: {i.message}" for i in found)
+                issues.extend(f"{i.loc}: {i.message}" if i.loc else i.message for i in found)
                 report_data = deps.redactor.redact(parsed.report.model_dump(mode="json"))
             else:
-                issues.extend(f"{i.loc}: {i.message}" for i in parsed.issues)
+                issues.extend(
+                    f"{i.loc}: {i.message}"
+                    if i.loc
+                    else f"report is not one JSON object: {i.message}"
+                    for i in parsed.issues
+                )
             valid = not issues
             if not valid:
                 deps.recorder.store_result(

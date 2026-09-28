@@ -52,7 +52,11 @@ def test_empty_findings_with_gaps_is_valid() -> None:
 @pytest.mark.parametrize(
     ("raw", "kind"),
     [
-        ("```json\n{}\n```", "invalid_json"),
+        ("Here is my report.\n" + json.dumps(doc()), "invalid_json"),  # prose before
+        (json.dumps(doc()) + "\nDone.", "invalid_json"),  # prose after
+        ("```json\n" + json.dumps(doc()) + "\n```\nDone.", "invalid_json"),  # text after fence
+        ("```json\n```json\n" + json.dumps(doc()) + "\n```\n```", "invalid_json"),  # two fences
+        ("```json\n{}\n```", "missing"),  # the fence is removed; the schema still applies
         ("[]", "not_object"),
         ('{"task": "t", "task": "u"}', "duplicate_key"),
         (json.dumps(doc(n=1)), "json_number"),
@@ -100,3 +104,19 @@ def test_parser_never_raises(raw: str) -> None:
 )
 def test_parser_never_raises_on_json(value: Any) -> None:
     parse_mignon_report(json.dumps(value))
+
+
+# -- ADR-0032: one enclosing code fence is removed before the strict parse ----------------------
+
+
+@pytest.mark.parametrize("fence", ["```json", "```", "```json  "])
+def test_one_enclosing_fence_is_accepted(fence: str) -> None:
+    raw = f"  {fence}\n{json.dumps(doc(f('Bid is 1.20.', ('evidence:e-1',))), indent=2)}\n```\n"
+    result = parse_mignon_report(raw)
+    assert isinstance(result, MignonReportParsed), result
+    assert result.report.cited_refs() == {"evidence:e-1"}
+
+
+def test_a_fence_inside_a_claim_is_left_alone() -> None:
+    report = doc(f("Scan note: ```x```", ("evidence:e-1",)))
+    assert parsed(report).report.findings[0].claim == "Scan note: ```x```"
