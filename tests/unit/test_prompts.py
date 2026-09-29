@@ -30,10 +30,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v10_with_expected_placeholders() -> None:
+def test_active_prompt_is_v11_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 10
+    assert template.version == 11
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -126,3 +126,12 @@ def test_orchestrator_prompt_delegates_research() -> None:
     body = load_prompt().body
     assert "## Research through Mignons" in body
     assert "a Mignon's quote" in body and "is research, not the price you order on" in body
+
+
+def test_v11_judges_cash_from_decision_facts_not_raw_snapshot_gaps() -> None:
+    """ADR-0040: the first local dry run stopped on the raw snapshot's missing
+    csp_reserved_cash_usd without requesting facts; v11 says facts decide."""
+    text = load_prompt().text
+    assert "Account\nstate is unavailable only when a required read failed" in text
+    assert "never from the raw snapshot's missing fields" in text
+    assert "Do not skip selection because a raw\nsnapshot field is missing" in text
