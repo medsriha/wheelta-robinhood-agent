@@ -74,6 +74,7 @@ from wheelta_robinhood_agent.agent.session import (
     plan_session,
     run_session_sync,
 )
+from wheelta_robinhood_agent.agent.summary_loader import load_summary_research
 from wheelta_robinhood_agent.agent.trace_loader import load_decision_trace
 from wheelta_robinhood_agent.config.prompts import (
     PromptError,
@@ -91,7 +92,10 @@ from wheelta_robinhood_agent.config.settings import (
     load_settings,
 )
 from wheelta_robinhood_agent.domain.assembly import DecisionsInput, assemble_run_record
-from wheelta_robinhood_agent.domain.decision_output import DecisionOutputParsed
+from wheelta_robinhood_agent.domain.decision_output import (
+    DecisionOutputParsed,
+    DecisionOutputParseFailure,
+)
 from wheelta_robinhood_agent.domain.enums import (
     AppEnv,
     AuditOutcome,
@@ -454,6 +458,7 @@ class _Run:
         # started; the rest is filled in by _finish, _audit and record_next_run.
         self.session_started = False
         self.summary_record: RunRecord | None = None
+        self.summary_diagnostics: list[str] = []
         self.audit_result: AuditResult | None = None
         self.audit_ran = False
         self.next_run: NextRun | None = None
@@ -512,7 +517,12 @@ class _Run:
             self.event(RunEventType.SOURCE_STATUS, obs.model_dump(mode="json"))
 
     def finalize(self, status: RunStatus, reason: str | None) -> int:
-        self.event(RunEventType.STATUS, {"reason": reason} if reason else None, status=status)
+        payload: dict[str, object] = {"reason": reason} if reason else {}
+        if self.summary_diagnostics:
+            payload["diagnostic_details"] = [
+                self.redactor.redact_text(detail) for detail in self.summary_diagnostics
+            ]
+        self.event(RunEventType.STATUS, payload or None, status=status)
         _heartbeat(self.settings, self.deps, status, self.run_id, self.slot, reason)
         if self.session_started:
             self.send_summary(status, reason)
@@ -529,6 +539,22 @@ class _Run:
             return
         try:
             audit = self.audit_result
+            research_unavailable = None
+            try:
+                candidates, reports = load_summary_research(self.conn, self.run_id)
+            except Exception as exc:  # noqa: BLE001 - preserve the email if context loading fails
+                candidates, reports = (), ()
+                research_unavailable = type(exc).__name__
+            audit_details = (
+                tuple(
+                    f"{f.check_id.value} {f.outcome.value}: {f.detail}"
+                    for f in audit.findings
+                    if f.outcome is not AuditOutcome.PASS
+                )
+                + tuple(f"{e.check_id.value}: {e.error_type}: {e.message}" for e in audit.errors)
+                if audit is not None
+                else ()
+            )
             summary = RunSummaryInput(
                 run_id=str(self.run_id),
                 environment=self.settings.APP_ENV,
@@ -539,6 +565,11 @@ class _Run:
                 effective_execution_mode=self.settings.effective_execution_mode,
                 order_venue=self.order_venue,
                 record=self.summary_record,
+                candidates=candidates,
+                research_reports=reports,
+                research_unavailable=research_unavailable,
+                diagnostic_details=tuple(self.summary_diagnostics),
+                audit_details=audit_details,
                 audit_status=(
                     (audit.status.value if audit is not None else AuditStatus.FAILED.value)
                     if self.audit_ran
@@ -620,6 +651,9 @@ class _Run:
         except Exception as exc:  # noqa: BLE001 - fail closed: record, alert via heartbeat
             self.log.exception("run failed", extra={"error_type": type(exc).__name__})
             self.metrics.error(type(exc).__name__)
+            self.summary_diagnostics.append(
+                self.redactor.redact_text(f"Orchestrator: {type(exc).__name__}: {exc}")
+            )
             return self.finalize(RunStatus.FAILED, f"error:{type(exc).__name__}")
 
     def _execute(self) -> int:
@@ -972,6 +1006,11 @@ class _Run:
             SessionStatus.NOT_STARTED
         )
         if session is not None:
+            self.summary_diagnostics.extend(session.error_details)
+            self.summary_diagnostics.extend(
+                f"Source unavailable: {source}: {reason}"
+                for source, reason in session.withheld.items()
+            )
             self.observe_sources(session.observations[len(plan.observations) :])
             if session.eligibility is not None:
                 # Only the configured account's redacted eligibility is persisted (§9, §24).
@@ -1005,6 +1044,13 @@ class _Run:
             )
         meta = self.meta(prompt=prompt, model_id=(session.model_id if session else None))
         decisions, output_id = load_decisions(self.conn, self.run_id)
+        if isinstance(decisions, DecisionOutputParseFailure):
+            self.summary_diagnostics.extend(
+                f"Invalid agent output at {i.loc or '(root)'}: {i.message} ({i.kind})"
+                for i in decisions.issues
+            )
+        elif decisions is None:
+            self.summary_diagnostics.append("No final decision output was recorded.")
         record = self._assemble(meta, book, decisions, output_id)
         self.summary_record = record
         audit_ok = self._audit(meta, book, decisions, record)
@@ -1080,6 +1126,9 @@ class _Run:
         except Exception as exc:  # noqa: BLE001 - assembly failure is recorded; audit still runs
             self.log.exception("assembly failed", extra={"error_type": type(exc).__name__})
             self.metrics.error(f"assembly:{type(exc).__name__}")
+            self.summary_diagnostics.append(
+                self.redactor.redact_text(f"Record assembly: {type(exc).__name__}: {exc}")
+            )
             return None
         for decision_record in record.decisions:
             for leg in decision_record.legs:
@@ -1121,6 +1170,9 @@ class _Run:
             result: AuditResult | None = run_audit(context)
         except Exception as exc:  # noqa: BLE001 - an audit that cannot run is a failed audit
             self.log.exception("audit failed", extra={"error_type": type(exc).__name__})
+            self.summary_diagnostics.append(
+                self.redactor.redact_text(f"Audit: {type(exc).__name__}: {exc}")
+            )
             result = None
         self.audit_ran = True
         self.audit_result = result

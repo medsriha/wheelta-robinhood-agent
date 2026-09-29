@@ -457,6 +457,7 @@ class SessionResult:
     output_id: uuid.UUID | None = None
     interrupted: bool = False
     error: str | None = None
+    error_details: tuple[str, ...] = ()
     model_id: str | None = None
     tool_drift: list[str] = field(default_factory=list)
     # The trusted Agentic-eligibility check (proxied Robinhood only); None if it did not run.
@@ -900,6 +901,11 @@ async def _converse(
                     text = message.result
                 elif message.is_error:
                     result.error = f"result error ({message.subtype})"
+                    result.error_details = tuple(
+                        deps.redactor.redact_text(detail)
+                        for detail in (message.errors or [])
+                        + ([message.result] if message.result else [])
+                    )
         return text
 
     async with anyio.create_task_group() as tg:
@@ -1022,6 +1028,7 @@ async def _run_client(
     except Exception as exc:  # noqa: BLE001 - SDK/transport failure: recorded, never retried
         result.status = SessionStatus.FAILED
         result.error = f"session failed ({type(exc).__name__})"
+        result.error_details = (deps.redactor.redact_text(f"{type(exc).__name__}: {exc}"),)
     finally:
         with contextlib.suppress(Exception), anyio.move_on_after(DISCONNECT_TIMEOUT_SECONDS):
             await client.disconnect()

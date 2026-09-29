@@ -22,6 +22,7 @@ from wheelta_robinhood_agent.domain.enums import (
     RunStatus,
 )
 from wheelta_robinhood_agent.domain.gating import executes_orders, with_default_venue
+from wheelta_robinhood_agent.domain.mignon_report import MignonReport
 from wheelta_robinhood_agent.domain.orders import Attempt, ReasonCode
 from wheelta_robinhood_agent.domain.run_record import LegRecord, RunRecord, UnassociatedAction
 from wheelta_robinhood_agent.observability.redaction import Redactor
@@ -29,6 +30,17 @@ from wheelta_robinhood_agent.observability.redaction import Redactor
 SUBJECT_PREFIX = "[Wheelta agent]"
 FACTS_HEADING = "Recorded facts (authoritative)"
 PROSE_UNAVAILABLE = "The written summary is unavailable for this run; the recorded facts follow."
+
+
+class ConsideredOption(BaseModel):
+    """A candidate delivered during research, with recorded limitations, not inferred motives."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_ref: str
+    underlying: str
+    occ_symbol: str
+    gaps: tuple[str, ...] = ()
 
 
 class RunSummaryInput(BaseModel):
@@ -55,6 +67,11 @@ class RunSummaryInput(BaseModel):
     next_run_at: AwareDatetime | None = None
     next_run_source: str | None = None
     next_run_rationale: str | None = None
+    candidates: tuple[ConsideredOption, ...] = ()
+    research_reports: tuple[MignonReport, ...] = ()
+    diagnostic_details: tuple[str, ...] = ()
+    audit_details: tuple[str, ...] = ()
+    research_unavailable: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -140,6 +157,8 @@ def _leg_facts(leg: LegRecord) -> dict[str, JsonValue]:
         "expiration": leg.expiration.isoformat() if leg.expiration is not None else None,
         "target_quantity": leg.target_quantity,
         "conditional": leg.conditional,
+        "reason_codes": [c.value for c in leg.reason_codes],
+        "gaps": [f"{g.field}: {g.detail}" for g in leg.gaps],
         "attempts": [_attempt_facts(a) for a in leg.attempts],
     }
 
@@ -156,9 +175,16 @@ def _record_facts(record: RunRecord) -> dict[str, JsonValue]:
                 "decision_ref": d.decision_ref,
                 "action": d.action.value,
                 "underlying": d.underlying,
+                "target_ref": d.target_ref,
+                "replacement_ref": d.replacement_ref,
                 "rationale": d.rationale,
                 "thesis": d.thesis,
                 "invalidation_conditions": list(d.invalidation_conditions),
+                "gaps": [f"{g.field}: {g.detail}" for g in d.gaps],
+                "metrics": [
+                    {"name": m.name, "value": _num(m.value.value), "unit": m.unit}
+                    for m in d.metrics
+                ],
                 "legs": [_leg_facts(leg) for leg in d.legs],
             }
             for d in record.decisions
@@ -178,9 +204,44 @@ def _record_facts(record: RunRecord) -> dict[str, JsonValue]:
             }
             for u in record.unassociated_actions
         ],
-        "gaps": len(record.gaps),
-        "assembly_findings": [f.code for f in record.findings],
+        "gaps": [f"{g.field}: {g.detail}" for g in record.gaps],
+        "metrics": [
+            {"name": m.name, "value": _num(m.value.value), "unit": m.unit} for m in record.metrics
+        ],
+        "assembly_findings": [f"{f.code}: {f.detail}" for f in record.findings],
     }
+
+
+def _candidate_facts(summary: RunSummaryInput) -> list[dict[str, JsonValue]]:
+    decisions = summary.record.decisions if summary.record is not None else ()
+    complete = (
+        summary.record is not None and summary.record.decision_output_status.value == "parsed"
+    )
+    candidates: list[dict[str, JsonValue]] = []
+    for candidate in summary.candidates:
+        selected = [
+            d
+            for d in decisions
+            if candidate.candidate_ref in (d.target_ref, d.replacement_ref)
+            or any(str(leg.occ_symbol) == candidate.occ_symbol for leg in d.legs)
+        ]
+        candidates.append(
+            {
+                "candidate_ref": candidate.candidate_ref,
+                "underlying": candidate.underlying,
+                "occ_symbol": candidate.occ_symbol,
+                "selection": "selected" if selected else "not selected" if complete else "unknown",
+                "rationales": [d.rationale for d in selected],
+                "gaps": list(candidate.gaps),
+                "research_findings": [
+                    finding.claim
+                    for report in summary.research_reports
+                    for finding in report.findings
+                    if candidate.candidate_ref in finding.refs
+                ],
+            }
+        )
+    return candidates
 
 
 def _unassociated(action: UnassociatedAction) -> tuple[str | None, str | None]:
@@ -216,10 +277,15 @@ def summary_facts(summary: RunSummaryInput, redactor: Redactor) -> dict[str, Jso
             "orders_sent_to_broker": summary.order_venue is OrderVenue.BROKER,
         },
         "record": _record_facts(summary.record) if summary.record is not None else None,
+        "candidates": [c for c in _candidate_facts(summary)],
+        "research_reports": [r.model_dump(mode="json") for r in summary.research_reports],
+        "research_unavailable": summary.research_unavailable,
+        "diagnostic_details": list(summary.diagnostic_details),
         "audit": {
             "status": summary.audit_status,
             "violations": summary.audit_violations,
             "unverifiable": summary.audit_unverifiable,
+            "details": list(summary.audit_details),
         },
         "alerts": list(summary.alerts),
         "next_run": {
@@ -270,6 +336,22 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
         f"(requested {summary.requested_execution_mode.value})",
     ]
     record = summary.record
+    if summary.status in (RunStatus.FAILED, RunStatus.TIMED_OUT, RunStatus.STOPPED):
+        explanations = {
+            "invalid_agent_output": "The agent's final decision output was missing or invalid.",
+            "audit_failed": "The post-run audit could not complete.",
+            "deadline": "The run exhausted its time budget and the session was stopped.",
+            "sigterm": "The session was stopped by SIGTERM.",
+            "sigint": "The session was stopped by SIGINT.",
+            "infrastructure_failure": "An infrastructure failure stopped the session.",
+        }
+        lines.append(
+            "Failure / stop reason: "
+            + explanations.get(
+                summary.reason or "", summary.reason or "No failure reason was recorded."
+            )
+        )
+    lines.extend(f"Diagnostic: {detail}" for detail in summary.diagnostic_details)
     if record is None:
         lines.append("Run record: not assembled (see the ledger for recorded events)")
     else:
@@ -280,12 +362,26 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
         for d in record.decisions:
             underlying = f" {d.underlying}" if d.underlying else ""
             lines.append(f"- {d.action.value}{underlying} [{d.decision_ref}]")
+            lines.append(f"    Why: {d.rationale}")
+            if d.thesis:
+                lines.append(f"    Thesis: {d.thesis}")
+            lines.extend(f"    Reconsider if: {c}" for c in d.invalidation_conditions)
+            lines.extend(f"    Data gap: {g.field}: {g.detail}" for g in d.gaps)
+            lines.extend(
+                f"    {m.name}: {_num(m.value.value) or 'unknown'} {m.unit}" for m in d.metrics
+            )
             for leg in d.legs:
                 lines.append(f"    {_leg_line(leg)}")
+                lines.extend(f"      Data gap: {g.field}: {g.detail}" for g in leg.gaps)
+                if leg.reason_codes:
+                    lines.append("      Reasons: " + ", ".join(c.value for c in leg.reason_codes))
                 for attempt in leg.attempts:
                     lines.append(f"      {_attempt_line(attempt)}")
         for c in record.cancellations:
             lines.append(f"- cancel: {c.status.value}")
+        lines.extend(
+            f"- cancellation rationale: {c.rationale}" for c in record.cancellation_rationales
+        )
         for u in record.unassociated_actions:
             status, order_id = _unassociated(u)
             what = " · ".join(
@@ -298,15 +394,57 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
             )
         for q in record.unresolved_questions:
             lines.append(f"- open question: {q.question}")
+        lines.extend(f"Data gap: {g.field}: {g.detail}" for g in record.gaps)
+        lines.extend(
+            f"{m.name}: {_num(m.value.value) or 'unknown'} {m.unit}" for m in record.metrics
+        )
+        lines.extend(f"Assembly finding: {f.code}: {f.detail}" for f in record.findings)
+    lines.append("Candidates encountered during research (selection is not execution):")
+    for candidate_model, candidate in zip(
+        summary.candidates, _candidate_facts(summary), strict=True
+    ):
+        lines.append(
+            f"- {candidate['underlying']} {candidate['occ_symbol']} "
+            f"[{candidate['candidate_ref']}]: {candidate['selection']}"
+        )
+        if candidate["selection"] == "not selected":
+            lines.append(
+                "    No separate rejection rationale recorded; see decisions and research below."
+            )
+        elif candidate["selection"] == "unknown":
+            lines.append("    Selection unknown because valid final decisions are unavailable.")
+        lines.extend(f"    Data gap: {gap}" for gap in candidate_model.gaps)
+        lines.extend(
+            f"    Cited research: {finding.claim}"
+            for report in summary.research_reports
+            for finding in report.findings
+            if candidate_model.candidate_ref in finding.refs
+        )
+    if not summary.candidates:
+        lines.append(
+            "No candidate list recorded; this does not establish that none were considered."
+        )
+    if summary.research_unavailable:
+        lines.append(f"Research context unavailable: {summary.research_unavailable}")
+    for report in summary.research_reports:
+        lines.append(f"Research task: {report.task}")
+        for finding in report.findings:
+            refs = ", ".join((*finding.refs, *finding.web_urls))
+            lines.append(f"- Research finding (not a final decision): {finding.claim} [{refs}]")
+        lines.extend(f"- Research gap: {gap}" for gap in report.gaps)
+        lines.extend(f"- Research question: {q}" for q in report.follow_up_questions)
     audit = summary.audit_status or "not run"
     lines.append(
         f"Audit: {audit} · {summary.audit_violations} violation(s) · "
         f"{summary.audit_unverifiable} unverifiable check(s)"
     )
     lines.append("Alerts: " + (", ".join(summary.alerts) if summary.alerts else "none"))
+    lines.extend(f"Audit detail: {detail}" for detail in summary.audit_details)
     if summary.next_run_at is not None:
         source = f" ({summary.next_run_source})" if summary.next_run_source else ""
         lines.append(f"Next run not before: {summary.next_run_at.isoformat()}{source}")
+        if summary.next_run_rationale:
+            lines.append(f"Next run rationale: {summary.next_run_rationale}")
     return redactor.redact_text("\n".join(lines))
 
 

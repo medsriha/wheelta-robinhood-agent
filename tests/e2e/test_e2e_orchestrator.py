@@ -1232,6 +1232,8 @@ def test_completed_session_sends_one_summary_email(harness: Callable[..., Harnes
     assert summary.effective_execution_mode is ExecutionMode.OFF
     assert summary.order_venue is OrderVenue.SIMULATED
     assert summary.record is not None and len(summary.record.decisions) == 1
+    assert summary.candidates and summary.research_reports
+    assert summary.research_unavailable is None
     assert summary.audit_status == "completed" and summary.audit_violations == 0
     # ADR-0038: an on-demand dry run schedules nothing.
     assert summary.next_run_at is None and summary.next_run_source is None
@@ -1260,6 +1262,7 @@ def test_failed_session_still_sends_a_summary_email(harness: Callable[..., Harne
     (summary,) = h.mailer.summaries
     assert summary.status is RunStatus.FAILED and summary.reason == "invalid_agent_output"
     assert "invalid_agent_output" in summary.alerts
+    assert any("Invalid agent output at" in d for d in summary.diagnostic_details)
 
 
 def test_timed_out_session_sends_a_summary_email(harness: Callable[..., Harness]) -> None:
@@ -1276,6 +1279,41 @@ def test_timed_out_session_sends_a_summary_email(harness: Callable[..., Harness]
     assert h.run(script) == 2
     (summary,) = h.mailer.summaries
     assert summary.status is RunStatus.TIMED_OUT
+
+
+def test_summary_includes_redacted_sdk_error_details(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = FakeCli._result
+
+    def failed_result(self: FakeCli, text: str | None, *, error: bool) -> dict[str, Any]:
+        result = original(self, text, error=True)
+        result["errors"] = [f"Provider overloaded for account {ACCOUNT_NUMBER}"]
+        return result
+
+    monkeypatch.setattr(FakeCli, "_result", failed_result)
+    h = harness()
+    assert h.run() == 1
+    (summary,) = h.mailer.summaries
+    assert summary.reason == "result error (error_during_execution)"
+    assert any("Provider overloaded" in d for d in summary.diagnostic_details)
+    assert ACCOUNT_NUMBER not in repr(summary.diagnostic_details)
+
+
+def test_summary_context_failure_still_sends_outcome_and_decisions(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable(*args: Any) -> Any:
+        raise RuntimeError("research could not be loaded")
+
+    monkeypatch.setattr(
+        "wheelta_robinhood_agent.orchestrator.main.load_summary_research", unavailable
+    )
+    h = harness()
+    assert h.run() == 0
+    (summary,) = h.mailer.summaries
+    assert summary.record is not None and summary.record.decisions
+    assert summary.research_unavailable == "RuntimeError"
 
 
 @pytest.mark.parametrize(

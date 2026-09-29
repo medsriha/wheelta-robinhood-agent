@@ -17,6 +17,7 @@ from wheelta_robinhood_agent.domain.enums import (
     OrderVenue,
     RunStatus,
 )
+from wheelta_robinhood_agent.domain.mignon_report import MignonReport
 from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.orders import Attempt, ReasonCode
 from wheelta_robinhood_agent.domain.run_record import (
@@ -32,6 +33,7 @@ from wheelta_robinhood_agent.observability.redaction import Redactor
 from wheelta_robinhood_agent.observability.run_summary import (
     FACTS_HEADING,
     PROSE_UNAVAILABLE,
+    ConsideredOption,
     RunSummaryInput,
     build_subject,
     placed_count,
@@ -293,4 +295,84 @@ def test_bodies_fall_back_when_prose_is_missing() -> None:
 
 def test_prose_is_redacted() -> None:
     text, html = render_bodies(f"Account {ACCOUNT} is fine.", "x", REDACTOR)
+    assert ACCOUNT not in text and ACCOUNT not in html
+
+
+def test_decision_context_survives_prose_failure() -> None:
+    summary = _input(
+        _record(_decision(_proposal(), invalidation_conditions=("Thesis weakens.",))),
+        candidates=(
+            ConsideredOption(candidate_ref="candidate:1", underlying="AAPL", occ_symbol=str(OCC)),
+            ConsideredOption(
+                candidate_ref="candidate:2",
+                underlying="MSFT",
+                occ_symbol="MSFT  261016P00400000",
+                gaps=("quote: no fresh bid",),
+            ),
+        ),
+        research_reports=(
+            MignonReport(
+                task="Compare put candidates",
+                findings=(
+                    {
+                        "claim": "MSFT was passed over because earnings are approaching.",
+                        "refs": ("candidate:2",),
+                        "web_urls": (),
+                    },
+                ),
+                gaps=(),
+                follow_up_questions=("Recheck after earnings?",),
+            ),
+        ),
+        next_run_at=T0,
+        next_run_rationale="Wait for refreshed quotes.",
+    )
+    facts = summary_facts(summary, REDACTOR)
+    assert [c["selection"] for c in facts["candidates"]] == ["selected", "not selected"]
+    text, html = render_bodies(None, render_facts_text(summary, REDACTOR), REDACTOR)
+    for expected in (
+        "Why: Cash covers it",
+        "Thesis: Durable business",
+        "Reconsider if: Thesis weakens",
+        "MSFT was passed over because earnings are approaching.",
+        "quote: no fresh bid",
+        "Recheck after earnings?",
+        "Next run rationale: Wait for refreshed quotes.",
+    ):
+        assert expected in text and expected in html
+    assert ACCOUNT not in text and ACCOUNT not in html
+
+
+def test_missing_decisions_do_not_turn_candidates_into_rejections() -> None:
+    summary = _input(
+        None,
+        status=RunStatus.FAILED,
+        reason="invalid_agent_output",
+        candidates=(
+            ConsideredOption(candidate_ref="candidate:1", underlying="AAPL", occ_symbol=str(OCC)),
+        ),
+    )
+    facts = summary_facts(summary, REDACTOR)
+    assert facts["candidates"][0]["selection"] == "unknown"
+    text = render_facts_text(summary, REDACTOR)
+    assert "final decision output was missing or invalid" in text
+    assert "Selection unknown" in text
+    assert "not selected" not in text
+
+
+def test_failure_and_audit_diagnostics_are_redacted_and_html_escaped() -> None:
+    summary = _input(
+        None,
+        status=RunStatus.FAILED,
+        reason="audit_failed",
+        diagnostic_details=(f"Record assembly: ValueError: <bad account {ACCOUNT}>",),
+        audit_details=("V1: RuntimeError: cannot load rules",),
+    )
+    facts = summary_facts(summary, REDACTOR)
+    assert ACCOUNT not in repr(facts)
+    text, html = render_bodies(None, render_facts_text(summary, REDACTOR), REDACTOR)
+    assert "post-run audit could not complete" in text
+    assert "Record assembly: ValueError:" in text
+    assert "V1: RuntimeError: cannot load rules" in text
+    assert "<bad account" not in html and "&lt;bad account" in html
     assert ACCOUNT not in text and ACCOUNT not in html

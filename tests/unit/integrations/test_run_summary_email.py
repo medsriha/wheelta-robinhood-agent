@@ -30,6 +30,7 @@ from wheelta_robinhood_agent.observability.logging import configure_logging
 from wheelta_robinhood_agent.observability.redaction import Redactor
 from wheelta_robinhood_agent.observability.run_summary import (
     PROSE_UNAVAILABLE,
+    ConsideredOption,
     RunSummaryInput,
 )
 
@@ -96,11 +97,11 @@ def _config(**kw: Any) -> RunSummaryEmailConfig:
     return RunSummaryEmailConfig(**base)
 
 
-def _send(router: Router, **kw: Any) -> Any:
+def _send(router: Router, *, summary: RunSummaryInput = SUMMARY, **kw: Any) -> Any:
     client = httpx.Client(transport=httpx.MockTransport(router))
     sleeps: list[float] = []
     result = send_run_summary(
-        SUMMARY, config=_config(**kw), client=client, redactor=REDACTOR, sleep=sleeps.append
+        summary, config=_config(**kw), client=client, redactor=REDACTOR, sleep=sleeps.append
     )
     return result, sleeps
 
@@ -144,6 +145,34 @@ def test_prose_failure_still_sends_the_facts(anthropic: list[Any]) -> None:
     assert len(router.requests["api.anthropic.com"]) == 1  # never retried
     sent = json.loads(router.requests["api.resend.com"][0].content)
     assert sent["text"].startswith(PROSE_UNAVAILABLE)
+
+
+def test_failure_context_reaches_writer_and_delivered_fallback_without_secrets() -> None:
+    summary = SUMMARY.model_copy(
+        update={
+            "status": RunStatus.FAILED,
+            "reason": "session_failed",
+            "diagnostic_details": (f"PermissionError: invalid credential {ANTHROPIC_KEY}",),
+            "candidates": (
+                ConsideredOption(
+                    candidate_ref="candidate:aapl",
+                    underlying="AAPL",
+                    occ_symbol="AAPL  261016P00190000",
+                ),
+            ),
+        }
+    )
+    router = Router(anthropic=[httpx.Response(529)])
+    result, _ = _send(router, summary=summary)
+    assert result.status is EmailDeliveryStatus.SENT and not result.prose_written
+    request_body = json.loads(router.requests["api.anthropic.com"][0].content)
+    facts = json.loads(request_body["messages"][0]["content"])
+    assert "PermissionError" in facts["diagnostic_details"][0]
+    assert facts["candidates"][0]["selection"] == "unknown"
+    sent = json.loads(router.requests["api.resend.com"][0].content)
+    assert "PermissionError" in sent["text"] and "PermissionError" in sent["html"]
+    assert "AAPL  261016P00190000" in sent["text"]
+    assert ANTHROPIC_KEY not in repr(facts) and ANTHROPIC_KEY not in repr(sent)
 
 
 def test_disabled_or_unconfigured_skips_without_any_request() -> None:
