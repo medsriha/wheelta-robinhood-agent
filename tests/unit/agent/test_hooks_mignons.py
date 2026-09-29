@@ -6,6 +6,7 @@ PostToolUse(Agent). Same fakes as test_hooks.py.
 
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -31,7 +32,7 @@ from test_hooks import (
 )
 
 from wheelta_robinhood_agent.agent.account_scope import NOT_SCOPED
-from wheelta_robinhood_agent.agent.hooks import EnvelopeKind
+from wheelta_robinhood_agent.agent.hooks import EnvelopeKind, last_assistant_text
 from wheelta_robinhood_agent.agent.local_server import LOCAL_REGISTRY
 from wheelta_robinhood_agent.agent.mignons import MignonLimits
 from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolCallStatus, ToolTier
@@ -391,3 +392,154 @@ def test_a_mignon_on_a_model_outside_the_allowlist_is_unknown() -> None:
 def test_the_orchestrator_picks_among_allowed_models() -> None:
     s = session(mignon_models=(TEST_MODEL, "claude-haiku-4-5"))
     assert_ok(s.pre("Agent", {**SPAWN, "subagent_type": "mignon-company--claude-haiku-4-5"}))
+
+
+# ---- report repair by patch (ADR-0047) ------------------------------------------------------
+
+
+def transcript(tmp_path: Path, *texts: str) -> str:
+    """A CLI transcript whose assistant messages are `texts` (the last is the final one)."""
+    path = tmp_path / f"agent-{uuid.uuid4().hex}.jsonl"
+    lines = [json.dumps({"type": "user", "message": {"content": "task"}})]
+    for text in texts:
+        message = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        lines.append(json.dumps({"type": "assistant", "message": message}))
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+def stop_hook(s: Session, path: str | None, agent: dict[str, str] = MARKET) -> Any:
+    callback = s.hooks["SubagentStop"][0].hooks[0]
+    data = {
+        "hook_event_name": "SubagentStop",
+        "stop_hook_active": False,
+        "agent_transcript_path": path,
+        **agent,
+    }
+    return drive(callback(data, None, {"signal": None}))
+
+
+def test_uncited_finding_gets_patch_feedback_and_is_merged(tmp_path: Path) -> None:
+    s = session()
+    spawn_and_research(s)
+    original = report(
+        finding("The regime is calm.", [EVIDENCE]),
+        finding("VIX is 15.9.", urls=[URL]),
+        finding("No source."),
+    )
+    out = stop_hook(s, transcript(tmp_path, original))
+    assert out["decision"] == "block"
+    assert "findings.1" in out["reason"] and "findings.2" in out["reason"]
+    assert "findings.0" not in out["reason"] and '"patches"' in out["reason"]
+    patch = json.dumps(
+        {
+            "patches": [
+                {"finding": "1", "refs": [EVIDENCE], "web_urls": []},
+                {"finding": "2", "drop": True},
+            ]
+        }
+    )
+    assert stop_hook(s, transcript(tmp_path, original, patch)) == {}
+    out = s.post("Agent", agent_response(patch), use_id="toolu_agent")
+    envelope = delivered_envelope(out)
+    assert envelope["kind"] == "validated"
+    findings = envelope["data"]["report"]["findings"]
+    assert [f["claim"] for f in findings] == ["The regime is calm.", "VIX is 15.9."]
+    assert findings[1]["refs"] == [EVIDENCE]
+    assert envelope["data"]["repair"] == {
+        "finding_origins": [0, 1],
+        "patched": [1],
+        "dropped": [2],
+    }
+    (raw,) = [r for k, r in s.rec.results.values() if k.value == "raw_invalid"]
+    assert raw["text"] == original and raw["patches"] == [patch]
+
+
+def test_patch_indexes_stay_those_of_the_original_report(tmp_path: Path) -> None:
+    s = session()
+    spawn_and_research(s)
+    original = report(finding("No source."), finding("Bid is 1.20.", urls=[URL]))
+    assert stop_hook(s, transcript(tmp_path, original))["decision"] == "block"
+    first = json.dumps({"patches": [{"finding": "0", "drop": True}]})
+    out = stop_hook(s, transcript(tmp_path, first))
+    # Finding 1 is still wrong and is named by its ORIGINAL index after finding 0 was dropped.
+    assert out["decision"] == "block" and "findings.1" in out["reason"]
+    second = json.dumps({"patches": [{"finding": "1", "refs": [EVIDENCE], "web_urls": []}]})
+    assert stop_hook(s, transcript(tmp_path, second)) == {}
+    envelope = delivered_envelope(s.post("Agent", agent_response(second), use_id="toolu_agent"))
+    assert envelope["kind"] == "validated"
+    assert envelope["data"]["repair"]["finding_origins"] == [1]
+
+
+def test_repairs_stop_after_the_limit_and_the_report_stays_invalid(tmp_path: Path) -> None:
+    s = session()
+    spawn_and_research(s)
+    original = report(finding("No source."))
+    useless = json.dumps({"patches": [{"finding": "0", "claim": "Still no source."}]})
+    assert stop_hook(s, transcript(tmp_path, original))["decision"] == "block"
+    assert stop_hook(s, transcript(tmp_path, useless))["decision"] == "block"
+    assert stop_hook(s, transcript(tmp_path, useless)) == {}  # MAX_MIGNON_REPAIRS reached
+    envelope = delivered_envelope(s.post("Agent", agent_response(useless), use_id="toolu_agent"))
+    assert envelope["kind"] == "missing"
+    assert any("at least one ref" in g for g in envelope["gaps"])
+
+
+def test_a_bad_patch_is_named_in_the_next_feedback(tmp_path: Path) -> None:
+    s = session()
+    spawn_and_research(s)
+    assert stop_hook(s, transcript(tmp_path, report(finding("No source."))))["decision"] == "block"
+    out = stop_hook(s, transcript(tmp_path, '{"patches": [{"finding": "7", "drop": true}]}'))
+    assert out["decision"] == "block" and "no finding 7" in out["reason"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        report(finding("The put bid is 1.20.", [EVIDENCE])),  # valid: nothing to repair
+        "Not a report at all.",  # no object: PostToolUse reports it
+        '{"task": "t", "findings": [], "gaps": [], "follow_up_questions": [], "x": "y"}',
+    ],
+)
+def test_stop_is_allowed_when_patching_cannot_help(tmp_path: Path, text: str) -> None:
+    s = session()
+    spawn_and_research(s)
+    assert stop_hook(s, transcript(tmp_path, text)) == {}
+
+
+def test_stop_is_allowed_without_a_transcript_or_for_a_non_mignon(tmp_path: Path) -> None:
+    s = session()
+    spawn_and_research(s)
+    assert stop_hook(s, str(tmp_path / "missing.jsonl")) == {}
+    assert stop_hook(s, None) == {}
+    other = {"agent_id": "x", "agent_type": "general-purpose"}
+    assert stop_hook(s, transcript(tmp_path, report(finding("No source."))), other) == {}
+    s.deps.run_control.request_stop(StopReason.DEADLINE, NOW)
+    assert stop_hook(s, transcript(tmp_path, report(finding("No source.")))) == {}
+
+
+def test_last_assistant_text_reads_the_final_message(tmp_path: Path) -> None:
+    path = tmp_path / "t.jsonl"
+    tool_use = {"type": "tool_use", "id": "t", "name": "x", "input": {}}
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "assistant", "message": {"content": [tool_use]}}),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {"type": "text", "text": "a"},
+                                {"type": "text", "text": "b"},
+                            ]
+                        },
+                    }
+                ),
+                "not json",
+                json.dumps({"type": "user", "message": {"content": "later"}}),
+            ]
+        )
+    )
+    assert last_assistant_text(str(path)) == "ab"
+    assert last_assistant_text(str(tmp_path / "none.jsonl")) is None
+    assert last_assistant_text(5) is None

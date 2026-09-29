@@ -29,6 +29,13 @@ and concurrent counts. PostToolUse(Agent) parses the Mignon's final text as a Mi
 resolves its refs/URLs against what that Mignon was delivered, records it, and replaces the
 Agent result with a validated or missing envelope (`mignon_report_output`).
 
+Mignon repair (ADR-0047): `SubagentStop` reads the Mignon's final text from its transcript and
+checks it. If only findings have issues, it blocks the stop with the issues by finding index,
+and the Mignon replies with patches to those findings only (`ReportPatch`). Code applies them
+to the original by index, at most `MAX_MIGNON_REPAIRS` times, and PostToolUse(Agent) validates
+the merged report as above and tells the orchestrator which original findings were patched or
+dropped. The stop-hook check is advisory; PostToolUse(Agent) decides.
+
 Any recording, lookup, or validation failure sets the stop latch, denies or replaces the
 output with an error envelope, and returns `continue_=False`. Raw tool output is never
 passed through for an MCP tool. SDK keys verified against claude-agent-sdk 0.2.160
@@ -43,8 +50,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from claude_agent_sdk import HookContext, HookMatcher
 from claude_agent_sdk.types import (
@@ -87,6 +95,7 @@ from wheelta_robinhood_agent.agent.tool_access import ALLOWED_BUILTINS
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
 from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules
 from wheelta_robinhood_agent.config.settings import Settings
+from wheelta_robinhood_agent.domain.decision_output import ParseIssue, load_strict_json
 from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
     OrderVenue,
@@ -96,8 +105,14 @@ from wheelta_robinhood_agent.domain.enums import (
 from wheelta_robinhood_agent.domain.gating import check_venue, executes_orders, order_venue
 from wheelta_robinhood_agent.domain.mignon_report import (
     REF_PREFIXES,
+    PatchedReport,
+    apply_report_patch,
     check_report_sources,
+    extract_report_object,
+    original_report,
     parse_mignon_report,
+    parse_report_patch,
+    report_issues,
 )
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry, ToolSpec
@@ -525,6 +540,77 @@ def _report_text(tool_response: object) -> tuple[str, str, str] | None:
     return agent_id, agent_type, "".join(cast(list[str], texts))
 
 
+# ADR-0047: feedback rounds a Mignon gets to patch its report's findings.
+MAX_MIGNON_REPAIRS: Final = 2
+MAX_TRANSCRIPT_BYTES: Final = 20_000_000
+_FINDING_LOC: Final = re.compile(r"^findings\.(\d+)")
+
+
+def last_assistant_text(path: object) -> str | None:
+    """The text of the last assistant message in a CLI transcript (JSONL), or None when the
+    file is missing, too large, or has no assistant text."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        file = Path(path)
+        if file.stat().st_size > MAX_TRANSCRIPT_BYTES:
+            return None
+        lines = file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        texts = [
+            b["text"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+        ]
+        if texts:
+            return "".join(texts)
+    return None
+
+
+def repair_feedback(issues: list[str], attempt: int) -> str:
+    """The SubagentStop block reason: the issues and the patch-only reply format."""
+    return (
+        f"Your report did not validate (repair {attempt} of {MAX_MIGNON_REPAIRS}). Fix only "
+        "these findings; do not rewrite or repeat the report. Issues:\n"
+        + "\n".join(f"- {i}" for i in issues)
+        + "\n\nReply with one JSON object of patches. `finding` is the finding's index in your "
+        "original report, as a digit string:\n"
+        '{"patches": [{"finding": "1", "refs": ["evidence:..."]}, {"finding": "3", "drop": true}]}'
+        "\nA patch replaces only the fields it gives (claim, refs, web_urls). Cite only refs "
+        "delivered to you and URLs you fetched; a claim with a digit needs a code-issued ref. "
+        "Drop a finding you cannot source."
+    )
+
+
+@dataclass
+class _MignonDraft:
+    """A Mignon's report under repair: the merged report so far and every text it sent."""
+
+    report: PatchedReport
+    texts: list[str]
+    attempts: int = 0
+
+
+def _original_loc(loc: str, origins: tuple[int, ...]) -> str | None:
+    """`findings.<merged index>...` rewritten to the original index; None if not a finding."""
+    match = _FINDING_LOC.match(loc)
+    if match is None or int(match.group(1)) >= len(origins):
+        return None
+    return f"findings.{origins[int(match.group(1))]}{loc[match.end() :]}"
+
+
 def _order_tool_denial(deps: HookDeps, server: str) -> str | None:
     """Why a live option-order tool is denied this run, or None (ADR-0034, ADR-0038).
 
@@ -546,7 +632,8 @@ def _order_tool_denial(deps: HookDeps, server: str) -> str | None:
 
 
 def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
-    """Build the PreToolUse, PostToolUse, PostToolUseFailure, and SubagentStart hooks."""
+    """Build the PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, and SubagentStop
+    hooks."""
     calls: dict[str, _Call] = {}
     # Mignon bookkeeping: spawns so far, Agent calls in flight, and per Mignon (`agent_id`)
     # the refs delivered to it and the URLs it fetched. `run_refs` is every ref delivered to
@@ -556,6 +643,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     mignon_refs: dict[str, set[str]] = {}
     mignon_urls: dict[str, set[str]] = {}
     run_refs: set[str] = set()
+    # ADR-0047: reports under repair, by Mignon `agent_id`.
+    drafts: dict[str, _MignonDraft] = {}
     ws = deps.rules.workspace
     prefix = deps.workspace_prefix
     owned_caps = {
@@ -1083,7 +1172,13 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             issues: list[str] = []
             if agent_type != call.effective_input.get("subagent_type"):
                 issues.append("agent type differs from the requested Mignon type")
-            parsed = parse_mignon_report(text)
+            draft = drafts.pop(agent_id, None)
+            repaired = draft is not None and draft.attempts > 0
+            if draft is not None and repaired:
+                # ADR-0047: the merged report replaces the last reply (a patch).
+                parsed = parse_mignon_report(json.dumps(draft.report.data))
+            else:
+                parsed = parse_mignon_report(text)
             report_data: JsonValue = None
             if parsed.ok:
                 prompt = call.effective_input.get("prompt")
@@ -1104,20 +1199,40 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                     for i in parsed.issues
                 )
             valid = not issues
-            if not valid:
+            if draft is not None and repaired:
+                # The original report and every patch stay on record (restricted evidence).
+                deps.recorder.store_result(
+                    call.tool_call_id,
+                    ResultKind.RAW_INVALID,
+                    {
+                        "agent_id": agent_id,
+                        "text": deps.redactor.redact_text(draft.texts[0]),
+                        "patches": [deps.redactor.redact_text(t) for t in draft.texts[1:]],
+                    },
+                )
+            elif not valid:
                 deps.recorder.store_result(
                     call.tool_call_id,
                     ResultKind.RAW_INVALID,
                     {"agent_id": agent_id, "text": deps.redactor.redact_text(text)},
                 )
+            data: dict[str, JsonValue] = {
+                "mignon_type": agent_type,
+                "agent_id": agent_id,
+                "report": report_data,
+            }
+            if draft is not None and repaired:
+                data["repair"] = {
+                    "finding_origins": list(draft.report.origins),
+                    "patched": list(draft.report.patched),
+                    "dropped": list(draft.report.dropped),
+                }
             envelope = ResultEnvelope(
                 tool_call_id=call.tool_call_id,
                 server=BUILTIN_SERVER,
                 tool=DELEGATION_TOOL,
                 kind=EnvelopeKind.VALIDATED if valid else EnvelopeKind.MISSING,
-                data={"mignon_type": agent_type, "agent_id": agent_id, "report": report_data}
-                if valid
-                else None,
+                data=data if valid else None,
                 gaps=tuple(deps.redactor.redact_text(i) for i in issues),
                 retrieved_at=now,
             )
@@ -1188,6 +1303,63 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 ),
             )
         )
+
+    def review_draft(agent_id: str, text: str) -> str | None:
+        """Check a Mignon's latest reply; the block reason if it should patch findings."""
+        draft = drafts.get(agent_id)
+        extra: list[str] = []
+        if draft is None:
+            loaded = load_strict_json(extract_report_object(text))
+            if isinstance(loaded, ParseIssue) or not isinstance(loaded[1], dict):
+                return None  # not a report object: PostToolUse(Agent) reports it
+            draft = drafts[agent_id] = _MignonDraft(
+                report=original_report(cast(dict[str, object], loaded[1])), texts=[text]
+            )
+        else:
+            draft.texts.append(text)
+            patch = parse_report_patch(text)
+            applied = patch if isinstance(patch, tuple) else apply_report_patch(draft.report, patch)
+            if isinstance(applied, tuple):
+                extra = [f"your patch: {i.loc}: {i.message}" for i in applied]
+            else:
+                draft.report = applied
+        found = report_issues(
+            draft.report.data,
+            mignon_refs.get(agent_id, set()) | run_refs,
+            mignon_urls.get(agent_id, set()),
+        )
+        if not found and not extra:
+            return None
+        located = [(_original_loc(i.loc, draft.report.origins), i.message) for i in found]
+        if any(loc is None for loc, _ in located) or draft.attempts >= MAX_MIGNON_REPAIRS:
+            return None  # not repairable by patch, or out of rounds
+        draft.attempts += 1
+        issues = extra + [f"{loc}: {message}" for loc, message in located]
+        return repair_feedback(issues, draft.attempts)
+
+    async def subagent_stop(
+        input_data: HookInput, tool_use_id: str | None, context: HookContext
+    ) -> HookJSONOutput:
+        """ADR-0047: ask a Mignon to patch the findings its report got wrong (advisory)."""
+        data = cast(Mapping[str, Any], input_data)
+        agent_id = data.get("agent_id")
+        if (
+            not isinstance(agent_id, str)
+            or role_of(data.get("agent_type"), deps.mignon_models) is None
+            or deps.run_control.stop_requested
+        ):
+            return SyncHookJSONOutput()
+        text = last_assistant_text(data.get("agent_transcript_path"))
+        if text is None:
+            return SyncHookJSONOutput()
+        try:
+            reason = review_draft(agent_id, text)
+        except Exception:  # noqa: BLE001 - advisory only; PostToolUse(Agent) still decides
+            drafts.pop(agent_id, None)
+            return SyncHookJSONOutput()
+        if reason is None:
+            return SyncHookJSONOutput()
+        return SyncHookJSONOutput(decision="block", reason=deps.redactor.redact_text(reason))
 
     async def subagent_start(
         input_data: HookInput, tool_use_id: str | None, context: HookContext
@@ -1271,4 +1443,5 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             HookMatcher(matcher=None, hooks=[post_tool_use_failure], timeout=timeout)
         ],
         "SubagentStart": [HookMatcher(matcher=None, hooks=[subagent_start], timeout=timeout)],
+        "SubagentStop": [HookMatcher(matcher=None, hooks=[subagent_stop], timeout=timeout)],
     }

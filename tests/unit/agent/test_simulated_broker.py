@@ -14,6 +14,7 @@ from wheelta_robinhood_agent.agent.mapped_evidence import MappingRequest
 from wheelta_robinhood_agent.agent.result_boundary import extract_mcp_payload
 from wheelta_robinhood_agent.agent.robinhood_mappers import (
     map_option_orders,
+    map_option_positions,
     map_order_cancel,
     map_order_placement,
     map_order_review,
@@ -90,8 +91,13 @@ class FakeUpstream:
     server = "robinhood"
     tools = (UpstreamTool("get_option_orders", None, {}),)
 
-    def __init__(self, orders: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        orders: list[dict[str, Any]] | None = None,
+        positions: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.orders = orders or []
+        self.positions = positions or []
         self.calls: list[str] = []
 
     async def call_tool(
@@ -100,7 +106,9 @@ class FakeUpstream:
         assert not name.endswith("_order") and not name.startswith("exercise"), name
         self.calls.append(name)
         payload: dict[str, Any] = {"data": {"orders": [dict(o) for o in self.orders]}}
-        if name != "get_option_orders":
+        if name == "get_option_positions":
+            payload = {"data": {"positions": [dict(p) for p in self.positions]}}
+        elif name != "get_option_orders":
             payload = {"data": {"other": True}}
         text = json.dumps(payload)
         return UpstreamResult({"content": [{"type": "text", "text": text}]}, len(text))
@@ -129,6 +137,7 @@ def mapped(tool: str, args: Mapping[str, Any], payload: Any) -> Any:
         "place_option_order": map_order_placement,
         "cancel_option_order": map_order_cancel,
         "get_option_orders": map_option_orders,
+        "get_option_positions": map_option_positions,
     }[tool]
     request = MappingRequest(
         tool_call_id=uuid.uuid4(),
@@ -152,30 +161,99 @@ def test_review_is_clean_and_passes_the_verified_mapper() -> None:
     assert upstream.calls == []
 
 
-def test_place_stays_working_and_reads_back_until_cancelled() -> None:
+def test_place_fills_in_full_at_the_limit_and_cannot_be_cancelled() -> None:
+    """ADR-0046: a simulated order fills at once, so the agent has no reason to walk it."""
     upstream = FakeUpstream()
     broker = _broker(upstream)
     placed = mapped("place_option_order", ORDER, call(broker, "place_option_order", ORDER))
     (order,) = placed.broker_orders
-    assert order.state_raw == "confirmed" and order.pending_quantity == 2
-    assert order.processed_quantity == 0 and order.executions == ()
+    assert order.state_raw == "filled" and order.processed_quantity == 2
+    assert order.pending_quantity == 0 and order.canceled_quantity == 0
+    (execution,) = order.executions
+    assert execution.quantity == 2 and execution.price == Decimal("1.79")
+    assert execution.executed_at == NOW
     assert str(order.legs[0].occ_symbol) == str(INSTRUMENT.occ_symbol)
     account = {"account_number": ORDER["account_number"]}
     read = mapped("get_option_orders", account, call(broker, "get_option_orders", account))
-    (working,) = read.open_orders[0].orders
-    assert working.broker_order_ref == order.broker_order_id and working.unfilled_quantity == 2
-    cancel_args = {**account, "order_id": order.broker_order_id}
-    ack = mapped(
-        "cancel_option_order", cancel_args, call(broker, "cancel_option_order", cancel_args)
-    )
-    assert ack.cancel_requests[0].accepted
-    after = mapped("get_option_orders", account, call(broker, "get_option_orders", account))
-    (listed,) = after.broker_orders
-    assert listed.state_raw == "cancelled" and listed.canceled_quantity == 2
-    assert after.open_orders[0].orders == ()
+    (listed,) = read.broker_orders
+    assert listed.state_raw == "filled" and read.open_orders[0].orders == ()
     with pytest.raises(UpstreamUnavailable, match="not open"):
-        call(broker, "cancel_option_order", cancel_args)
-    assert upstream.calls == ["get_option_orders", "get_option_orders"]
+        call(broker, "cancel_option_order", {**account, "order_id": order.broker_order_id})
+    assert upstream.calls == ["get_option_orders"]
+
+
+def test_a_fill_shows_as_a_short_position() -> None:
+    broker = _broker()
+    call(broker, "place_option_order", ORDER)
+    account = {"account_number": ORDER["account_number"], "nonzero": True}
+    payload = call(broker, "get_option_positions", account)
+    (row,) = payload["data"]["positions"]
+    assert row["option_id"] == IID and row["type"] == "short" and row["quantity"] == "2"
+    evidence = mapped("get_option_positions", account, payload)
+    (pending,) = evidence.pending_option_positions
+    (held,) = pending.rows
+    assert (held.broker_instrument_id, held.short_quantity, held.multiplier) == (IID, 2, 100)
+
+
+def _short(quantity: str) -> dict[str, Any]:
+    return {
+        "option_id": IID,
+        "chain_symbol": "SPY",
+        "type": "short",
+        "quantity": quantity,
+        "trade_value_multiplier": "100.0000",
+        "average_price": "-150.0000",
+    }
+
+
+def test_fills_adjust_a_real_short_row_and_close_it() -> None:
+    upstream = FakeUpstream(positions=[_short("3")])
+    broker = _broker(upstream)
+    account = {"account_number": ORDER["account_number"]}
+    call(broker, "get_option_positions", account)  # the real short is known this run
+    close = {**ORDER, "legs": [{"option_id": IID, "side": "buy", "position_effect": "close"}]}
+    call(broker, "place_option_order", {**close, "quantity": "2"})
+    (row,) = call(broker, "get_option_positions", account)["data"]["positions"]
+    assert row["quantity"] == "1" and row["average_price"] == "-150.0000"
+    call(broker, "place_option_order", {**close, "quantity": "1"})
+    (row,) = call(broker, "get_option_positions", account)["data"]["positions"]
+    assert row["quantity"] == "0"  # the mapper skips a zero row: the position is closed
+    with pytest.raises(UpstreamUnavailable, match="no short position"):
+        call(broker, "place_option_order", {**close, "quantity": "1"})
+
+
+def test_a_close_without_a_known_short_is_refused() -> None:
+    close = {**ORDER, "legs": [{"option_id": IID, "side": "buy", "position_effect": "close"}]}
+    with pytest.raises(UpstreamUnavailable, match="no short position"):
+        call(_broker(), "place_option_order", close)
+
+
+@pytest.mark.parametrize(
+    "leg",
+    [
+        {"option_id": IID, "side": "buy", "position_effect": "open"},
+        {"option_id": IID, "side": "sell", "position_effect": "close"},
+    ],
+)
+def test_only_sell_to_open_and_buy_to_close_are_simulated(leg: dict[str, Any]) -> None:
+    with pytest.raises(UpstreamUnavailable, match="only sell-to-open and buy-to-close"):
+        call(_broker(), "place_option_order", {**ORDER, "legs": [leg]})
+
+
+def test_positions_overlay_lists_new_rows_on_the_first_page_only() -> None:
+    upstream = FakeUpstream()
+    broker = _broker(upstream)
+    call(broker, "place_option_order", ORDER)
+    later = call(broker, "get_option_positions", {"account_number": "x", "cursor": "p2"})
+    assert later["data"]["positions"] == []
+
+
+def test_an_unchanged_positions_read_passes_through_verbatim() -> None:
+    broker = _broker(FakeUpstream(positions=[_short("1")]))
+    result = asyncio.run(
+        broker.call_tool("get_option_positions", {"account_number": "x"}, timeout_seconds=5)
+    )
+    assert "structuredContent" not in result.response
 
 
 def test_place_ref_id_is_idempotent() -> None:
@@ -215,8 +293,8 @@ def test_an_unchanged_read_passes_through_verbatim() -> None:
 @pytest.mark.parametrize(
     ("args", "listed"),
     [
-        ({"state": "confirmed"}, True),
-        ({"state": "filled"}, False),
+        ({"state": "confirmed"}, False),
+        ({"state": "filled"}, True),
         ({"placed_agent": "agentic"}, True),
         ({"placed_agent": "user"}, False),
         ({"created_at_gte": (NOW - timedelta(hours=1)).isoformat()}, True),

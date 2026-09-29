@@ -10,20 +10,27 @@ without any order reaching Robinhood:
   unregistered name) is answered here or refused with an `UpstreamError`. Nothing else in the
   run can send one: the proxy is the only path to the upstream (ADR-0023).
 - `review_option_order`: the request echoed back, `order_checks` `{}` (clean), no quotes.
-- `place_option_order`: the order is accepted and stays working (`confirmed`, nothing filled,
-  owner decision 2026-09-28). The contract comes from this run's `get_option_instruments`
-  evidence; an instrument not read this run (or without a verified multiplier) is refused.
-- `cancel_option_order`: accepted for a working simulated order, or for a working real order
-  a `get_option_orders` read showed this run; the order then reads `cancelled`. Anything else
-  is refused, as the broker would.
+- `place_option_order`: the order fills in full at its limit price, with one execution
+  (ADR-0046, owner decision 2026-09-29; it replaced "stays working"). The contract comes from
+  this run's `get_option_instruments` evidence; an instrument not read this run (or without a
+  verified multiplier) is refused, and so is a buy-to-close for more than the short quantity
+  known this run (a positions read plus this run's fills).
+- `cancel_option_order`: a simulated order is already filled, so cancelling one is refused,
+  as the broker would. A working real order a `get_option_orders` read showed this run is
+  accepted and then reads `cancelled`. Anything else is refused.
 - `get_option_orders` is read from Robinhood and overlaid: this run's simulated orders are
   listed first (the list is newest first), and simulated cancellations of real orders are
-  applied. Other reads pass through unchanged, so real positions and cash never reflect a
-  simulated order (the facts service derives reservations from the orders read).
+  applied.
+- `get_option_positions` is read from Robinhood and overlaid with this run's fills: a
+  sell-to-open adds to (or creates) the contract's short row, a buy-to-close reduces it.
+  Only a first-page read lists a new row. `get_portfolio` passes through unchanged: whether
+  the broker's `cash` nets short-put collateral is unverified, and the facts service already
+  treats CSP reserved cash as unavailable while any short put is held.
 
 State lives only in this object, for one session: nothing carries over to another run (owner
-decision 2026-09-28). The ledger records every call, and `BrokerLedger` records the simulated
-orders under a per-run scope (`simulated_scope_id`), never the account's own scope.
+decisions 2026-09-28 and 2026-09-29). The ledger records every call, and `BrokerLedger`
+records the simulated orders, fills, and lineages under a per-run scope
+(`simulated_scope_id`), never the account's own scope.
 
 Responses follow the captured output schemas
 (`tests/fixtures/robinhood/output_schemas_orders_2026-09-28.json`) so they pass the same
@@ -60,6 +67,7 @@ REVIEW_TOOL: Final = "review_option_order"
 PLACE_TOOL: Final = "place_option_order"
 CANCEL_TOOL: Final = "cancel_option_order"
 ORDERS_TOOL: Final = "get_option_orders"
+POSITIONS_TOOL: Final = "get_option_positions"
 SIMULATED_SCOPE_PREFIX: Final = "simulated:"
 # Names that act on orders; never forwarded whatever their registry tier.
 _ORDER_ACTION: Final = re.compile(r"^(review|place|replace|cancel|exercise)_")
@@ -155,6 +163,12 @@ class SimulatedBroker:
     # Real orders a read showed working this run, and those cancelled in simulation.
     _real_working: set[str] = field(default_factory=set)
     _real_cancelled: dict[str, str] = field(default_factory=dict)
+    # ADR-0046: net short contracts this run's fills added (+) or closed (-), by option id,
+    # and the instrument each names.
+    _short_delta: dict[str, int] = field(default_factory=dict)
+    _filled_instruments: dict[str, OptionInstrument] = field(default_factory=dict)
+    # Short quantity per option id in the latest real positions read this run.
+    _real_short: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.upstream.server != self.registry.server:
@@ -194,6 +208,8 @@ class SimulatedBroker:
         result = await self.upstream.call_tool(name, arguments, timeout_seconds=timeout_seconds)
         if name == ORDERS_TOOL:
             return self._overlay_orders(arguments, result)
+        if name == POSITIONS_TOOL:
+            return self._overlay_positions(arguments, result)
         return result
 
     # ---------------------------------------------------------------------------- requests
@@ -267,31 +283,39 @@ class SimulatedBroker:
         ref_id = _text(arguments.get("ref_id"))
         if ref_id is not None and ref_id in self._ref_ids:
             return {"data": {"order": dict(self._orders[self._ref_ids[ref_id]])}}
+        opening = req.leg.side == "sell" and req.leg.position_effect == "open"
+        closing = req.leg.side == "buy" and req.leg.position_effect == "close"
+        if not (opening or closing):
+            raise _Refused("only sell-to-open and buy-to-close are simulated")
+        option_id = req.leg.option_id
+        if closing and self._short_held(option_id) < req.quantity:
+            raise _Refused("no short position of that size to close")
         now = self.clock().isoformat()
         occ = req.instrument.occ_symbol
         order_id = str(self.id_factory())
+        premium = Decimal(req.price) * req.quantity * req.multiplier
         order: dict[str, JsonValue] = {
             "id": order_id,
             "chain_symbol": occ.root,
-            "state": "confirmed",
+            "state": "filled",
             "type": "limit",
             "trigger": "immediate",
             "direction": "credit" if req.leg.side == "sell" else "debit",
             "quantity": str(req.quantity),
-            "processed_quantity": "0",
-            "pending_quantity": str(req.quantity),
+            "processed_quantity": str(req.quantity),
+            "pending_quantity": "0",
             "canceled_quantity": "0",
             "price": req.price,
             "stop_price": None,
-            "processed_premium": "0",
+            "processed_premium": str(premium),
             "trade_value_multiplier": str(req.multiplier),
             "time_in_force": req.time_in_force,
             "market_hours": req.market_hours,
             "placed_agent": "agentic",
             "created_at": now,
             "updated_at": now,
-            "last_transaction_at": None,
-            "is_replaceable": True,
+            "last_transaction_at": now,
+            "is_replaceable": False,
             "legs": [
                 {
                     **self._leg_json(req.leg),
@@ -299,14 +323,28 @@ class SimulatedBroker:
                     "expiration_date": occ.expiration.isoformat(),
                     "strike_price": str(occ.strike),
                     "option_type": "put" if occ.right is OptionRight.PUT else "call",
-                    "executions": [],
+                    "executions": [
+                        {
+                            "id": str(self.id_factory()),
+                            "price": req.price,
+                            "quantity": str(req.quantity),
+                            "timestamp": now,
+                        }
+                    ],
                 }
             ],
         }
         self._orders[order_id] = order
         if ref_id is not None:
             self._ref_ids[ref_id] = order_id
+        change = req.quantity if opening else -req.quantity
+        self._short_delta[option_id] = self._short_delta.get(option_id, 0) + change
+        self._filled_instruments[option_id] = req.instrument
         return {"data": {"order": dict(order)}}
+
+    def _short_held(self, option_id: str) -> int:
+        """Short contracts known this run: the latest real read plus this run's fills."""
+        return self._real_short.get(option_id, 0) + self._short_delta.get(option_id, 0)
 
     def _cancel(self, arguments: Mapping[str, Any]) -> dict[str, JsonValue]:
         if _text(arguments.get("account_number")) is None:
@@ -318,7 +356,7 @@ class SimulatedBroker:
         order = self._orders.get(order_id)
         if order is not None:
             if order["state"] not in _WORKING:
-                raise _Refused("the order is not open")
+                raise _Refused("the order is not open")  # every simulated order is filled
             pending = order["pending_quantity"]
             order.update(
                 state="cancelled",
@@ -404,3 +442,57 @@ class SimulatedBroker:
             return result
         orders: list[JsonValue] = [*simulated, *real]
         return _result({**payload, "data": {**data, "orders": orders}})
+
+    def _new_short_row(self, option_id: str, quantity: int) -> dict[str, JsonValue]:
+        instrument = self._filled_instruments[option_id]
+        occ = instrument.occ_symbol
+        return {
+            "option_id": option_id,
+            "chain_symbol": occ.root,
+            "type": "short",
+            "quantity": str(quantity),
+            "trade_value_multiplier": str(instrument.multiplier),
+            "expiration_date": occ.expiration.isoformat(),
+        }
+
+    def _overlay_positions(
+        self, arguments: Mapping[str, Any], result: UpstreamResult
+    ) -> UpstreamResult:
+        """This run's fills applied to a real positions read (module docstring)."""
+        try:
+            kind, payload = extract_mcp_payload(result.response)
+        except (PayloadError, TypeError, ValueError):
+            return result
+        if kind is not PayloadKind.OK or not isinstance(payload, dict):
+            return result
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return result
+        listed = data.get("positions")
+        if listed is not None and not isinstance(listed, list):
+            return result
+        rows: list[JsonValue] = []
+        seen: set[str] = set()
+        for row in listed or []:
+            option_id = row.get("option_id") if isinstance(row, dict) else None
+            if not isinstance(row, dict) or not isinstance(option_id, str):
+                rows.append(row)
+                continue
+            seen.add(option_id)
+            real = _count(row.get("quantity")) if row.get("type") == "short" else None
+            if real is not None:
+                self._real_short[option_id] = real
+            delta = self._short_delta.get(option_id, 0)
+            if delta == 0 or real is None:
+                rows.append(row)
+                continue
+            rows.append({**row, "quantity": str(max(real + delta, 0))})
+        first_page = not arguments.get(_CURSOR)
+        added = [
+            self._new_short_row(option_id, delta)
+            for option_id, delta in self._short_delta.items()
+            if first_page and delta > 0 and option_id not in seen
+        ]
+        if not added and rows == (listed or []):
+            return result
+        return _result({**payload, "data": {**data, "positions": [*added, *rows]}})

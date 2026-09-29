@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions, Transport
@@ -130,16 +132,18 @@ class FakeModel:
         prompt: str,
         mignon: Script,
         description: str = "research",
+        repair: Script | None = None,
         **extra: Any,
     ) -> ToolTurn:
-        """An `Agent` call whose Mignon runs `mignon`; `extra` adds tool inputs."""
+        """An `Agent` call whose Mignon runs `mignon`; `extra` adds tool inputs. `repair`
+        answers a SubagentStop block (ADR-0047); without it the Mignon repeats its text."""
         tool_input = {
             "description": description,
             "prompt": prompt,
             "subagent_type": subagent_type,
             **extra,
         }
-        return await self._cli.agent_call(tool_input, mignon, self.agent)
+        return await self._cli.agent_call(tool_input, mignon, self.agent, repair)
 
     @property
     def interrupted(self) -> bool:
@@ -163,6 +167,8 @@ class FakeCli(Transport):
         # one, the model repeats its previous final text and calls no tool.
         self.followup = followup
         self.final_texts: list[str | None] = []
+        self.repair_reasons: list[str] = []
+        self._transcripts = Path(tempfile.mkdtemp(prefix="fake-cli-"))
         self.model_inputs: list[Any] = []
         self.turns: list[ToolTurn] = []
         self.user_messages: list[str] = []
@@ -423,7 +429,11 @@ class FakeCli(Transport):
         return self._deliver(ToolTurn(name, False, output=visible, context=context), stop=stop)
 
     async def agent_call(
-        self, tool_input: dict[str, Any], mignon: Script, caller: tuple[str, str] | None
+        self,
+        tool_input: dict[str, Any],
+        mignon: Script,
+        caller: tuple[str, str] | None,
+        repair: Script | None = None,
     ) -> ToolTurn:
         """One `Agent` call: hooks, the Mignon's run, and its hand-back (module docstring)."""
         name = "Agent"
@@ -453,6 +463,28 @@ class FakeCli(Transport):
         if any(o.get("continue") is False for o in await self._hook("SubagentStart", name, start)):
             raise ScriptStopped("SubagentStart stopped the session")
         text = await mignon(FakeModel(self, (agent_id, agent_type)))
+        texts = [text or ""]
+        # Like the real CLI: SubagentStop fires as the Mignon finishes; a block sends the
+        # reason back to the Mignon, which replies and tries to stop again (ADR-0047).
+        for _ in range(5):
+            path = self._transcript(agent_id, texts)
+            stop = {
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "agent_transcript_path": path,
+                "stop_hook_active": len(texts) > 1,
+            }
+            outs = await self._hook("SubagentStop", name, stop)
+            blocked = next((o for o in outs if o.get("decision") == "block"), None)
+            if blocked is None:
+                break
+            self.repair_reasons.append(str(blocked.get("reason")))
+            reply = repair or (lambda _model: _returning(texts[-1]))
+            texts.append(
+                await reply(FakeModel(self, (agent_id, agent_type), message=blocked["reason"]))
+                or ""
+            )
+        text = texts[-1]
         response = {
             "status": "completed",
             "prompt": tool_input.get("prompt"),
@@ -472,6 +504,21 @@ class FakeCli(Transport):
                 visible = _decode_mcp_output(replaced)
             stop = stop or out.get("continue") is False
         return self._deliver(ToolTurn(name, False, output=visible), stop=stop)
+
+    def _transcript(self, agent_id: str, texts: list[str]) -> str:
+        """A JSONL transcript of the Mignon's replies, as the CLI keeps one per sub-agent."""
+        path = self._transcripts / f"agent-{agent_id}.jsonl"
+        lines = [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": t}]},
+                }
+            )
+            for t in texts
+        ]
+        path.write_text("\n".join(lines) + "\n")
+        return str(path)
 
     def _deliver(self, turn: ToolTurn, stop: bool = False) -> ToolTurn:
         self.turns.append(turn)

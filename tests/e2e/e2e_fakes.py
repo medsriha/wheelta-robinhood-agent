@@ -433,9 +433,9 @@ SIMULATED_MAPPERS = {
 }
 
 
-def simulated_price_walk_script(advance: Callable[[], None]) -> Callable[[FakeModel], Any]:
-    """`simulated_order_script`, then a second, lower price step on the same contract after
-    the first step's cancel is confirmed, itself cancelled and confirmed."""
+def simulated_second_order_script(advance: Callable[[], None]) -> Callable[[FakeModel], Any]:
+    """`simulated_order_script`, then a second order on the same contract after the first
+    one's fill is confirmed (ADR-0046: simulated orders fill at once)."""
 
     async def script(model: FakeModel) -> str | None:
         output = await _simulated_orders(model, advance)
@@ -459,17 +459,15 @@ async def _step(model: FakeModel, advance: Callable[[], None], price: str) -> No
     await model.call("mcp__robinhood__review_option_order", order)
     advance()
     placed = await model.call("mcp__robinhood__place_option_order", order)
-    order_id = placed.data["evidence"]["broker_orders"][0]["broker_order_id"]
-    advance()
-    await model.call("mcp__robinhood__cancel_option_order", {**account, "order_id": order_id})
+    assert placed.data["evidence"]["broker_orders"][0]["state_raw"] == "filled"
     advance()
     await model.call("mcp__robinhood__get_option_orders", account)
 
 
 def simulated_order_script(advance: Callable[[], None]) -> Callable[[FakeModel], Any]:
-    """Research, then review, place, read, cancel, and read again one SPY put: the live order
-    procedure against the simulated broker. Returns the unsubmitted AAPL proposal. `advance`
-    moves the fake clock between broker steps, as real time would."""
+    """Research, then review, place, and read back one SPY put: the live order procedure
+    against the simulated broker, where the order fills at once (ADR-0046). Returns the
+    unsubmitted AAPL proposal. `advance` moves the fake clock between broker steps."""
 
     async def script(model: FakeModel) -> str | None:
         return await _simulated_orders(model, advance)
@@ -496,19 +494,11 @@ async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> st
     placed = await model.call("mcp__robinhood__place_option_order", order)
     assert not placed.denied and placed.output["kind"] == "validated", placed.output
     advance()
-    working = await model.call("mcp__robinhood__get_option_orders", account)
-    assert working.output["kind"] == "validated", working.output
-    (listed,) = working.data["evidence"]["broker_orders"]
-    assert listed["state_raw"] == "confirmed" and listed["pending_quantity"] == 1
-    advance()
-    cancel = await model.call(
-        "mcp__robinhood__cancel_option_order",
-        {**account, "order_id": listed["broker_order_id"]},
-    )
-    assert cancel.output["kind"] == "validated", cancel.output
-    final = await model.call("mcp__robinhood__get_option_orders", account)
-    (after,) = final.data["evidence"]["broker_orders"]
-    assert after["state_raw"] == "cancelled" and after["canceled_quantity"] == 1
+    read = await model.call("mcp__robinhood__get_option_orders", account)
+    assert read.output["kind"] == "validated", read.output
+    (listed,) = read.data["evidence"]["broker_orders"]
+    assert listed["state_raw"] == "filled" and listed["processed_quantity"] == 1
+    assert listed["pending_quantity"] == 0
     return decision_json(candidate_ref, facts_ref)
 
 

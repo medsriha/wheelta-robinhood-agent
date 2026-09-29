@@ -30,6 +30,7 @@ from e2e_fakes import (
     E2E_MODEL,
     FIXTURE_MAPPERS,
     FIXTURE_SCOPE_TABLE,
+    INSTRUMENT_ID,
     MACRO,
     MARKET,
     OTHER_ACCOUNT_NICKNAME,
@@ -43,7 +44,7 @@ from e2e_fakes import (
     mignon_report,
     research,
     simulated_order_script,
-    simulated_price_walk_script,
+    simulated_second_order_script,
     simulated_world,
 )
 from e2e_support import (
@@ -644,6 +645,49 @@ def test_invalid_agent_output_still_assembles_from_events(harness: Callable[...,
     assert len(calls) == 8
 
 
+def test_a_mignon_patches_only_its_bad_finding(harness: Callable[..., Harness]) -> None:
+    """ADR-0047: SubagentStop names the finding that fails; the Mignon replies with a patch
+    for it alone, and the orchestrator gets the merged report mapped to the original."""
+    replies: list[str | None] = []
+
+    async def mignon(model: FakeModel) -> str:
+        quotes = await model.call(
+            "mcp__robinhood__get_option_quotes", {"instrument_ids": [INSTRUMENT_ID]}
+        )
+        replies.append(quotes.data["evidence_ref"])
+        return mignon_report(
+            "Quote the AAPL put.",
+            ("The live quote was returned.", [quotes.data["evidence_ref"]]),
+            ("The bid is 1.20.", []),  # a number without a ref, and no source at all
+        )
+
+    async def repair(model: FakeModel) -> str:
+        assert model.message is not None and "findings.1" in model.message
+        assert "findings.0" not in model.message
+        return json.dumps({"patches": [{"finding": "1", "refs": [replies[0]]}]})
+
+    async def script(model: FakeModel) -> str | None:
+        turn = await model.spawn(MARKET, "Quote the AAPL put.", mignon, repair=repair)
+        assert turn.output["kind"] == "validated", turn.output
+        data = turn.data
+        assert [f["refs"] for f in data["report"]["findings"]] == [[replies[0]], [replies[0]]]
+        assert data["repair"] == {"finding_origins": [0, 1], "patched": [1], "dropped": []}
+        return json.dumps(
+            {
+                "decisions": [],
+                "cancellation_rationales": [],
+                "unresolved_questions": [],
+                "next_run": None,
+            }
+        )
+
+    h = harness()
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    (cli,) = h.clis
+    (reason,) = cli.repair_reasons
+    assert "Fix only these findings" in reason
+
+
 def test_invalid_output_is_repaired_with_tools_denied(harness: Callable[..., Harness]) -> None:
     """ADR-0044: the issues go back to the agent; its corrected output completes the run, and
     a tool call during the repair turn is denied."""
@@ -813,11 +857,10 @@ def test_dry_run_order_tools_go_to_the_simulated_broker(
     assert by_tool == {
         "review_option_order": ToolCallStatus.SUCCEEDED,
         "place_option_order": ToolCallStatus.SUCCEEDED,
-        "cancel_option_order": ToolCallStatus.SUCCEEDED,
     }
     (record,) = [r for r in orders if r.intent is not None]
     assert record.intent.account_scope_id == simulated_scope_id(h.run_id)
-    assert record.status is AttemptStatus.CANCELLED
+    assert record.status is AttemptStatus.FILLED  # ADR-0046: a simulated order fills at once
     assert owned == ()  # nothing simulated leaks into the account's owned orders
     assert stored.record.order_venue is OrderVenue.SIMULATED
     assert stored.record.effective_execution_mode is ExecutionMode.OFF
@@ -844,19 +887,16 @@ def _assert_simulated_trace(h: Harness) -> None:
     assert all(e.resolved for e in decision.evidence)
     (leg,) = decision.legs
     assert leg.facts is not None and leg.facts.initial_quantity == 2
-    # The SPY place and its cancel, which the output did not select, with their calls.
+    # The SPY place, which the output did not select, with its calls.
     unlinked = {u.kind: [c.tool for c in u.calls] for u in trace.unassociated}
-    assert unlinked == {
-        "place": ["review_option_order", "place_option_order", "cancel_option_order"],
-        "cancel": ["cancel_option_order"],
-    }
+    assert unlinked == {"place": ["review_option_order", "place_option_order"]}
     # The audit sees the simulated order (ADR-0038): the script placed a 740 put on 30,000 of
     # cash without quoting it. Its time in force matches the rule ("gfd", ADR-0039). Every
     # such finding sits under the unlinked place, not the run level.
     place = next(u for u in trace.unassociated if u.kind == "place")
     checks = {v.split(":")[0] for v in place.findings.violations}
     assert checks == {"V1.3", "V2.1", "V7.3", "V7.4"}
-    assert place.broker_order_id is not None and place.status == "cancelled"
+    assert place.broker_order_id is not None and place.status == "filled"
     assert not trace.run_findings.violations
     callers = {c.caller for c in trace.timeline}
     assert callers == {"orchestrator", MARKET}
@@ -1394,14 +1434,14 @@ def test_trace_script_prints_the_run_and_the_listing(
     assert "no run at" in capsys.readouterr().err
 
 
-def test_a_price_walk_audits_each_step_against_state_that_includes_the_last(
+def test_a_second_order_audits_against_state_that_includes_the_first(
     harness: Callable[..., Harness],
 ) -> None:
-    """The second step's pre-order state reflects the first step's place and confirmed cancel,
+    """The second order's pre-order state reflects the first order's place and confirmed fill,
     so V1/V6/V7 judge it instead of reporting the state incomplete (run_loader broker_states)."""
     h = harness()
     h.world = simulated_world(h.clock.now)
-    script = simulated_price_walk_script(lambda: h.clock.advance(1))
+    script = simulated_second_order_script(lambda: h.clock.advance(1))
     assert h.run(script, mappers=SIMULATED_MAPPERS) == 0, h.notifier.alert_kinds()
     with h.conn() as c:
         findings = ledger_evidence.audit_findings_for_run(c, h.run_id)

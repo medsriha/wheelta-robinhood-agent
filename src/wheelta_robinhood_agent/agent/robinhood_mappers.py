@@ -33,8 +33,9 @@ Tools deliberately NOT registered:
 
 Positions (ADR-0031): `get_equity_positions` and `get_option_positions` each yield a
 `PositionsRead` that covers only its own kind (shares or options); the facts service combines
-the two halves of one run into a complete read. Only the empty shape is captured, so any
-non-empty list still raises until a real holding is captured.
+the two halves of one run into a complete read. Only the empty shape is captured; a short
+option row is read from `option_id`, `chain_symbol`, `type`, `quantity`, and
+`trade_value_multiplier` (ADR-0034), unverified against a real holding until one is captured.
 """
 
 import re

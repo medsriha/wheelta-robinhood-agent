@@ -309,9 +309,15 @@ def assert_allowed(s: Session, out: Any) -> None:
 # ---- structure ----------------------------------------------------------------------------
 
 
-def test_build_hooks_registers_four_events_matching_all_tools() -> None:
+def test_build_hooks_registers_five_events_matching_all_tools() -> None:
     s = session(hook_timeout_seconds=12.0)
-    assert set(s.hooks) == {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart"}
+    assert set(s.hooks) == {
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SubagentStart",
+        "SubagentStop",
+    }
     for matchers in s.hooks.values():
         assert len(matchers) == 1 and matchers[0].matcher is None
         assert matchers[0].timeout == 12.0

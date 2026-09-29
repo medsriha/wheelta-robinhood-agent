@@ -9,9 +9,15 @@ from hypothesis import strategies as st
 
 from wheelta_robinhood_agent.domain.mignon_report import (
     MignonReportParsed,
+    PatchedReport,
+    ReportPatch,
+    apply_report_patch,
     check_report_sources,
     extract_report_object,
+    original_report,
     parse_mignon_report,
+    parse_report_patch,
+    report_issues,
 )
 
 
@@ -169,3 +175,66 @@ def parsed_raw(raw: str) -> MignonReportParsed:
     result = parse_mignon_report(raw)
     assert isinstance(result, MignonReportParsed), result
     return result
+
+
+# -- ADR-0047: patches ---------------------------------------------------------------------------
+
+
+def _base(*findings: dict[str, Any]) -> PatchedReport:
+    return original_report(doc(*findings))
+
+
+def _patch(*patches: dict[str, Any]) -> ReportPatch:
+    result = parse_report_patch(json.dumps({"patches": list(patches)}))
+    assert isinstance(result, ReportPatch), result
+    return result
+
+
+def test_patch_replaces_only_given_fields_and_drops_by_original_index() -> None:
+    base = _base(f("A.", ("evidence:a",)), f("B 1.2."), f("C.", urls=("https://x.example/c",)))
+    merged = apply_report_patch(
+        base, _patch({"finding": "1", "refs": ["evidence:b"]}, {"finding": "2", "drop": True})
+    )
+    assert isinstance(merged, PatchedReport)
+    assert merged.data["findings"] == [
+        f("A.", ("evidence:a",)),
+        {"claim": "B 1.2.", "refs": ["evidence:b"], "web_urls": []},
+    ]
+    assert (merged.origins, merged.patched, merged.dropped) == ((0, 1), (1,), (2,))
+    assert report_issues(merged.data, {"evidence:a", "evidence:b"}, set()) == ()
+    again = apply_report_patch(merged, _patch({"finding": "2", "claim": "C again."}))
+    assert isinstance(again, tuple) and again[0].kind == "bad_index"  # finding 2 was dropped
+
+
+@pytest.mark.parametrize(
+    ("raw", "kind"),
+    [
+        ('{"patches": [{"finding": 1, "drop": true}]}', "json_number"),
+        ('{"patches": [{"finding": "x", "drop": true}]}', "bad_index"),
+        ('{"patches": [{"finding": "1"}]}', "value_error"),  # changes nothing
+        ('{"patches": [{"finding": "1", "drop": true, "claim": "c"}]}', "value_error"),
+        (
+            '{"patches": [{"finding": "1", "drop": true}, {"finding": "1", "claim": "c"}]}',
+            "value_error",
+        ),
+        ('{"patches": []}', "too_short"),
+        ('{"other": []}', "not_patch"),
+        ('{"patches": [{"finding": "1", "refs": ["facts:x"]}]}', "string_pattern_mismatch"),
+    ],
+)
+def test_malformed_patches_are_issues(raw: str, kind: str) -> None:
+    result = parse_report_patch(raw)
+    assert isinstance(result, tuple) and kind in [i.kind for i in result], result
+
+
+def test_prose_around_a_patch_is_dropped() -> None:
+    result = parse_report_patch('Fixed:\n{"patches": [{"finding": "0", "drop": true}]}\nDone.')
+    assert isinstance(result, ReportPatch) and result.patches[0].finding == 0
+
+
+def test_report_issues_are_located_by_finding() -> None:
+    data = doc(f("Fine.", ("evidence:a",)), f("Cites nothing."), f("Old.", ("evidence:z",)))
+    locs = [i.loc for i in report_issues(data, {"evidence:a"}, set())]
+    assert locs == ["findings.1"]  # schema issues come first; source checks need a valid report
+    fixed = doc(f("Fine.", ("evidence:a",)), f("Old.", ("evidence:z",)))
+    assert [i.loc for i in report_issues(fixed, {"evidence:a"}, set())] == ["findings.1.refs"]
