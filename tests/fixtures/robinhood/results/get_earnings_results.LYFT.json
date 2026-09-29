@@ -1,0 +1,128 @@
+{
+  "provenance": {
+    "tool": "get_earnings_results",
+    "arguments": {
+      "symbol": "LYFT"
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-29",
+    "captured_via": "recorded by local dry run 006a73a1-2ae8-55a8-ba50-0951dd2973a7 (read-only call; restricted raw payload from the ledger)",
+    "scrubbing": "public market data; the tool's `guide` prose dropped"
+  },
+  "data": {
+    "results": [
+      {
+        "eps": {
+          "actual": "0.270000",
+          "estimate": "0.220000"
+        },
+        "year": 2024,
+        "report": {
+          "date": "2025-02-11",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "LYFT",
+        "quarter": 4
+      },
+      {
+        "eps": {
+          "actual": "0.010000",
+          "estimate": "-0.020000"
+        },
+        "year": 2025,
+        "report": {
+          "date": "2025-05-08",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "LYFT",
+        "quarter": 1
+      },
+      {
+        "eps": {
+          "actual": "0.100000",
+          "estimate": "0.050000"
+        },
+        "year": 2025,
+        "report": {
+          "date": "2025-08-06",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "LYFT",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": "0.110000",
+          "estimate": "0.080000"
+        },
+        "year": 2025,
+        "report": {
+          "date": "2025-11-05",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "LYFT",
+        "quarter": 3
+      },
+      {
+        "eps": {
+          "actual": "0.150000",
+          "estimate": "0.120000"
+        },
+        "year": 2025,
+        "report": {
+          "date": "2026-02-10",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "LYFT",
+        "quarter": 4
+      },
+      {
+        "eps": {
+          "actual": "0.040000",
+          "estimate": "0.070000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-05-07",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "LYFT",
+        "quarter": 1
+      },
+      {
+        "eps": {
+          "actual": "0.130000",
+          "estimate": "0.150000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-08-06",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "LYFT",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "0.210000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-11-04",
+          "timing": "pm",
+          "verified": false
+        },
+        "symbol": "LYFT",
+        "quarter": 3
+      }
+    ]
+  }
+}

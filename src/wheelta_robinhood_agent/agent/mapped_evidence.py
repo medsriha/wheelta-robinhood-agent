@@ -7,8 +7,9 @@ cycle. `result_boundary` re-exports every name here.
 
 import uuid
 from collections.abc import Callable
+from datetime import date
 from decimal import Decimal
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, JsonValue
 
@@ -143,6 +144,104 @@ class PendingOptionPositions(_Observed):
     rows: tuple[HeldOptionRow, ...]
 
 
+class EarningsReport(_Observed):
+    """One earnings report event (`get_earnings_results`, `get_earnings_calendar`; ADR-0042).
+
+    `verified` false means the broker marks `report_date` as tentative. `eps_actual` is None
+    until the company has reported. Fiscal year and quarter are the company's.
+    """
+
+    symbol: NonEmptyStr
+    fiscal_year: int
+    fiscal_quarter: int
+    report_date: date
+    timing: Literal["am", "pm"] | None
+    verified: bool
+    eps_estimate: Decimal | None
+    eps_actual: Decimal | None
+
+
+class SecFilingListing(_Observed):
+    """One SEC filing as `get_sec_filing_index` lists it (ADR-0042)."""
+
+    symbol: NonEmptyStr
+    filing_id: NonEmptyStr
+    form_type: NonEmptyStr
+    date_filed: date
+    description: str
+
+
+class FinancialPeriod(_Observed):
+    """One reported fiscal period from `get_financials` (ADR-0042). USD amounts as reported;
+    `fiscal_quarter` is None for an annual period."""
+
+    symbol: NonEmptyStr
+    period: Literal["quarterly", "annual"]
+    fiscal_year: int
+    fiscal_quarter: int | None
+    period_end_date: date
+    revenue_usd: Decimal | None
+    gross_profit_usd: Decimal | None
+    net_income_usd: Decimal | None
+    net_margin_ratio: Decimal | None
+
+
+class EquityFundamentals(_Observed):
+    """Company fundamentals from `get_equity_fundamentals` for one `market_date` (ADR-0042).
+
+    Dividend dates are kept as reported; whether they describe the last or the next
+    distribution is unverified (the mapper adds a gap when any is present).
+    """
+
+    symbol: NonEmptyStr
+    market_date: date
+    market_cap_usd: Decimal
+    shares_outstanding: Decimal
+    pe_ratio: Decimal | None
+    pb_ratio: Decimal | None
+    high_52_weeks: Decimal
+    high_52_weeks_date: date
+    low_52_weeks: Decimal
+    low_52_weeks_date: date
+    average_volume_30_days: Decimal
+    ex_dividend_date: date | None
+    record_date: date | None
+    payable_date: date | None
+    distribution_frequency: str | None
+    sector: str
+    industry: str
+    description: str
+
+
+class AnalystRatings(_Observed):
+    """Analyst rating counts and price targets for one symbol (`get_equity_analyst_ratings`,
+    ADR-0042). Targets can be absent while counts are present."""
+
+    symbol: NonEmptyStr
+    buy_ratings: int
+    hold_ratings: int
+    sell_ratings: int
+    low_price_target: Decimal | None
+    mean_price_target: Decimal | None
+    high_price_target: Decimal | None
+    updated_at: AwareDatetime | None
+
+
+class OptionChainObservation(_Observed):
+    """One option chain: its listed expirations and contract terms (`get_option_chains`,
+    ADR-0042). A contract still comes only from `get_option_instruments`."""
+
+    chain_id: NonEmptyStr
+    symbol: NonEmptyStr
+    expiration_dates: tuple[date, ...]
+    multiplier: int
+    can_open_position: bool
+    settle_on_open: bool
+    above_tick: Decimal
+    below_tick: Decimal
+    tick_cutoff_price: Decimal
+
+
 class MappedEvidence(_Model):
     """Normalized, typed evidence produced from one validated tool result."""
 
@@ -159,6 +258,13 @@ class MappedEvidence(_Model):
     pending_option_positions: tuple[PendingOptionPositions, ...] = ()
     # ADR-0041: Wheelta board rows, a build-time screen (never a quote).
     board_screens: tuple[BoardScreen, ...] = ()
+    # ADR-0042: research reads. Citable context; no decision fact is computed from them.
+    earnings_reports: tuple[EarningsReport, ...] = ()
+    sec_filings: tuple[SecFilingListing, ...] = ()
+    financial_periods: tuple[FinancialPeriod, ...] = ()
+    fundamentals: tuple[EquityFundamentals, ...] = ()
+    analyst_ratings: tuple[AnalystRatings, ...] = ()
+    option_chains: tuple[OptionChainObservation, ...] = ()
     # Non-citable context delivered beside the evidence (the other selected board columns);
     # it carries no evidence identity and can back no number or decision.
     screen_context: tuple[dict[str, JsonValue], ...] = ()
@@ -170,6 +276,12 @@ class MappedEvidence(_Model):
             *self.order_reviews,
             *self.cancel_requests,
             *self.pending_option_positions,
+            *self.earnings_reports,
+            *self.sec_filings,
+            *self.financial_periods,
+            *self.fundamentals,
+            *self.analyst_ratings,
+            *self.option_chains,
         )
 
     def evidence_ids(self) -> tuple[uuid.UUID, ...]:

@@ -88,7 +88,7 @@ def test_extract_rejects_unknown_shapes(response: object) -> None:
 
 def test_unmapped_remote_result_is_missing_and_raw_is_restricted() -> None:
     outcome = BoundaryValidator(Redactor())(
-        _req("robinhood", "get_equity_fundamentals", _text({"p": "1"}))
+        _req("robinhood", "get_equity_historicals", _text({"p": "1"}))
     )
     assert outcome.envelope.kind is EnvelopeKind.MISSING
     assert outcome.envelope.data is None

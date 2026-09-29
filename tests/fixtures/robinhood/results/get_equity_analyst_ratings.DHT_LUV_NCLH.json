@@ -1,0 +1,55 @@
+{
+  "provenance": {
+    "tool": "get_equity_analyst_ratings",
+    "arguments": {
+      "symbols": [
+        "DHT",
+        "LUV",
+        "NCLH"
+      ]
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-29",
+    "captured_via": "recorded by local dry run 006a73a1-2ae8-55a8-ba50-0951dd2973a7 (read-only call; restricted raw payload from the ledger)",
+    "scrubbing": "public market data; the tool's `guide` prose dropped"
+  },
+  "data": {
+    "results": [
+      {
+        "symbol": "DHT",
+        "ratings": {
+          "num_buy_ratings": 6,
+          "low_price_target": "19.0000",
+          "num_hold_ratings": 3,
+          "num_sell_ratings": 0,
+          "high_price_target": "28.0000",
+          "mean_price_target": "22.5111"
+        }
+      },
+      {
+        "symbol": "LUV",
+        "ratings": {
+          "updated_at": "2026-09-28T09:23:56Z",
+          "num_buy_ratings": 12,
+          "low_price_target": "35.0000",
+          "num_hold_ratings": 13,
+          "num_sell_ratings": 3,
+          "high_price_target": "65.0000",
+          "mean_price_target": "50.4500"
+        }
+      },
+      {
+        "symbol": "NCLH",
+        "ratings": {
+          "updated_at": "2026-07-31T16:42:58Z",
+          "num_buy_ratings": 9,
+          "low_price_target": "13.0000",
+          "num_hold_ratings": 19,
+          "num_sell_ratings": 1,
+          "high_price_target": "26.0000",
+          "mean_price_target": "19.4783"
+        }
+      }
+    ]
+  }
+}

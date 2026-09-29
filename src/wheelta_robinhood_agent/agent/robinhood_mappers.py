@@ -21,13 +21,15 @@ Conventions shared by all mappers:
 - **Skipped rows.** A row that is well formed but unusable (inactive, untradable, zero
   bid/ask) produces no evidence and a named gap instead.
 
+Research reads (ADR-0042): earnings, the SEC filing index, financials, fundamentals, analyst
+ratings, and option chains become typed, citable evidence. Their shapes come from the results
+recorded on 2026-09-29 and the tools' own guidance. No decision fact is computed from them;
+an option chain in particular never stands in for an instrument or a quote.
+
 Tools deliberately NOT registered:
 
-- `get_option_chains`: the captured result carries chain identity, expiration dates, the chain
-  multiplier, and ticks. No fact computation or run loader reads a chain: the multiplier and
-  identity come from `get_option_instruments` (per instrument), and quotes from
-  `get_option_quotes`. `MappedEvidence` has no field for expiration lists, and a `validated`
-  envelope with no evidence would claim a check it did not do, so the result stays `missing`.
+- `get_equity_orders`: only the empty list was captured, and no fact reads equity orders
+  (ADR-0031).
 
 Positions (ADR-0031): `get_equity_positions` and `get_option_positions` each yield a
 `PositionsRead` that covers only its own kind (shares or options); the facts service combines
@@ -43,21 +45,35 @@ from decimal import ROUND_FLOOR, Decimal
 from types import MappingProxyType
 from typing import Annotated, Final, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, JsonValue, StrictBool, StrictInt
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StrictBool,
+    StrictInt,
+)
 
 from wheelta_robinhood_agent.agent.mapped_evidence import (
     CANDIDATE_REF_PREFIX,
+    AnalystRatings,
     BrokerOrderObservation,
     CancelRequestObservation,
     CandidateEvidence,
+    EarningsReport,
+    EquityFundamentals,
     EvidenceMapper,
     Execution,
+    FinancialPeriod,
     HeldOptionRow,
     MappedEvidence,
     MappingRequest,
+    OptionChainObservation,
     OrderLeg,
     OrderReviewObservation,
     PendingOptionPositions,
+    SecFilingListing,
 )
 from wheelta_robinhood_agent.domain.account import AccountSnapshot
 from wheelta_robinhood_agent.domain.enums import (
@@ -982,6 +998,411 @@ def map_order_cancel(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -
     return MappedEvidence(cancel_requests=(ack,), gaps=(gap,))
 
 
+# --------------------------------------------------------------------------------------------
+# Research reads (ADR-0042): earnings, SEC filing index, financials, fundamentals, analyst
+# ratings, option chains. Citable evidence; no decision fact is computed from them.
+# --------------------------------------------------------------------------------------------
+
+
+def _requested_symbols(request: MappingRequest) -> tuple[str, ...]:
+    """The requested tickers as the tool normalizes them (uppercase, trimmed)."""
+    single = request.effective_input.get("symbol")
+    many = request.effective_input.get("symbols")
+    if isinstance(single, str):
+        return (single.strip().upper(),)
+    if isinstance(many, list) and all(isinstance(s, str) for s in many):
+        return tuple(str(s).strip().upper() for s in many)
+    raise ValueError("expected a symbol or symbols argument")
+
+
+def _not_found_gaps(tool: str, not_found: tuple[str, ...]) -> list[str]:
+    return [_gap_text(tool, f"no data for {symbol}") for symbol in not_found]
+
+
+class _Eps(_External):
+    actual: DecStr | None
+    estimate: DecStr | None
+
+
+class _EarningsReportTime(_External):
+    report_date: IsoDate = Field(alias="date")
+    timing: Literal["am", "pm"] | None
+    verified: StrictBool
+
+
+class _EarningsRow(_External):
+    symbol: _Symbol
+    year: StrictInt
+    quarter: Annotated[StrictInt, Field(ge=1, le=4)]
+    report: _EarningsReportTime
+    eps: _Eps
+
+
+class _EarningsRows(_External):
+    results: tuple[_EarningsRow, ...]
+    not_found: tuple[str, ...] = ()
+
+
+def _earnings(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> MappedEvidence:
+    parsed = _EarningsRows.model_validate(_unwrap(request.payload))
+    reports = tuple(
+        EarningsReport(
+            evidence_id=new_id(),
+            as_of=request.retrieved_at,
+            source_tool_call_ids=(request.tool_call_id,),
+            symbol=row.symbol,
+            fiscal_year=row.year,
+            fiscal_quarter=row.quarter,
+            report_date=row.report.report_date,
+            timing=row.report.timing,
+            verified=row.report.verified,
+            eps_estimate=row.eps.estimate,
+            eps_actual=row.eps.actual,
+        )
+        for row in parsed.results
+    )
+    gaps = _not_found_gaps(request.tool, parsed.not_found)
+    if any(not r.verified for r in reports):
+        gaps.append(_gap_text(request.tool, "a report with verified=false has a tentative date"))
+    return MappedEvidence(earnings_reports=reports, gaps=tuple(gaps))
+
+
+def map_earnings_results(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID]
+) -> MappedEvidence:
+    """`get_earnings_results` -> one `EarningsReport` per quarter of the requested symbol.
+
+    Every row must name the requested symbol. An empty result is a gap, not a failure (the
+    tool's guidance: the symbol did not resolve).
+    """
+    (symbol,) = _requested_symbols(request)
+    evidence = _earnings(request, new_id)
+    if any(r.symbol != symbol for r in evidence.earnings_reports):
+        raise ValueError("earnings rows name another symbol than requested")
+    if not evidence.earnings_reports:
+        return evidence.model_copy(
+            update={"gaps": (*evidence.gaps, _gap_text(request.tool, f"no data for {symbol}"))}
+        )
+    return evidence
+
+
+def map_earnings_calendar(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID]
+) -> MappedEvidence:
+    """`get_earnings_calendar` -> one `EarningsReport` per report event in the window.
+
+    An empty window is valid (no reports fall in it) and yields a gap saying so.
+    """
+    evidence = _earnings(request, new_id)
+    if not evidence.earnings_reports:
+        return evidence.model_copy(
+            update={"gaps": (*evidence.gaps, _gap_text(request.tool, "no reports in the window"))}
+        )
+    return evidence
+
+
+class _Filing(_External):
+    filing_id: Annotated[str, Field(min_length=1)]
+    form_type: Annotated[str, Field(min_length=1)]
+    date_filed: IsoDate
+    description: str
+
+
+class _FilingIndex(_External):
+    symbol: _Symbol
+    filings: tuple[_Filing, ...]
+    next: str | None = None
+
+
+def map_sec_filing_index(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID]
+) -> MappedEvidence:
+    """`get_sec_filing_index` -> one `SecFilingListing` per filing (most recent first).
+
+    The index must name the requested symbol. A non-empty `next` cursor means more filings
+    exist, and a gap says so.
+    """
+    (symbol,) = _requested_symbols(request)
+    parsed = _FilingIndex.model_validate(_unwrap(request.payload))
+    if parsed.symbol != symbol:
+        raise ValueError("filing index names another symbol than requested")
+    filings = tuple(
+        SecFilingListing(
+            evidence_id=new_id(),
+            as_of=request.retrieved_at,
+            source_tool_call_ids=(request.tool_call_id,),
+            symbol=parsed.symbol,
+            filing_id=f.filing_id,
+            form_type=f.form_type,
+            date_filed=f.date_filed,
+            description=f.description,
+        )
+        for f in parsed.filings
+    )
+    gaps: list[str] = []
+    if parsed.next:
+        gaps.append(_gap_text(request.tool, "more filings exist; call again with the cursor"))
+    if not filings:
+        gaps.append(_gap_text(request.tool, f"no matching filings for {symbol}"))
+    return MappedEvidence(sec_filings=filings, gaps=tuple(gaps))
+
+
+_PERCENT: Final = Decimal(100)
+
+
+class _FinancialRow(_External):
+    fiscal_year: StrictInt
+    fiscal_quarter: Annotated[StrictInt, Field(ge=1, le=4)] | None
+    period_end_date: IsoDate
+    revenue: DecStr | None
+    gross_profit: DecStr | None
+    net_income: DecStr | None
+    net_margin: DecStr | None
+
+
+class _FinancialEntry(_External):
+    symbol: _Symbol
+    period: Literal["quarterly", "annual"]
+    financials: tuple[_FinancialRow, ...]
+
+
+class _Financials(_External):
+    results: tuple[_FinancialEntry | None, ...]
+
+
+def map_financials(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> MappedEvidence:
+    """`get_financials` -> one `FinancialPeriod` per reported period.
+
+    `results` is positional, one entry per requested symbol; a null entry is a "no data" gap.
+    `net_margin` is a percentage (the tool's guidance; checked against revenue and net income
+    on the captured rows) and becomes `net_margin_ratio` = value / 100. A quarterly period
+    must have a fiscal quarter and an annual one must not.
+    """
+    requested = _requested_symbols(request)
+    parsed = _Financials.model_validate(_unwrap(request.payload))
+    if len(parsed.results) != len(requested):
+        raise ValueError("financials results are not aligned with the requested symbols")
+    periods: list[FinancialPeriod] = []
+    gaps: list[str] = []
+    for symbol, entry in zip(requested, parsed.results, strict=True):
+        if entry is None:
+            gaps.append(_gap_text(request.tool, f"no data for {symbol}"))
+            continue
+        if entry.symbol != symbol:
+            raise ValueError("financials entry names another symbol than requested")
+        for row in entry.financials:
+            if (row.fiscal_quarter is None) != (entry.period == "annual"):
+                raise ValueError("fiscal_quarter does not match the period")
+            periods.append(
+                FinancialPeriod(
+                    evidence_id=new_id(),
+                    as_of=request.retrieved_at,
+                    source_tool_call_ids=(request.tool_call_id,),
+                    symbol=entry.symbol,
+                    period=entry.period,
+                    fiscal_year=row.fiscal_year,
+                    fiscal_quarter=row.fiscal_quarter,
+                    period_end_date=row.period_end_date,
+                    revenue_usd=row.revenue,
+                    gross_profit_usd=row.gross_profit,
+                    net_income_usd=row.net_income,
+                    net_margin_ratio=None if row.net_margin is None else row.net_margin / _PERCENT,
+                )
+            )
+    return MappedEvidence(financial_periods=tuple(periods), gaps=tuple(gaps))
+
+
+class _FundamentalsRow(_External):
+    symbol: _Symbol
+    market_date: IsoDate
+    market_cap: DecStr
+    shares_outstanding: DecStr
+    pe_ratio: DecStr | None
+    pb_ratio: DecStr | None
+    high_52_weeks: DecStr
+    high_52_weeks_date: IsoDate
+    low_52_weeks: DecStr
+    low_52_weeks_date: IsoDate
+    average_volume_30_days: DecStr
+    ex_dividend_date: IsoDate | None
+    record_date: IsoDate | None
+    payable_date: IsoDate | None
+    distribution_frequency: str | None
+    sector: str
+    industry: str
+    description: str
+
+
+class _FundamentalsRows(_External):
+    results: tuple[_FundamentalsRow, ...]
+    not_found: tuple[str, ...] = ()
+
+
+def map_equity_fundamentals(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID]
+) -> MappedEvidence:
+    """`get_equity_fundamentals` -> one `EquityFundamentals` per resolved symbol.
+
+    Only fields whose meaning is settled are kept. Today's session OHLCV is left out (prices
+    come from `get_equity_quotes`), and so are `dividend_yield` and `dividend_per_share`: on
+    the captured rows neither agrees with the other and the frequency. Dividend dates are kept
+    as reported with a gap: one captured row has a future ex-date and a past record date, so
+    whether they describe the last or the next distribution is unverified.
+    """
+    requested = set(_requested_symbols(request))
+    parsed = _FundamentalsRows.model_validate(_unwrap(request.payload))
+    rows: list[EquityFundamentals] = []
+    gaps = _not_found_gaps(request.tool, parsed.not_found)
+    for r in parsed.results:
+        if r.symbol not in requested:
+            raise ValueError("fundamentals row names a symbol that was not requested")
+        rows.append(
+            EquityFundamentals(
+                evidence_id=new_id(),
+                as_of=request.retrieved_at,
+                source_tool_call_ids=(request.tool_call_id,),
+                symbol=r.symbol,
+                market_date=r.market_date,
+                market_cap_usd=r.market_cap,
+                shares_outstanding=r.shares_outstanding,
+                pe_ratio=r.pe_ratio,
+                pb_ratio=r.pb_ratio,
+                high_52_weeks=r.high_52_weeks,
+                high_52_weeks_date=r.high_52_weeks_date,
+                low_52_weeks=r.low_52_weeks,
+                low_52_weeks_date=r.low_52_weeks_date,
+                average_volume_30_days=r.average_volume_30_days,
+                ex_dividend_date=r.ex_dividend_date,
+                record_date=r.record_date,
+                payable_date=r.payable_date,
+                distribution_frequency=r.distribution_frequency,
+                sector=r.sector,
+                industry=r.industry,
+                description=r.description,
+            )
+        )
+        if r.ex_dividend_date or r.record_date or r.payable_date:
+            gaps.append(
+                _gap_text(
+                    request.tool,
+                    f"{r.symbol} dividend dates as reported; whether they describe the last or "
+                    "the next distribution is unverified",
+                )
+            )
+    return MappedEvidence(fundamentals=tuple(rows), gaps=tuple(gaps))
+
+
+class _Ratings(_External):
+    num_buy_ratings: StrictInt
+    num_hold_ratings: StrictInt
+    num_sell_ratings: StrictInt
+    low_price_target: DecStr | None = None
+    mean_price_target: DecStr | None = None
+    high_price_target: DecStr | None = None
+    updated_at: BrokerTime | None = None
+
+
+class _RatingsEntry(_External):
+    symbol: _Symbol
+    ratings: _Ratings | None
+
+
+class _RatingsRows(_External):
+    results: tuple[_RatingsEntry | None, ...]
+
+
+def map_equity_analyst_ratings(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID]
+) -> MappedEvidence:
+    """`get_equity_analyst_ratings` -> one `AnalystRatings` per covered symbol.
+
+    `results` is positional, one entry per requested symbol. A null entry or null `ratings`
+    means no analyst coverage (the tool's guidance) and is a gap. Price targets can be absent
+    while counts are present.
+    """
+    requested = _requested_symbols(request)
+    parsed = _RatingsRows.model_validate(_unwrap(request.payload))
+    if len(parsed.results) != len(requested):
+        raise ValueError("ratings results are not aligned with the requested symbols")
+    rows: list[AnalystRatings] = []
+    gaps: list[str] = []
+    for symbol, entry in zip(requested, parsed.results, strict=True):
+        if entry is not None and entry.symbol != symbol:
+            raise ValueError("ratings entry names another symbol than requested")
+        if entry is None or entry.ratings is None:
+            gaps.append(_gap_text(request.tool, f"no analyst coverage for {symbol}"))
+            continue
+        r = entry.ratings
+        rows.append(
+            AnalystRatings(
+                evidence_id=new_id(),
+                as_of=request.retrieved_at,
+                source_tool_call_ids=(request.tool_call_id,),
+                symbol=entry.symbol,
+                buy_ratings=r.num_buy_ratings,
+                hold_ratings=r.num_hold_ratings,
+                sell_ratings=r.num_sell_ratings,
+                low_price_target=r.low_price_target,
+                mean_price_target=r.mean_price_target,
+                high_price_target=r.high_price_target,
+                updated_at=r.updated_at,
+            )
+        )
+    return MappedEvidence(analyst_ratings=tuple(rows), gaps=tuple(gaps))
+
+
+class _Chain(_External):
+    id: uuid.UUID
+    symbol: Annotated[str, BeforeValidator(_require_root)]
+    expiration_dates: tuple[IsoDate, ...]
+    trade_value_multiplier: DecStr
+    can_open_position: StrictBool
+    settle_on_open: StrictBool
+    cash_component: JsonValue
+    min_ticks: _MinTicks
+
+
+class _Chains(_External):
+    chains: tuple[_Chain, ...]
+
+
+def map_option_chains(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> MappedEvidence:
+    """`get_option_chains` -> one `OptionChainObservation` per chain.
+
+    A chain with a cash component has a non-standard deliverable and yields a gap instead.
+    Contracts, their multipliers, and quotes still come only from `get_option_instruments`
+    and `get_option_quotes`.
+    """
+    parsed = _Chains.model_validate(_unwrap(request.payload))
+    chains: list[OptionChainObservation] = []
+    gaps: list[str] = []
+    for c in parsed.chains:
+        if c.cash_component is not None:
+            gaps.append(
+                _gap_text(request.tool, f"chain {c.id} has a cash component (non-standard)")
+            )
+            continue
+        chains.append(
+            OptionChainObservation(
+                evidence_id=new_id(),
+                as_of=request.retrieved_at,
+                source_tool_call_ids=(request.tool_call_id,),
+                chain_id=str(c.id),
+                symbol=c.symbol,
+                expiration_dates=c.expiration_dates,
+                multiplier=_multiplier(c.trade_value_multiplier),
+                can_open_position=c.can_open_position,
+                settle_on_open=c.settle_on_open,
+                above_tick=c.min_ticks.above_tick,
+                below_tick=c.min_ticks.below_tick,
+                tick_cutoff_price=c.min_ticks.cutoff_price,
+            )
+        )
+    if not parsed.chains:
+        gaps.append(_gap_text(request.tool, "no chains returned"))
+    return MappedEvidence(option_chains=tuple(chains), gaps=tuple(gaps))
+
+
 # Tool name -> mapper; `result_boundary.VERIFIED_MAPPERS` keys these by the Robinhood server.
 ROBINHOOD_MAPPERS: Mapping[str, EvidenceMapper] = MappingProxyType(
     {
@@ -995,5 +1416,12 @@ ROBINHOOD_MAPPERS: Mapping[str, EvidenceMapper] = MappingProxyType(
         "review_option_order": map_order_review,
         "place_option_order": map_order_placement,
         "cancel_option_order": map_order_cancel,
+        "get_earnings_results": map_earnings_results,
+        "get_earnings_calendar": map_earnings_calendar,
+        "get_sec_filing_index": map_sec_filing_index,
+        "get_financials": map_financials,
+        "get_equity_fundamentals": map_equity_fundamentals,
+        "get_equity_analyst_ratings": map_equity_analyst_ratings,
+        "get_option_chains": map_option_chains,
     }
 )

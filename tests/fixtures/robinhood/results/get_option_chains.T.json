@@ -1,0 +1,57 @@
+{
+  "provenance": {
+    "tool": "get_option_chains",
+    "arguments": {
+      "underlying_symbol": "T"
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-29",
+    "captured_via": "recorded by local dry run 006a73a1-2ae8-55a8-ba50-0951dd2973a7 (read-only call; restricted raw payload from the ledger)",
+    "scrubbing": "public market data; the tool's `guide` prose dropped; Robinhood internal hostnames replaced"
+  },
+  "data": {
+    "chains": [
+      {
+        "id": "4a3843ed-a66e-4e8b-a3d5-08357ad9a4cd",
+        "symbol": "T",
+        "min_ticks": {
+          "above_tick": "0.05",
+          "below_tick": "0.01",
+          "cutoff_price": "3.00"
+        },
+        "cash_component": null,
+        "settle_on_open": false,
+        "expiration_dates": [
+          "2026-10-02",
+          "2026-10-09",
+          "2026-10-16",
+          "2026-10-23",
+          "2026-10-30",
+          "2026-11-06",
+          "2026-11-20",
+          "2026-12-18",
+          "2027-01-15",
+          "2027-03-19",
+          "2027-04-16",
+          "2027-06-17",
+          "2027-09-17",
+          "2027-10-15",
+          "2028-01-21",
+          "2028-04-21",
+          "2029-01-19"
+        ],
+        "late_close_state": "disabled",
+        "can_open_position": true,
+        "extended_hours_state": "disabled",
+        "trade_value_multiplier": "100.0000",
+        "underlying_instruments": [
+          {
+            "symbol": "",
+            "instrument": "INTERNAL_URL_REDACTED/instruments/2b456f6a-3287-4757-abf9-327383d2c708/"
+          }
+        ],
+        "sellout_time_to_expiration": 1800
+      }
+    ]
+  }
+}

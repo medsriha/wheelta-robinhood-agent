@@ -86,6 +86,13 @@ def test_verified_mappers_are_exactly_the_mapped_tools() -> None:
         ("robinhood", "review_option_order"),
         ("robinhood", "place_option_order"),
         ("robinhood", "cancel_option_order"),
+        ("robinhood", "get_earnings_results"),
+        ("robinhood", "get_earnings_calendar"),
+        ("robinhood", "get_sec_filing_index"),
+        ("robinhood", "get_financials"),
+        ("robinhood", "get_equity_fundamentals"),
+        ("robinhood", "get_equity_analyst_ratings"),
+        ("robinhood", "get_option_chains"),
     }
 
 
@@ -478,15 +485,12 @@ def test_boundary_validates_real_fixtures(
     assert mapped is not None and mapped.evidence_ids()
 
 
-@pytest.mark.parametrize(
-    ("tool", "fixture"),
-    [
-        ("get_option_chains", "get_option_chains.SPY.json"),
-        ("get_equity_orders", "get_equity_orders.empty_account.json"),
-    ],
-)
-def test_boundary_keeps_unregistered_tools_missing(tool: str, fixture: str) -> None:
-    envelope = _validate(tool, _data(fixture), account_number="****1234")
+def test_boundary_keeps_unregistered_tools_missing() -> None:
+    envelope = _validate(
+        "get_equity_orders",
+        _data("get_equity_orders.empty_account.json"),
+        account_number="****1234",
+    )
     assert envelope.kind is EnvelopeKind.MISSING
 
 

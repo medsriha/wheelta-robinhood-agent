@@ -1,0 +1,269 @@
+{
+  "provenance": {
+    "tool": "get_earnings_calendar",
+    "arguments": {
+      "days": 18,
+      "start_date": "2026-09-29"
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-29",
+    "captured_via": "recorded by local dry run 006a73a1-2ae8-55a8-ba50-0951dd2973a7 (read-only call; restricted raw payload from the ledger)",
+    "scrubbing": "public market data; the tool's `guide` prose dropped; results trimmed to 18 of 285 rows in their original order (plus the first rows with a null timing)"
+  },
+  "data": {
+    "results": [
+      {
+        "eps": {
+          "actual": "-0.120000",
+          "estimate": "-0.020000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": true
+        },
+        "symbol": "UEC",
+        "quarter": 4
+      },
+      {
+        "eps": {
+          "actual": "-0.050000",
+          "estimate": null
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": true
+        },
+        "symbol": "IH",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "-0.240000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": false
+        },
+        "symbol": "CLGN",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": "1.430000",
+          "estimate": "1.350000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": true
+        },
+        "symbol": "CCL",
+        "quarter": 3
+      },
+      {
+        "eps": {
+          "actual": "1.160000",
+          "estimate": "0.700000"
+        },
+        "year": 2027,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": true
+        },
+        "symbol": "KMX",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "-0.010000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": false
+        },
+        "symbol": "SNYRQ",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": null
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": false
+        },
+        "symbol": "SAGT",
+        "quarter": 1
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": null
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "am",
+          "verified": false
+        },
+        "symbol": "SAGT",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": null
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "pm",
+          "verified": false
+        },
+        "symbol": "MPU",
+        "quarter": 1
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": null
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "pm",
+          "verified": false
+        },
+        "symbol": "RGNT",
+        "quarter": 3
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "2.730000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "CNXC",
+        "quarter": 3
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": null
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-29",
+          "timing": "pm",
+          "verified": false
+        },
+        "symbol": "PASW",
+        "quarter": 1
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "4.340000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-30",
+          "timing": "am",
+          "verified": true
+        },
+        "symbol": "FDS",
+        "quarter": 4
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "1.440000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-30",
+          "timing": "pm",
+          "verified": true
+        },
+        "symbol": "PRGS",
+        "quarter": 3
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "-0.060000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-30",
+          "timing": "am",
+          "verified": false
+        },
+        "symbol": "CBAT",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": null
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-09-30",
+          "timing": "am",
+          "verified": true
+        },
+        "symbol": "YRD",
+        "quarter": 2
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "4.450000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-10-15",
+          "timing": null,
+          "verified": true
+        },
+        "symbol": "TSM",
+        "quarter": 3
+      },
+      {
+        "eps": {
+          "actual": null,
+          "estimate": "1.170000"
+        },
+        "year": 2026,
+        "report": {
+          "date": "2026-10-15",
+          "timing": null,
+          "verified": true
+        },
+        "symbol": "WABC",
+        "quarter": 3
+      }
+    ]
+  }
+}

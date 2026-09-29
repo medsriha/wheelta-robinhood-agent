@@ -1,0 +1,107 @@
+{
+  "provenance": {
+    "tool": "get_financials",
+    "arguments": {
+      "limit": 4,
+      "period": "quarterly",
+      "symbols": [
+        "DHT",
+        "LUV",
+        "NCLH"
+      ]
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-09-29",
+    "captured_via": "recorded by local dry run 006a73a1-2ae8-55a8-ba50-0951dd2973a7 (read-only call; restricted raw payload from the ledger)",
+    "scrubbing": "public market data; the tool's `guide` prose dropped"
+  },
+  "data": {
+    "results": [
+      null,
+      {
+        "period": "quarterly",
+        "symbol": "LUV",
+        "financials": [
+          {
+            "revenue": "8432000000.000000",
+            "net_income": "233000000.000000",
+            "net_margin": "2.760000",
+            "fiscal_year": 2026,
+            "gross_profit": null,
+            "fiscal_quarter": 2,
+            "period_end_date": "2026-06-30"
+          },
+          {
+            "revenue": "7249000000.000000",
+            "net_income": "227000000.000000",
+            "net_margin": "3.130000",
+            "fiscal_year": 2026,
+            "gross_profit": null,
+            "fiscal_quarter": 1,
+            "period_end_date": "2026-03-31"
+          },
+          {
+            "revenue": "7442000000.000000",
+            "net_income": "323000000.000000",
+            "net_margin": "4.340000",
+            "fiscal_year": 2025,
+            "gross_profit": null,
+            "fiscal_quarter": 4,
+            "period_end_date": "2025-12-31"
+          },
+          {
+            "revenue": "6949000000.000000",
+            "net_income": "54000000.000000",
+            "net_margin": "0.780000",
+            "fiscal_year": 2025,
+            "gross_profit": null,
+            "fiscal_quarter": 3,
+            "period_end_date": "2025-09-30"
+          }
+        ]
+      },
+      {
+        "period": "quarterly",
+        "symbol": "NCLH",
+        "financials": [
+          {
+            "revenue": "2640544000.000000",
+            "net_income": "222553000.000000",
+            "net_margin": "8.430000",
+            "fiscal_year": 2026,
+            "gross_profit": "1053736000.000000",
+            "fiscal_quarter": 2,
+            "period_end_date": "2026-06-30"
+          },
+          {
+            "revenue": "2331221000.000000",
+            "net_income": "104666000.000000",
+            "net_margin": "4.490000",
+            "fiscal_year": 2026,
+            "gross_profit": "953340000.000000",
+            "fiscal_quarter": 1,
+            "period_end_date": "2026-03-31"
+          },
+          {
+            "revenue": "2244400000.000000",
+            "net_income": "14254000.000000",
+            "net_margin": "0.640000",
+            "fiscal_year": 2025,
+            "gross_profit": "920881000.000000",
+            "fiscal_quarter": 4,
+            "period_end_date": "2025-12-31"
+          },
+          {
+            "revenue": "2938142000.000000",
+            "net_income": "419295000.000000",
+            "net_margin": "14.270000",
+            "fiscal_year": 2025,
+            "gross_profit": "1383283000.000000",
+            "fiscal_quarter": 3,
+            "period_end_date": "2025-09-30"
+          }
+        ]
+      }
+    ]
+  }
+}
