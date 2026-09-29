@@ -43,6 +43,9 @@ from wheelta_robinhood_agent.agent.hooks import (
     ValidationRequest,
 )
 from wheelta_robinhood_agent.agent.mapped_evidence import (  # re-exported
+    CANDIDATE_REF_PREFIX as CANDIDATE_REF_PREFIX,
+)
+from wheelta_robinhood_agent.agent.mapped_evidence import (
     CandidateEvidence as CandidateEvidence,
 )
 from wheelta_robinhood_agent.agent.mapped_evidence import (
@@ -67,13 +70,19 @@ from wheelta_robinhood_agent.agent.model_view import (
 )
 from wheelta_robinhood_agent.agent.robinhood_mappers import ROBINHOOD_MAPPERS
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
+from wheelta_robinhood_agent.agent.wheelta_mappers import WHEELTA_MAPPERS
+from wheelta_robinhood_agent.domain.enums import CandidateOrigin
+from wheelta_robinhood_agent.domain.facts_compute import BoardScreen
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     SERVER_NAME as ROBINHOOD_SERVER,
 )
+from wheelta_robinhood_agent.integrations.wheelta.registry import (
+    SERVER_NAME as WHEELTA_SERVER,
+)
+from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 from wheelta_robinhood_agent.ledger.ids import new_id
 from wheelta_robinhood_agent.observability.redaction import REDACTED, Redactor, is_account_key
 
-CANDIDATE_REF_PREFIX: Final = "candidate:"
 EVIDENCE_REF_PREFIX: Final = "evidence:"
 
 
@@ -82,15 +91,32 @@ def evidence_ref_for(tool_call_id: uuid.UUID) -> str:
     return f"{EVIDENCE_REF_PREFIX}{tool_call_id}"
 
 
+PREVIEW_SCAN_TOOL: Final = "preview_scan"
 # ADR-0026: login-scoped workspace reads without a verified mapper reach the model as redacted
 # context, never as evidence (no evidence_ref, not citable, cannot support a number).
-CONTEXT_ONLY_TOOLS: Final = frozenset((ROBINHOOD_SERVER, tool) for tool in LOGIN_SCOPED_TOOLS)
+# ADR-0041: every Wheelta tool but the board query is delivered the same way (read-only
+# research, macro, calendar, quotes, board detail and status).
+CONTEXT_ONLY_TOOLS: Final = frozenset(
+    {
+        *((ROBINHOOD_SERVER, tool) for tool in LOGIN_SCOPED_TOOLS),
+        # ADR-0041: the Robinhood scanner fallback; market data, projected like run_scan.
+        (ROBINHOOD_SERVER, PREVIEW_SCAN_TOOL),
+        *(
+            (WHEELTA_SERVER, t.name)
+            for t in WHEELTA_REGISTRY.tools
+            if t.name not in WHEELTA_MAPPERS
+        ),
+    }
+)
 CONTEXT_ONLY_GAP: Final = "context only: no verified result mapping; not evidence"
 
 # (server, tool) -> mapper. Only tools whose result shapes were captured and verified
 # (ADR-0017 fixtures, tests/fixtures/robinhood/results/; robinhood_mappers.py).
 VERIFIED_MAPPERS: Mapping[tuple[str, str], EvidenceMapper] = MappingProxyType(
-    {(ROBINHOOD_SERVER, tool): mapper for tool, mapper in ROBINHOOD_MAPPERS.items()}
+    {
+        **{(ROBINHOOD_SERVER, tool): mapper for tool, mapper in ROBINHOOD_MAPPERS.items()},
+        **{(WHEELTA_SERVER, tool): mapper for tool, mapper in WHEELTA_MAPPERS.items()},
+    }
 )
 
 
@@ -160,6 +186,9 @@ class BoundaryValidator:
     id_factory: Callable[[], uuid.UUID] = new_id
     # Set by the session from its trusted `get_accounts` check; never from tool output.
     account_eligible: bool = False
+    # ADR-0041: this run's current-build Wheelta board rows by OCC symbol (read from the
+    # ledger by the session). A candidate whose contract is listed there has origin `board`.
+    board_screens: Callable[[], Mapping[str, BoardScreen]] | None = None
 
     def __call__(self, request: ValidationRequest) -> ValidationOutcome:
         if request.server == BUILTIN_SERVER:
@@ -181,7 +210,7 @@ class BoundaryValidator:
             # no evidence ref, so it can neither be cited nor back a number or a decision.
             context = _drop_account_values(redacted)
             gaps: tuple[str, ...] = (CONTEXT_ONLY_GAP,)
-            if request.tool == RUN_SCAN_TOOL:
+            if request.tool in (RUN_SCAN_TOOL, PREVIEW_SCAN_TOOL):
                 context, scan_gaps = project_scan(context)
                 gaps += scan_gaps
             return self._envelope(
@@ -207,6 +236,7 @@ class BoundaryValidator:
                 self.id_factory,
             )
             _check_provenance(evidence, request.tool_call_id)
+            evidence = self._board_origin(evidence)
         except (ValidationError, ValueError, TypeError, KeyError) as exc:
             gap = f"result failed schema validation ({type(exc).__name__})"
             return self._invalid(request, EnvelopeKind.MISSING, gap)
@@ -215,6 +245,22 @@ class BoundaryValidator:
             EVIDENCE_KEY: evidence.model_dump(mode="json"),
         }
         return self._envelope(request, EnvelopeKind.VALIDATED, data=data, gaps=evidence.gaps)
+
+    def _board_origin(self, evidence: MappedEvidence) -> MappedEvidence:
+        """Relabel candidates the run's current board lists (selection.board_comparison: a
+        board-derived candidate must be compared, never treated as independently found)."""
+        if not evidence.candidates or self.board_screens is None:
+            return evidence
+        listed = self.board_screens()
+        if not listed:
+            return evidence
+        relabeled = tuple(
+            c.model_copy(update={"origin": CandidateOrigin.BOARD})
+            if str(c.occ_symbol) in listed
+            else c
+            for c in evidence.candidates
+        )
+        return evidence.model_copy(update={"candidates": relabeled})
 
     def _envelope(
         self,

@@ -13,6 +13,11 @@ Rules applied (each formula id below is stamped at version "1"):
 - `annualized_yield_on_collateral`: live BID x multiplier / collateral x 365 / DTE
   (filters.min_annualized_yield_ratio, ADR-0014, definitions.annualization). Opening only.
 - `spread_ratio_of_mid`: (ask - bid) / mid, mid = (bid + ask) / 2 (filters notes).
+- `board_premium_divergence`: |live BID - board BID| / board BID for a board-derived
+  candidate (selection.board_comparison: the same premium measure, the bid, for the same
+  contract, from the run's current Wheelta build; ADR-0041). The agent compares it with
+  data_quality.tolerances.board_vs_live_premium_divergence_ratio. A board-derived candidate
+  without that row, or with a zero board bid, gets a `board_screen` gap instead.
 - `csp_capacity`: floor of the smallest applicable capacity (selection.sizing): order cap;
   per-underlying USD cap and ratio x account value, each minus existing CSP collateral on the
   underlying; (C - reserve); (total_ratio x B - R), with C = available settled cash, R = CSP
@@ -53,6 +58,7 @@ from wheelta_robinhood_agent.domain.base import (
     Dec,
     DomainModel,
     NonEmptyStr,
+    NonNegDec,
     PosCount,
     PosDec,
     Ref,
@@ -85,6 +91,7 @@ F_DTE = "dte_calendar_days"
 F_COLLATERAL = "collateral_per_contract"
 F_YIELD = "annualized_yield_on_collateral"
 F_SPREAD = "spread_ratio_of_mid"
+F_BOARD = "board_premium_divergence"
 F_CSP = "csp_capacity"
 F_CC = "cc_capacity"
 F_CLOSE = "close_capacity"
@@ -233,6 +240,21 @@ class OpenOrdersRead(_Observation):
     orders: tuple[WorkingOrder, ...] = ()
 
 
+class BoardScreen(_Observation):
+    """One Wheelta board row's contract screen (ADR-0041): build-time, never a quote.
+
+    `bid` is the board's premium at the bid per share; `as_of` is the board's `asOf`.
+    Only rows of the run's current `build_id` are ever used (data_quality.freshness).
+    """
+
+    build_id: NonEmptyStr
+    row_id: NonEmptyStr
+    underlying: NonEmptyStr
+    occ_symbol: OccSymbol
+    bid: NonNegDec
+    wheel_iq_score: Dec | None = None
+
+
 class CandidateProvenance(DomainModel):
     """A code-issued candidate reference with its discovery path."""
 
@@ -273,6 +295,8 @@ class FactInputs(DomainModel):
     positions: PositionsRead | None = None
     open_orders: OpenOrdersRead | None = None
     candidate: CandidateProvenance | None = None
+    # ADR-0041: the current-build board row matching a board-derived candidate's contract.
+    board_screen: BoardScreen | None = None
     position: PositionBookEntry | None = None
     debit_funding: SourcedValue[Dec] | None = None
     limit_price: PosDec | None = None
@@ -289,6 +313,12 @@ class FactInputs(DomainModel):
             raise ValueError("option quote does not belong to the instrument")
         if self.underlying_quote and self.underlying_quote.symbol != inst.underlying:
             raise ValueError("underlying quote does not belong to the instrument's underlying")
+        if self.board_screen is not None and (
+            self.board_screen.occ_symbol != inst.occ_symbol
+            or self.candidate is None
+            or self.candidate.origin is not CandidateOrigin.BOARD
+        ):
+            raise ValueError("a board screen belongs to a board-derived candidate's contract")
         require_unique(tuple(f.evidence_id for f in self.confirmed_fills), "fill evidence id")
         if self.close_quantity is not None and self.purpose is not FactsPurpose.CLOSE:
             raise ValueError("close_quantity is a CLOSE-purpose input only")
@@ -344,6 +374,7 @@ class FactInputs(DomainModel):
         ids += [self.account.snapshot_id] if self.account else []
         ids += [self.positions.evidence_id] if self.positions else []
         ids += [self.open_orders.evidence_id] if self.open_orders else []
+        ids += [self.board_screen.evidence_id] if self.board_screen else []
         ids += [self.debit_funding.evidence_id] if self.debit_funding else []
         ids += list(self.position.entry_fill_ids) if self.position else []
         ids += [f.evidence_id for f in self.confirmed_fills]
@@ -368,7 +399,12 @@ class _Computation:
         self.metrics: list[DerivedMetric] = []
         self.formulas: dict[str, str] = {F_QUANTITY: FORMULA_VERSION}
         self.times: dict[UUID, datetime] = {self.inst.evidence_id: self.inst.as_of}
-        for obs in (inputs.underlying_quote, inputs.positions, inputs.open_orders):
+        for obs in (
+            inputs.underlying_quote,
+            inputs.positions,
+            inputs.open_orders,
+            inputs.board_screen,
+        ):
             if obs is not None:
                 self.times[obs.evidence_id] = obs.as_of
         if inputs.option_quote is not None:
@@ -613,6 +649,28 @@ class _Computation:
         if q is not None:
             name = "annualized_yield_on_collateral_ratio"
             self.annualized(name, q.bid, F_YIELD, (q.quote_id,))
+        candidate = self.i.candidate
+        if candidate is not None and candidate.origin is CandidateOrigin.BOARD:
+            self.board_divergence(q)
+
+    def board_divergence(self, q: Quote | None) -> None:
+        """selection.board_comparison inputs for a board-derived candidate (ADR-0041)."""
+        screen = self.i.board_screen
+        if screen is None:
+            detail = (
+                "board-derived candidate without a current-build board row for this contract; "
+                "selection.board_comparison blocks it"
+            )
+            self.gap("board_screen", DataQuality.MISSING, detail)
+            return
+        if screen.bid <= _ZERO:
+            self.gap("board_screen", DataQuality.MISSING, "the board row's bid is zero")
+            return
+        if q is None:
+            return
+        value = _CTX.divide(abs(q.bid - screen.bid), screen.bid)
+        ids = (q.quote_id, screen.evidence_id)
+        self.metric("board_vs_live_premium_divergence_ratio", "ratio", value, F_BOARD, ids)
 
     def position_metrics(self, position: PositionBookEntry) -> None:
         self.spread()

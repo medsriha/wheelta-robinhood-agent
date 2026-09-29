@@ -1,0 +1,102 @@
+{
+ "provenance": {
+  "tool": "wheelta_board_query",
+  "arguments": {
+   "limit": 3
+  },
+  "server": "wheelta-mcp",
+  "captured_on": "2026-09-29",
+  "captured_via": "read-only call through mcp_upstream, owner-approved",
+  "scrubbing": "none needed: public board data, no account data"
+ },
+ "structuredContent": {
+  "mode": "rows",
+  "matched": 210,
+  "universeRows": 210,
+  "freshness": {
+   "asOf": "2026-09-28T20:58:23Z",
+   "buildId": "df52f70ac584",
+   "buildState": "ready",
+   "nextRefreshAt": "2026-09-29T11:45:00Z",
+   "scoresUpdatedAt": "2026-09-28T19:48:07Z"
+  },
+  "rows": [
+   {
+    "rowId": "IWM:medium",
+    "symbol": "IWM",
+    "sector": "Broad Market",
+    "isEtf": true,
+    "wheelIq.score": 76.24,
+    "quote.price": 279.98,
+    "contract.strike": 267.0,
+    "contract.expiration": "2026-10-16",
+    "contract.dteBucket": "medium",
+    "contract.bid": 1.15,
+    "contract.probOtm": 0.8319,
+    "risk.annualizedYield": 0.0896,
+    "risk.cushionPct": 0.0506,
+    "risk.cushionCoverage": 1.03,
+    "risk.catalystRisk": "weak"
+   },
+   {
+    "rowId": "SPY:medium",
+    "symbol": "SPY",
+    "sector": "Broad Market",
+    "isEtf": true,
+    "wheelIq.score": 76.13,
+    "quote.price": 765.33,
+    "contract.strike": 739.0,
+    "contract.expiration": "2026-10-16",
+    "contract.dteBucket": "medium",
+    "contract.bid": 2.18,
+    "contract.probOtm": 0.841,
+    "risk.annualizedYield": 0.0606,
+    "risk.cushionPct": 0.0373,
+    "risk.cushionCoverage": 1.04,
+    "risk.catalystRisk": "weak"
+   },
+   {
+    "rowId": "IWM:long",
+    "symbol": "IWM",
+    "sector": "Broad Market",
+    "isEtf": true,
+    "wheelIq.score": 76.12,
+    "quote.price": 279.98,
+    "contract.strike": 263.0,
+    "contract.expiration": "2026-10-30",
+    "contract.dteBucket": "long",
+    "contract.bid": 1.6,
+    "contract.probOtm": 0.8266,
+    "risk.annualizedYield": 0.07,
+    "risk.cushionPct": 0.0664,
+    "risk.cushionCoverage": 1.01,
+    "risk.catalystRisk": "weak"
+   }
+  ],
+  "columns": [
+   "rowId",
+   "symbol",
+   "sector",
+   "isEtf",
+   "wheelIq.score",
+   "quote.price",
+   "contract.strike",
+   "contract.expiration",
+   "contract.dteBucket",
+   "contract.bid",
+   "contract.probOtm",
+   "risk.annualizedYield",
+   "risk.cushionPct",
+   "risk.cushionCoverage",
+   "risk.catalystRisk"
+  ],
+  "returned": 3,
+  "offset": 0,
+  "sortedBy": "wheelIq.score",
+  "order": "desc",
+  "groups": null,
+  "groupedBy": null,
+  "note": "Showing rows 1-3 of 210 matching (sorted by wheelIq.score desc). Page with offset=3, or narrow with more filters. The omitted rows are not worse on every axis \u2014 only on wheelIq.score.",
+  "caveat": "WheelIQ is a 0-100 ranking of premium against assignment risk and underlying quality, tenor-neutral so scores compare across expirations. It is a ranking, not a prediction, and not a recommendation to trade."
+ }
+}

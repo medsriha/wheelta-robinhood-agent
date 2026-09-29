@@ -46,6 +46,8 @@ NOW = datetime(2026, 9, 23, 15, 30, tzinfo=UTC)
 RH = McpHttpServer(name="robinhood", url="https://rh.example/mcp", token=SecretStr("rh-token"))  # type: ignore[arg-type]
 WT = McpHttpServer(name="wheelta", url="https://wt.example/mcp", token=SecretStr("wt-token"))  # type: ignore[arg-type]
 RH_VERIFIED = ROBINHOOD_REGISTRY.model_copy(update={"verified": True})
+# A registry left unverified, for the withholding rules (Wheelta itself is verified, ADR-0041).
+WT_UNVERIFIED = WHEELTA_REGISTRY.model_copy(update={"verified": False})
 ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
 LOCAL_TOOLS = {LOCAL_REGISTRY.qualified(t.name) for t in LOCAL_REGISTRY.tools}
 
@@ -61,7 +63,7 @@ def _plan(
         workspace_writes=True,
         sources=(
             RemoteSource(rh_registry, rh, required=True),
-            RemoteSource(WHEELTA_REGISTRY, WT),
+            RemoteSource(WT_UNVERIFIED, WT),
         ),
         observed_at=NOW,
         remote_boundary_accepted=accepted,
@@ -86,7 +88,7 @@ def test_production_defaults_proxy_token_servers_and_never_deliver_directly() ->
         workspace_writes=True,
         sources=(
             RemoteSource(RH_VERIFIED, RH, required=True),
-            RemoteSource(WHEELTA_REGISTRY, WT),
+            RemoteSource(WT_UNVERIFIED, WT),
         ),
         observed_at=NOW,
     )
@@ -94,6 +96,22 @@ def test_production_defaults_proxy_token_servers_and_never_deliver_directly() ->
     assert set(plan.withheld) == {"wheelta"}  # unverified registry, proxy or not
     assert plan.may_start
     assert "mcp__robinhood__get_option_quotes" in plan.tool_access.allowed_tools
+
+
+def test_verified_wheelta_is_proxied_with_its_read_tools() -> None:
+    """ADR-0041: Wheelta's registry is verified, so a token-bearing Wheelta is proxied."""
+    assert WHEELTA_REGISTRY.verified
+    plan = plan_session(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=False,
+        sources=(
+            RemoteSource(RH_VERIFIED, RH, required=True),
+            RemoteSource(WHEELTA_REGISTRY, WT),
+        ),
+        observed_at=NOW,
+    )
+    assert plan.proxied == (RH, WT) and "wheelta" not in plan.withheld
+    assert "mcp__wheelta__wheelta_board_query" in plan.tool_access.allowed_tools
 
 
 def test_proxied_dry_run_gets_the_live_order_tools_on_the_simulated_venue() -> None:
@@ -143,7 +161,7 @@ def test_unverified_registry_is_withheld_even_when_the_boundary_is_accepted() ->
     assert plan.may_start and plan.servers == (RH,)
     allowed = set(plan.tool_access.allowed_tools)
     assert not any(t.startswith("mcp__wheelta__") for t in allowed)
-    assert WHEELTA_REGISTRY.qualified("wheelta_board_query") in plan.tool_access.disallowed_tools
+    assert WT_UNVERIFIED.qualified("wheelta_board_query") in plan.tool_access.disallowed_tools
 
 
 def test_missing_token_is_needs_auth_and_required() -> None:

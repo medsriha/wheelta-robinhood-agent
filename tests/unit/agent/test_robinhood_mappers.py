@@ -75,7 +75,7 @@ def _wrapped(payload: Any) -> dict[str, Any]:
 
 
 def test_verified_mappers_are_exactly_the_mapped_tools() -> None:
-    assert set(VERIFIED_MAPPERS) == {
+    assert {k for k in VERIFIED_MAPPERS if k[0] == "robinhood"} == {
         ("robinhood", "get_equity_quotes"),
         ("robinhood", "get_option_instruments"),
         ("robinhood", "get_option_quotes"),

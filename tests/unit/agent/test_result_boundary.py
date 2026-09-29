@@ -11,6 +11,7 @@ import pytest
 from wheelta_robinhood_agent.agent.facts_tool import FactsRequestError, parse_request
 from wheelta_robinhood_agent.agent.hooks import EnvelopeKind, ValidationRequest
 from wheelta_robinhood_agent.agent.result_boundary import (
+    CONTEXT_ONLY_TOOLS,
     VERIFIED_MAPPERS,
     BoundaryValidator,
     CandidateEvidence,
@@ -48,9 +49,13 @@ def _text(value: object) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value)}]}
 
 
-def test_only_captured_robinhood_tools_have_verified_mappers() -> None:
-    # The exact set is pinned in test_robinhood_mappers.py; no Wheelta mapping is verified.
-    assert all(server == "robinhood" for server, _ in VERIFIED_MAPPERS)
+def test_only_captured_tools_have_verified_mappers() -> None:
+    # The Robinhood set is pinned in test_robinhood_mappers.py; Wheelta maps only the board
+    # query (ADR-0041); every other Wheelta tool is context only.
+    assert {t for s, t in VERIFIED_MAPPERS if s == "wheelta"} == {"wheelta_board_query"}
+    assert {s for s, _ in VERIFIED_MAPPERS} == {"robinhood", "wheelta"}
+    wheelta_context = {t for s, t in CONTEXT_ONLY_TOOLS if s == "wheelta"}
+    assert len(wheelta_context) == 11 and "wheelta_board_query" not in wheelta_context
 
 
 @pytest.mark.parametrize(

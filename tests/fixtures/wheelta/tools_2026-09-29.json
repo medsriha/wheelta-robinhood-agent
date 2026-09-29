@@ -1,0 +1,564 @@
+{
+ "provenance": {
+  "server": "wheelta-mcp (https://mcp.wheelta.com/mcp)",
+  "captured_on": "2026-09-29",
+  "captured_via": "initialize + tools/list through agent/integrations mcp_upstream, owner-approved (read-only server)",
+  "scrubbing": "none needed: tool schemas carry no account or personal data"
+ },
+ "tools": [
+  {
+   "name": "wheelta_board_query",
+   "description": "Query today's cash-secured-put board across 85 columns and return only what you ask for.\n\nThis is the entry point for any question about what to sell puts on. Filter on any\ncolumn (score, cushion, yield, greeks, IV, open interest, spread, technicals, support\nand resistance, 52-week position, fund structure), sort on any column, page with\noffset, and choose exactly which columns come back.\n\nThe board holds one row per symbol per DTE tenor, so a name can appear up to three\ntimes \u2014 dedupe on `rowId`, group on `symbol`. The upstream API does no filtering of\nits own, so a query is evaluated over the whole board: results are complete with\nrespect to your filters, not a first page of a server-side search.\n\nSet `groupBy` when the question is about the board's shape (\"which sectors dominate\",\n\"how do scores differ by tenor\") \u2014 it returns counts and means instead of rows, for a\nfraction of the tokens. Call wheelta_board_fields for the column catalog and worked\nexamples; use wheelta_board_row for one candidate's full drawer.",
+   "input_schema": {
+    "properties": {
+     "filters": {
+      "anyOf": [
+       {
+        "items": {
+         "$ref": "#/$defs/FilterInput"
+        },
+        "maxItems": 20,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Conditions, ANDed. Omit to match every row.",
+      "title": "Filters"
+     },
+     "select": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 40,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Columns to return. Omit for a sensible screening set. Ask for only what you need \u2014 this is the main lever on how much context a result costs.",
+      "title": "Select"
+     },
+     "sort_by": {
+      "default": "wheelIq.score",
+      "description": "Column to order by. Any numeric, date or text column.",
+      "title": "Sort By",
+      "type": "string"
+     },
+     "order": {
+      "default": "desc",
+      "description": "Sort direction",
+      "enum": [
+       "desc",
+       "asc"
+      ],
+      "title": "Order",
+      "type": "string"
+     },
+     "limit": {
+      "default": 20,
+      "description": "Maximum rows",
+      "maximum": 100,
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+     },
+     "offset": {
+      "default": 0,
+      "description": "Rows to skip \u2014 page through a large match",
+      "minimum": 0,
+      "title": "Offset",
+      "type": "integer"
+     },
+     "group_by": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Summarise instead of listing: return one entry per distinct value of this column with row counts and metric means. Far cheaper than rows when the question is about shape rather than specific candidates.",
+      "title": "Group By"
+     },
+     "metrics": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 6,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Numeric columns to average per group",
+      "title": "Metrics"
+     }
+    },
+    "type": "object",
+    "$defs": {
+     "FilterInput": {
+      "description": "One condition. Filters are ANDed.",
+      "properties": {
+       "field": {
+        "description": "Column path, e.g. 'sector', 'risk.cushionCoverage', 'technicals.adx'. Call wheelta_board_fields for the catalog.",
+        "title": "Field",
+        "type": "string"
+       },
+       "op": {
+        "default": "eq",
+        "description": "'between' takes [low, high] inclusive; 'in'/'notIn' take a list; 'contains' is a case-insensitive substring on text; 'isNull'/'notNull' take no value.",
+        "enum": [
+         "eq",
+         "ne",
+         "gt",
+         "gte",
+         "lt",
+         "lte",
+         "in",
+         "notIn",
+         "between",
+         "contains",
+         "isNull",
+         "notNull"
+        ],
+        "title": "Op",
+        "type": "string"
+       },
+       "value": {
+        "default": null,
+        "description": "Comparison value. Omit for isNull/notNull.",
+        "title": "Value"
+       }
+      },
+      "required": [
+       "field"
+      ],
+      "title": "FilterInput",
+      "type": "object"
+     }
+    },
+    "title": "board_queryArguments"
+   }
+  },
+  {
+   "name": "wheelta_board_fields",
+   "description": "List the columns wheelta_board_query can filter, sort and select on.\n\nCall this before composing a non-obvious query, or when a column name was rejected.\nEach entry gives the column's type, unit, whether it can be null and what a null\nmeans there, the allowed values for enum columns, and whether it is sortable.\n\nNeeds no network call \u2014 the catalog is derived from the contract this server is\npinned to. `examples` shows complete worked queries.",
+   "input_schema": {
+    "properties": {
+     "search": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Filter the catalog by substring against column path, description or unit \u2014 e.g. 'cushion', 'volatility', 'fund'. Omit for all 85.",
+      "title": "Search"
+     }
+    },
+    "type": "object",
+    "title": "board_fieldsArguments"
+   }
+  },
+  {
+   "name": "wheelta_board_row",
+   "description": "Open one board candidate's detail drawer, section by section.\n\nUse after wheelta_board_query has narrowed to a name, or when asked about a specific\nticker. Sections are opt-in so a question about technicals does not also pay for a\npage of news prose.\n\n`wheelIq.explanation.groups[]` decomposes the score exactly \u2014 baseline plus the seven\nthemes' impactPoints sums to the score with no residual. Explain a score from that,\nand read `impactPoints` rather than `score` when saying what drove it: a theme can\nscore 90 and barely move the total if it carries little weight.\n\n404s when the symbol is not on today's board, or has no row in the requested bucket.\nThat is a real answer about the board, not an outage.",
+   "input_schema": {
+    "properties": {
+     "symbol": {
+      "description": "Ticker, uppercase, 1-5 letters. Dotted or class-share tickers (BRK.B) are not addressable in this API.",
+      "pattern": "^[A-Z]{1,5}$",
+      "title": "Symbol",
+      "type": "string"
+     },
+     "bucket": {
+      "anyOf": [
+       {
+        "enum": [
+         "short",
+         "medium",
+         "long"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Which tenor row. Omit for the symbol's primary row \u2014 its highest-scoring tenor.",
+      "title": "Bucket"
+     },
+     "sections": {
+      "anyOf": [
+       {
+        "items": {
+         "enum": [
+          "wheelIq",
+          "quote",
+          "contract",
+          "risk",
+          "technicals",
+          "levels",
+          "range",
+          "fund",
+          "trend",
+          "catalysts",
+          "news",
+          "all"
+         ],
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Which parts of the drawer to return. Defaults to the scored sections (wheelIq, quote, contract, risk). 'technicals' adds the indicator set, 'levels' support/resistance, 'range' the 52-week position, 'trend' ~30 trailing closes, 'catalysts' the dated events, 'news' the AI news read (~9 KB of prose, written once a day \u2014 ask for it only when the question is about news, sentiment or event risk). 'all' returns everything.",
+      "title": "Sections"
+     }
+    },
+    "required": [
+     "symbol"
+    ],
+    "type": "object",
+    "title": "board_rowArguments"
+   }
+  },
+  {
+   "name": "wheelta_board_status",
+   "description": "Report how fresh today's board is and how the screening funnel narrowed to it.\n\nThe cheapest call in this server \u2014 a few hundred tokens, no rows. Use it to answer\n\"how current is this?\", to check whether a rebuild has landed, or before a long\nanalysis. `buildId` identifies the funnel build and is not advanced by the 5-minute\nquote merge, so it \u2014 not `asOf` \u2014 is what changes on a real rebuild. `nextRefreshAt`\nis the poll target.\n\nBuilds run at 07:45, 10:00, 12:00, 14:00 and 15:30 America/New_York.",
+   "input_schema": {
+    "properties": {},
+    "type": "object",
+    "title": "board_statusArguments"
+   }
+  },
+  {
+   "name": "wheelta_assignment_rates",
+   "description": "Report what actually happened to contracts the board previously recommended, sliced\nby one dimension.\n\nOne row per settled contract, with its entry snapshot taken at first board sighting.\nDefaults to cushionBand because cushion is what dominates the outcome.\n\nThis is descriptive history, not a model: publish `assignedRateLow`/`High` alongside\nany rate, and publish `meta.pending` \u2014 most persisted contracts have not expired yet,\nso a large pending count means the sample is early rather than that assignment is\nrare. Buckets with `reliable: false` are provisional. An empty sample returns zeroed\ncounts, not an error.",
+   "input_schema": {
+    "properties": {
+     "category": {
+      "default": "cushionBand",
+      "description": "Which dimension to slice settled contracts by",
+      "enum": [
+       "wheelIqBand",
+       "dteBucket",
+       "cushionBand",
+       "deltaBand",
+       "sector",
+       "instrumentClass",
+       "catalystRisk"
+      ],
+      "title": "Category",
+      "type": "string"
+     },
+     "lookback_days": {
+      "anyOf": [
+       {
+        "minimum": 1,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Sample window. Snapped UP to 30, 90, 180 or 365 upstream; the value actually used comes back in meta.lookbackDays.",
+      "title": "Lookback Days"
+     }
+    },
+    "type": "object",
+    "title": "assignment_ratesArguments"
+   }
+  },
+  {
+   "name": "wheelta_macro_snapshot",
+   "description": "Return the current macro picture and its wheel-strategy regime verdict.\n\nAnswers \"is this a good environment for selling puts right now?\" and gives the\nbackdrop for any board result. `regime` carries the tag, a plain-language summary,\nexplicit guidance, and the exact FRED inputs the classification was computed from, in\nrule-test order.\n\nMost indicators come from a 24-hour cache; six are refreshed per request from live\nsources and are listed in `liveIndicatorIds`. Values are in native units with `change`\nin the same unit and `changePct` as a decimal fraction.",
+   "input_schema": {
+    "properties": {
+     "category": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Restrict indicators to one category: rates, inflation, volatility, recession, labor or markets. Omit for all of them.",
+      "title": "Category"
+     }
+    },
+    "type": "object",
+    "title": "macro_snapshotArguments"
+   }
+  },
+  {
+   "name": "wheelta_macro_series",
+   "description": "Return one FRED macro series as a time series, thinned to fit a model context.\n\nUse for trend questions the snapshot cannot answer \u2014 where rates or the yield curve\nhave been heading, not just where they are. Points are ascending by date. Thinning\nkeeps the first and last points and spaces the rest evenly; ask for a longer window\nrather than more points when you need shape rather than precision.",
+   "input_schema": {
+    "properties": {
+     "series_id": {
+      "description": "FRED series id, e.g. DGS10, T10Y2Y, VIXCLS, UNRATE",
+      "pattern": "^[A-Z0-9]{1,30}$",
+      "title": "Series Id",
+      "type": "string"
+     },
+     "lookback_days": {
+      "anyOf": [
+       {
+        "minimum": 1,
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": 365,
+      "description": "Days of history. Rounded UP to the nearest 30/90/180/365/730/1095/1825 bucket upstream, so you may receive slightly more than requested.",
+      "title": "Lookback Days"
+     },
+     "max_points": {
+      "default": 90,
+      "description": "Thin the series to at most this many points",
+      "maximum": 400,
+      "minimum": 2,
+      "title": "Max Points",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "series_id"
+    ],
+    "type": "object",
+    "title": "macro_seriesArguments"
+   }
+  },
+  {
+   "name": "wheelta_candles",
+   "description": "Return daily OHLCV bars for one underlying.\n\nUse for price-action questions a board row cannot answer \u2014 how a name has traded into\nthe current setup, where it sat before a move. When the requested window holds more\nbars than `maxPoints`, bars are aggregated into equal buckets (open of the first, max\nhigh, min low, close of the last, summed volume) rather than sampled, so highs and\nlows survive; `aggregated` says when that happened.\n\nToday's bar is still forming and lags intraday. For a current price use\nwheelta_quotes, or `quote.price` on a board row.",
+   "input_schema": {
+    "properties": {
+     "symbol": {
+      "description": "Ticker, uppercase, 1-5 letters. Dotted or class-share tickers (BRK.B) are not addressable in this API.",
+      "pattern": "^[A-Z]{1,5}$",
+      "title": "Symbol",
+      "type": "string"
+     },
+     "timeframe": {
+      "default": "6M",
+      "description": "How far back to fetch",
+      "enum": [
+       "1M",
+       "3M",
+       "6M",
+       "1Y"
+      ],
+      "title": "Timeframe",
+      "type": "string"
+     },
+     "max_points": {
+      "default": 60,
+      "description": "Aggregate down to at most this many bars",
+      "maximum": 300,
+      "minimum": 5,
+      "title": "Max Points",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "symbol"
+    ],
+    "type": "object",
+    "title": "candlesArguments"
+   }
+  },
+  {
+   "name": "wheelta_quotes",
+   "description": "Return the latest quote tick for a set of symbols.\n\nRead from an in-memory tick buffer that refreshes on a 60-second cadence during market\nhours, so this is the freshest price this API exposes. Use it for current prices,\nincluding for symbols not on the board; use wheelta_candles for history.\n\nSymbols with no tick come back in `missing` rather than as an error or a null price.",
+   "input_schema": {
+    "properties": {
+     "symbols": {
+      "description": "Tickers to quote",
+      "items": {
+       "description": "Ticker, uppercase, 1-5 letters. Dotted or class-share tickers (BRK.B) are not addressable in this API.",
+       "pattern": "^[A-Z]{1,5}$",
+       "type": "string"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Symbols",
+      "type": "array"
+     }
+    },
+    "required": [
+     "symbols"
+    ],
+    "type": "object",
+    "title": "quotesArguments"
+   }
+  },
+  {
+   "name": "wheelta_correlations",
+   "description": "Return pairwise correlation of daily log returns across a set of symbols.\n\nUse to check whether a shortlist is actually diversified before treating it as one.\nTwo names both scoring well on the board can be nearly the same bet; this is how you\nfind that out.\n\nUpstream bounds global concurrency on this route tightly, so ask once for the whole\nset rather than issuing many small calls. Fails with history_unavailable when fewer\nthan two symbols' histories resolve.",
+   "input_schema": {
+    "properties": {
+     "symbols": {
+      "description": "Between 2 and 30 tickers",
+      "items": {
+       "description": "Ticker, uppercase, 1-5 letters. Dotted or class-share tickers (BRK.B) are not addressable in this API.",
+       "pattern": "^[A-Z]{1,5}$",
+       "type": "string"
+      },
+      "maxItems": 30,
+      "minItems": 2,
+      "title": "Symbols",
+      "type": "array"
+     },
+     "window": {
+      "default": "90d",
+      "description": "Lookback in calendar days",
+      "enum": [
+       "30d",
+       "90d"
+      ],
+      "title": "Window",
+      "type": "string"
+     }
+    },
+    "required": [
+     "symbols"
+    ],
+    "type": "object",
+    "title": "correlationsArguments"
+   }
+  },
+  {
+   "name": "wheelta_calendar_events",
+   "description": "Return upcoming earnings and ex-dividend dates for symbols the board covers.\n\nThis is the event-risk check to run before committing to a candidate: an earnings\nprint inside the contract's life is the single most common reason a screened setup is\na bad idea. Ex-dividend dates matter for assignment timing on dividend payers.\n\nScoped to the board's universe, so a symbol the screener does not cover will not\nappear. Events come back ascending by date.",
+   "input_schema": {
+    "properties": {
+     "symbols": {
+      "anyOf": [
+       {
+        "items": {
+         "description": "Ticker, uppercase, 1-5 letters. Dotted or class-share tickers (BRK.B) are not addressable in this API.",
+         "pattern": "^[A-Z]{1,5}$",
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Restrict to these tickers. Omit for all.",
+      "title": "Symbols"
+     },
+     "event_type": {
+      "anyOf": [
+       {
+        "enum": [
+         "earnings",
+         "exDividend"
+        ],
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Restrict to one event type",
+      "title": "Event Type"
+     },
+     "in_window_only": {
+      "default": false,
+      "description": "Only events inside a symbol's trade window",
+      "title": "In Window Only",
+      "type": "boolean"
+     },
+     "min_date": {
+      "anyOf": [
+       {
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Earliest date, YYYY-MM-DD",
+      "title": "Min Date"
+     },
+     "max_date": {
+      "anyOf": [
+       {
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null,
+      "description": "Latest date, YYYY-MM-DD",
+      "title": "Max Date"
+     },
+     "limit": {
+      "default": 50,
+      "maximum": 200,
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+     }
+    },
+    "type": "object",
+    "title": "calendar_eventsArguments"
+   }
+  },
+  {
+   "name": "wheelta_company_research",
+   "description": "Return one company's identity and its valuation snapshot in a single call.\n\nProfile gives name, sector, industry, description, exchange and country. Valuation\ngives the multiples (P/E, PEG, P/B, P/S, EV/EBITDA), EPS, dividend yield and payout,\nbeta, and the 52-week range with the current position inside it.\n\nUse to answer \"what is this company and is it expensive?\" about a board candidate.\nYou do not need this to label a board row: rows already carry `company`, the same\nstring this returns as `companyName`.\n\nThe two halves come from different providers and are fetched concurrently; if one is\nunavailable the other is still returned, and `unavailable` says which failed.",
+   "input_schema": {
+    "properties": {
+     "symbol": {
+      "description": "Ticker, uppercase, 1-5 letters. Dotted or class-share tickers (BRK.B) are not addressable in this API.",
+      "pattern": "^[A-Z]{1,5}$",
+      "title": "Symbol",
+      "type": "string"
+     }
+    },
+    "required": [
+     "symbol"
+    ],
+    "type": "object",
+    "title": "company_researchArguments"
+   }
+  }
+ ]
+}

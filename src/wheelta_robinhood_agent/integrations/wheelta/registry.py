@@ -1,7 +1,8 @@
 """Wheelta MCP tool registry. Every Wheelta tool is read-only (CLAUDE.md §10).
 
 Names are from the wheelta-mcp contract (`/Users/deepset/wheelta-mcp/MCP.yaml`), which this
-repository consumes but does not own.
+repository consumes but does not own, verified against our own `tools/list` capture of
+2026-09-29 (`tests/fixtures/wheelta/tools_2026-09-29.json`, ADR-0041).
 """
 
 from wheelta_robinhood_agent.domain.enums import ToolTier
@@ -27,5 +28,5 @@ WHEELTA_REGISTRY: ToolRegistry = make_registry(
             "wheelta_company_research",
         ),
     },  # fmt: skip
-    verified=False,
+    verified=True,
 )

@@ -1,0 +1,62 @@
+{
+ "provenance": {
+  "tool": "wheelta_board_status",
+  "arguments": {},
+  "server": "wheelta-mcp",
+  "captured_on": "2026-09-29",
+  "captured_via": "read-only call through mcp_upstream, owner-approved",
+  "scrubbing": "none needed: public board data, no account data"
+ },
+ "structuredContent": {
+  "asOf": "2026-09-28T20:58:23Z",
+  "buildId": "df52f70ac584",
+  "buildState": "ready",
+  "universeRows": 210,
+  "distinctSymbols": 126,
+  "nextRefreshAt": "2026-09-29T11:45:00Z",
+  "dteBuckets": [
+   {
+    "bucket": "short",
+    "minDte": 1,
+    "maxDte": 14,
+    "rows": 94
+   },
+   {
+    "bucket": "medium",
+    "minDte": 15,
+    "maxDte": 30,
+    "rows": 90
+   },
+   {
+    "bucket": "long",
+    "minDte": 31,
+    "maxDte": 45,
+    "rows": 26
+   }
+  ],
+  "funnel": {
+   "screened": 1805,
+   "passedFundamentals": 1132,
+   "passedTechnical": 1132,
+   "passedOptions": 439
+  },
+  "scoreRange": [
+   57.78,
+   76.24
+  ],
+  "sectors": [
+   "Basic Materials",
+   "Broad Market",
+   "Commodities",
+   "Communication Services",
+   "Consumer Cyclical",
+   "Consumer Defensive",
+   "Digital Assets",
+   "Energy",
+   "Financial",
+   "Healthcare",
+   "Industrials",
+   "Technology"
+  ]
+ }
+}

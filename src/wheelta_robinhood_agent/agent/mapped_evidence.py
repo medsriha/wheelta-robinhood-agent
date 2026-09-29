@@ -16,6 +16,7 @@ from wheelta_robinhood_agent.domain.account import AccountSnapshot
 from wheelta_robinhood_agent.domain.base import NonEmptyStr, Ref
 from wheelta_robinhood_agent.domain.enums import AttemptStatus, CandidateOrigin
 from wheelta_robinhood_agent.domain.facts_compute import (
+    BoardScreen,
     OpenOrdersRead,
     OptionInstrument,
     PositionsRead,
@@ -23,6 +24,8 @@ from wheelta_robinhood_agent.domain.facts_compute import (
 )
 from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.run_record import Quote
+
+CANDIDATE_REF_PREFIX = "candidate:"
 
 
 class _Model(BaseModel):
@@ -154,6 +157,11 @@ class MappedEvidence(_Model):
     order_reviews: tuple[OrderReviewObservation, ...] = ()
     cancel_requests: tuple[CancelRequestObservation, ...] = ()
     pending_option_positions: tuple[PendingOptionPositions, ...] = ()
+    # ADR-0041: Wheelta board rows, a build-time screen (never a quote).
+    board_screens: tuple[BoardScreen, ...] = ()
+    # Non-citable context delivered beside the evidence (the other selected board columns);
+    # it carries no evidence identity and can back no number or decision.
+    screen_context: tuple[dict[str, JsonValue], ...] = ()
     gaps: tuple[str, ...] = ()
 
     def _observed(self) -> tuple[_Observed, ...]:
@@ -173,6 +181,7 @@ class MappedEvidence(_Model):
             *(p.evidence_id for p in self.positions),
             *(o.evidence_id for o in self.open_orders),
             *(o.evidence_id for o in self._observed()),
+            *(b.evidence_id for b in self.board_screens),
         )
 
     def source_tool_call_ids(self) -> tuple[uuid.UUID, ...]:
@@ -184,6 +193,7 @@ class MappedEvidence(_Model):
             *(t for p in self.positions for t in p.source_tool_call_ids),
             *(t for o in self.open_orders for t in o.source_tool_call_ids),
             *(t for o in self._observed() for t in o.source_tool_call_ids),
+            *(t for b in self.board_screens for t in b.source_tool_call_ids),
         )
 
 

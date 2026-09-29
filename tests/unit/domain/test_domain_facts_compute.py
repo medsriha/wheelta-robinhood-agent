@@ -1045,3 +1045,58 @@ def test_observation_needs_a_tool_call() -> None:
 def test_float_prices_are_rejected() -> None:
     with pytest.raises(ValidationError):
         open_inputs(limit_price=0.5)
+
+
+# -- board comparison (ADR-0041) ----------------------------------------------------------------
+
+
+def _board_candidate() -> CandidateProvenance:
+    return CandidateProvenance(
+        candidate_ref="candidate:1", origin=CandidateOrigin.BOARD, underlying="XYZ"
+    )
+
+
+def _screen(bid: str = "0.50", occ: OccSymbol = PUT) -> Any:
+    from wheelta_robinhood_agent.domain.facts_compute import BoardScreen
+
+    return BoardScreen(
+        evidence_id=uid(30),
+        as_of=T0 - timedelta(hours=1),
+        source_tool_call_ids=(TC,),
+        build_id="b1",
+        row_id="XYZ:medium",
+        underlying="XYZ",
+        occ_symbol=occ,
+        bid=D(bid),
+    )
+
+
+def test_board_candidate_facts_carry_the_premium_divergence() -> None:
+    f = facts(open_inputs(candidate=_board_candidate(), board_screen=_screen("0.50")))
+    # |live bid 0.40 - board bid 0.50| / 0.50
+    assert metric(f, "board_vs_live_premium_divergence_ratio") == D("0.2")
+    m = f.metric("board_vs_live_premium_divergence_ratio")
+    assert m is not None and m.value.derivation is not None
+    assert m.value.derivation.formula == "board_premium_divergence"
+    assert uid(30) in f.input_evidence_ids
+
+
+def test_board_candidate_without_its_row_is_blocked_by_a_gap() -> None:
+    f = facts(open_inputs(candidate=_board_candidate()))
+    assert "board_screen" in {g.field for g in f.gaps}
+    assert f.metric("board_vs_live_premium_divergence_ratio") is None
+    zero = facts(open_inputs(candidate=_board_candidate(), board_screen=_screen("0")))
+    assert "board_screen" in {g.field for g in zero.gaps}
+
+
+def test_robinhood_candidates_need_no_board_row() -> None:
+    f = facts(open_inputs())
+    assert "board_screen" not in {g.field for g in f.gaps}
+    assert f.metric("board_vs_live_premium_divergence_ratio") is None
+
+
+def test_a_board_screen_must_match_a_board_candidates_contract() -> None:
+    with pytest.raises(ValidationError, match="board screen"):
+        open_inputs(board_screen=_screen())  # robinhood-origin candidate
+    with pytest.raises(ValidationError, match="board screen"):
+        open_inputs(candidate=_board_candidate(), board_screen=_screen(occ=OTHER_PUT))

@@ -501,7 +501,10 @@ def build_session_options(
         deps.conn, run_id=deps.run_id, result_writer=ledger_result_writer
     )
     validator = BoundaryValidator(
-        redactor=deps.redactor, mappers=deps.mappers, account_eligible=account_eligible
+        redactor=deps.redactor,
+        mappers=deps.mappers,
+        account_eligible=account_eligible,
+        board_screens=lambda: load_run_evidence(deps.conn, deps.run_id).board_screens(),
     )
     upstreams = dict(upstreams or {})
     dispatch = ProxyDispatch(frozenset(upstreams))

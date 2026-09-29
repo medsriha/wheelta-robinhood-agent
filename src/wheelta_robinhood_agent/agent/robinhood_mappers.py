@@ -46,8 +46,10 @@ from typing import Annotated, Final, Literal
 from pydantic import BaseModel, BeforeValidator, ConfigDict, JsonValue, StrictBool, StrictInt
 
 from wheelta_robinhood_agent.agent.mapped_evidence import (
+    CANDIDATE_REF_PREFIX,
     BrokerOrderObservation,
     CancelRequestObservation,
+    CandidateEvidence,
     EvidenceMapper,
     Execution,
     HeldOptionRow,
@@ -60,6 +62,7 @@ from wheelta_robinhood_agent.agent.mapped_evidence import (
 from wheelta_robinhood_agent.domain.account import AccountSnapshot
 from wheelta_robinhood_agent.domain.enums import (
     AttemptStatus,
+    CandidateOrigin,
     DataQuality,
     OptionRight,
     OrderSide,
@@ -274,9 +277,15 @@ def map_option_instruments(
     a price-dependent tick cannot be stated as one increment. An instrument that is not
     `active`/`tradable` or whose `underlying_type` is not `equity` yields a gap, because
     `OptionInstrument` cannot record tradability. A repeated instrument ID raises.
+
+    Each mapped instrument also gets a code-issued candidate reference (ADR-0041), the only
+    subject the decision-facts tool sizes for an open. Its origin is `robinhood` here; the
+    result boundary sets `board` when a current-build Wheelta board row of this run lists
+    the same contract.
     """
     parsed = _Instruments.model_validate(_unwrap(request.payload))
     instruments: list[OptionInstrument] = []
+    candidates: list[CandidateEvidence] = []
     gaps: list[str] = []
     seen: set[uuid.UUID] = set()
     for inst in parsed.instruments:
@@ -318,9 +327,22 @@ def map_option_instruments(
                     ),
                 )
             )
+            inst_ev = instruments[-1]
+            candidates.append(
+                CandidateEvidence(
+                    candidate_ref=f"{CANDIDATE_REF_PREFIX}{new_id()}",
+                    origin=CandidateOrigin.ROBINHOOD,
+                    underlying=inst_ev.underlying,
+                    instrument_evidence_id=inst_ev.evidence_id,
+                    broker_instrument_id=inst_ev.broker_instrument_id,
+                    occ_symbol=inst_ev.occ_symbol,
+                )
+            )
     if not parsed.instruments:
         gaps.append(_gap_text(request.tool, "no instruments returned"))
-    return MappedEvidence(instruments=tuple(instruments), gaps=tuple(gaps))
+    return MappedEvidence(
+        instruments=tuple(instruments), candidates=tuple(candidates), gaps=tuple(gaps)
+    )
 
 
 # --------------------------------------------------------------------------------------------

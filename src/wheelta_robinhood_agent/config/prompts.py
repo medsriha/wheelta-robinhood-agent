@@ -24,7 +24,7 @@ ACTIVE_PROMPT_VERSION = 11
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {
-        MignonType.MARKET: ("mignon_market", 2),
+        MignonType.MARKET: ("mignon_market", 3),  # ADR-0041: board first
         MignonType.COMPANY: ("mignon_company", 2),
         MignonType.MACRO: ("mignon_macro", 2),
     }

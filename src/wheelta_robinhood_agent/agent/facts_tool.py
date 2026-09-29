@@ -45,10 +45,11 @@ from wheelta_robinhood_agent.agent.result_boundary import (
 )
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
 from wheelta_robinhood_agent.domain.account import AccountSnapshot
-from wheelta_robinhood_agent.domain.enums import DataQuality, PositionsCoverage
+from wheelta_robinhood_agent.domain.enums import CandidateOrigin, DataQuality, PositionsCoverage
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.facts import DecisionFacts, FactsPurpose
 from wheelta_robinhood_agent.domain.facts_compute import (
+    BoardScreen,
     CandidateProvenance,
     FactInputs,
     OpenOrdersRead,
@@ -240,6 +241,19 @@ class RunEvidence:
         latest: PositionsRead | None = self._latest(reads)
         return latest
 
+    def board_screens(self) -> dict[str, BoardScreen]:
+        """Board rows of the run's current Wheelta build, by OCC symbol (ADR-0041).
+
+        The current build is the build of the newest board row seen this run (by `as_of`); rows
+        of any older build are never used (data_quality.freshness.wheelta_board). A contract
+        listed more than once in the build keeps its latest row.
+        """
+        rows = sorted((b for e in self.items for b in e.board_screens), key=lambda b: b.as_of)
+        if not rows:
+            return {}
+        build = rows[-1].build_id
+        return {str(b.occ_symbol): b for b in rows if b.build_id == build}
+
     def open_orders(self) -> OpenOrdersRead | None:
         latest: OpenOrdersRead | None = self._latest([o for e in self.items for o in e.open_orders])
         return latest
@@ -347,6 +361,11 @@ class DecisionFactsService:
                 positions=evidence.positions(),
                 open_orders=evidence.open_orders(),
                 candidate=candidate,
+                board_screen=(
+                    evidence.board_screens().get(str(instrument.occ_symbol))
+                    if candidate is not None and candidate.origin is CandidateOrigin.BOARD
+                    else None
+                ),
                 position=position,
                 limit_price=request.limit_price,
                 close_quantity=request.close_quantity,

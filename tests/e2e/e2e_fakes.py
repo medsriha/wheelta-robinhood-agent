@@ -126,7 +126,7 @@ def build_world(as_of: datetime) -> FakeWorld:
     def place(args: dict[str, Any]) -> dict[str, Any]:  # must never be reached
         raise AssertionError("an order tool reached the fake broker")
 
-    return FakeWorld(
+    world = FakeWorld(
         handlers={
             "robinhood": {
                 "get_accounts": accounts,
@@ -161,6 +161,18 @@ def build_world(as_of: datetime) -> FakeWorld:
         },
         web_results={"AAPL earnings date": [{"title": "AAPL earnings", "url": "https://x.test"}]},
     )
+    return add_fake_wheelta(world)
+
+
+def add_fake_wheelta(world: FakeWorld) -> FakeWorld:
+    """A fake Wheelta server listing every registered tool (ADR-0041: verified), so discovery
+    is complete; each returns a small object (context only without a mapper)."""
+    from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
+
+    world.handlers["wheelta"] = {
+        t.name: (lambda args: _text({"ok": True})) for t in WHEELTA_REGISTRY.tools
+    }
+    return world
 
 
 # -- fixture mappers (fake schemas only) -------------------------------------------------------
@@ -498,3 +510,93 @@ async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> st
     (after,) = final.data["evidence"]["broker_orders"]
     assert after["state_raw"] == "cancelled" and after["canceled_quantity"] == 1
     return decision_json(candidate_ref, facts_ref)
+
+
+# -- Wheelta board as the initial scanner (ADR-0041) ------------------------------------------
+
+# The captured SPY 740 put (instrument and quote fixtures), listed on the fake board.
+BOARD_BID = "1.90"
+BOARD_BUILD = "build-e2e-1"
+
+
+def _board_rows(args: dict[str, Any]) -> dict[str, Any]:
+    return _text(
+        {
+            "mode": "rows",
+            "matched": 1,
+            "universeRows": 210,
+            "freshness": {
+                "asOf": "2026-09-25T19:00:00Z",
+                "buildId": BOARD_BUILD,
+                "buildState": "ready",
+                "nextRefreshAt": "2026-09-25T19:30:00Z",
+            },
+            "rows": [
+                {
+                    "rowId": "SPY:medium",
+                    "symbol": "SPY",
+                    "wheelIq.score": 76.13,
+                    "contract.strike": 740.0,
+                    "contract.expiration": "2026-10-16",
+                    "contract.bid": float(BOARD_BID),
+                    "risk.annualizedYield": 0.0606,
+                }
+            ],
+            "columns": ["rowId", "symbol", "wheelIq.score"],
+            "returned": 1,
+            "note": None,
+        }
+    )
+
+
+def wheelta_world(as_of: datetime) -> FakeWorld:
+    """`simulated_world` plus a fake Wheelta server (every registered tool) and the captured
+    SPY quote, so a board row, the Robinhood instrument, and a live quote line up."""
+    world = simulated_world(as_of)
+    world.handlers["robinhood"]["get_option_quotes"] = lambda args: _text(
+        _fixture("get_option_quotes.SPY_20261016_P740.json")
+    )
+    world.handlers["wheelta"]["wheelta_board_query"] = _board_rows
+    return world
+
+
+WHEELTA_MAPPERS_E2E = {
+    **SIMULATED_MAPPERS,
+    **{
+        key: mapper
+        for key, mapper in VERIFIED_MAPPERS.items()
+        if key in {("robinhood", "get_option_quotes"), ("wheelta", "wheelta_board_query")}
+    },
+}
+
+
+async def board_mignon(model: FakeModel) -> str:
+    """A market Mignon screening the Wheelta board first (the initial scanner)."""
+    board = await model.call(
+        "mcp__wheelta__wheelta_board_query",
+        {"select": ["rowId", "symbol", "contract.strike", "contract.expiration", "contract.bid"]},
+    )
+    assert board.output["kind"] == "validated", board.output
+    return mignon_report(
+        "Screen the Wheelta board for cash-secured puts.",
+        ("The board lists the SPY 740 put.", [board.data["evidence_ref"]]),
+    )
+
+
+async def board_scanner_script(model: FakeModel) -> str | None:
+    turn = await model.spawn(MARKET, "Screen the Wheelta board.", board_mignon)
+    assert turn.output["kind"] == "validated", turn.output
+    account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+    inst = await model.call("mcp__robinhood__get_option_instruments", {"ids": SPY_INSTRUMENT_ID})
+    (candidate,) = inst.data["evidence"]["candidates"]
+    assert candidate["origin"] == "board", candidate
+    await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]})
+    await model.call("mcp__robinhood__get_portfolio", account)
+    await model.call("mcp__robinhood__get_option_positions", account)
+    await model.call("mcp__robinhood__get_option_orders", account)
+    facts = await model.call(
+        "mcp__wra_local__get_decision_facts",
+        {"subject_ref": candidate["candidate_ref"], "purpose": "open", "limit_price": "1.79"},
+    )
+    assert facts.data["status"] == "ok", facts.data
+    return decision_json(candidate["candidate_ref"], facts.data["facts_ref"], limit_price="1.79")

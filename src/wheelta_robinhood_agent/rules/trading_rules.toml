@@ -28,9 +28,9 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 9
+version = 10
 status = "signed_off"
-adr = "ADR-0039"
+adr = "ADR-0041"
 signed_off_by = "medsriha (account owner)"
 signed_off_on = "2026-09-28"
 
@@ -230,10 +230,10 @@ assigned_shares = "Become CC candidates in selection, with a strike that satisfi
 
 [selection]
 sources = [
-  "The Wheelta board.",
-  "Your saved scans (run_scan).",
+  "First, the Wheelta board (wheelta_board_query): the initial scanner for cash-secured puts. Screen it before any other discovery.",
+  "Only when the current board carries no relevant contract (unavailable or building, or no row passes selection.underlying_filters and selection.contract_filters): the Robinhood scanner, your saved scans (run_scan) and scanner previews (preview_scan).",
   "Your owned watchlists.",
-  "Uncovered share lots of at least one contract multiplier of shares.",
+  "Uncovered share lots of at least one contract multiplier of shares (covered calls).",
 ]
 underlying_filters = [
   "Tradable.",

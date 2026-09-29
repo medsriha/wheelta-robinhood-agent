@@ -481,20 +481,32 @@ def test_robinhood_needs_auth_at_connect_sends_no_query(harness: Callable[..., H
     assert h.status() is RunStatus.FAILED
 
 
-def test_production_defaults_proxy_robinhood_and_withhold_unverified_wheelta(
+def test_production_defaults_proxy_both_verified_sources(
     harness: Callable[..., Harness],
 ) -> None:
     """Direct delivery is not accepted, so a remote source reaches the model only through the
-    validating proxy (ADR-0023), and only with a verified registry."""
+    validating proxy (ADR-0023), and only with a verified registry (Wheelta: ADR-0041)."""
     h = harness()
     h.run(remote_boundary_accepted=False, registries=(ROBINHOOD_REGISTRY, WHEELTA_REGISTRY))
     assert len(h.clis) == 1
     (cli,) = h.clis
     servers = cli.options.mcp_servers
     assert isinstance(servers, dict)
-    assert {n: c["type"] for n, c in servers.items()} == {"robinhood": "sdk", "wra_local": "sdk"}
+    assert {n: c["type"] for n, c in servers.items()} == {
+        "robinhood": "sdk",
+        "wheelta": "sdk",
+        "wra_local": "sdk",
+    }
     statuses = {e["server"]: e["status"] for e in h.events(RunEventType.SOURCE_STATUS)}
     assert statuses["robinhood"] == "connected"
+    assert statuses["wheelta"] == "connected"
+
+
+def test_an_unverified_registry_is_still_withheld(harness: Callable[..., Harness]) -> None:
+    h = harness()
+    unverified = WHEELTA_REGISTRY.model_copy(update={"verified": False})
+    h.run(remote_boundary_accepted=False, registries=(ROBINHOOD_REGISTRY, unverified))
+    statuses = {e["server"]: e["status"] for e in h.events(RunEventType.SOURCE_STATUS)}
     assert statuses["wheelta"] == "disabled"
 
 
@@ -589,8 +601,8 @@ def test_dry_run_records_an_unsubmitted_proposal_and_audits_it(
     assert record.findings == ()
     assert findings, "the audit recorded findings"
     assert h.events(RunEventType.AUDIT_STATUS)[0]["status"] == "completed"
-    # Wheelta is unverified in the registry: withheld, and the model was told so.
-    assert "wheelta" in h.clis[0].user_messages[0]
+    # Wheelta is verified (ADR-0041): not withheld, so the model is not told it is.
+    assert "wheelta" not in h.clis[0].user_messages[0]
 
 
 def test_invalid_agent_output_still_assembles_from_events(harness: Callable[..., Harness]) -> None:
@@ -837,7 +849,8 @@ def test_unmapped_remote_result_never_reaches_the_model(harness: Callable[..., H
         return await dry_run_script(model)
 
     h = harness()
-    assert h.run(script) == 0
+    unverified = WHEELTA_REGISTRY.model_copy(update={"verified": False})
+    assert h.run(script, registries=(VERIFIED_RH, unverified)) == 0
     (cli,) = h.clis
     assert RAW_MARKER not in repr(cli.model_inputs)
     with h.conn() as c:
@@ -1413,3 +1426,40 @@ def test_a_dry_run_adds_no_position_notes(harness: Callable[..., Harness]) -> No
         (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
     assert [d.rationale for d in stored.record.decisions] == ["Dry-run judgment."]
     assert entry.notes == ()
+
+
+def test_the_wheelta_board_is_the_initial_scanner_and_board_candidates_are_compared(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0041: a Mignon screens the board; the Robinhood instrument for a listed contract is
+    a board-origin candidate; its facts carry the board-vs-live premium divergence."""
+    from decimal import Decimal
+
+    from e2e_fakes import (
+        BOARD_BID,
+        WHEELTA_MAPPERS_E2E,
+        board_scanner_script,
+        wheelta_world,
+    )
+
+    from wheelta_robinhood_agent.agent.trace_loader import load_decision_trace
+
+    quote_time = datetime.fromisoformat("2026-09-25T20:15:20+00:00")  # fixture quote + 20 s
+    h = harness(at=quote_time)
+    h.world = wheelta_world(h.clock.now)
+    assert h.run(board_scanner_script, mappers=WHEELTA_MAPPERS_E2E) == 0, h.notifier.alert_kinds()
+    with h.conn() as c:
+        facts = ledger_evidence.decision_facts_for_run(c, h.run_id)
+        trace = load_decision_trace(c, h.run_id)
+    (stored,) = facts
+    metric = stored.facts.metric("board_vs_live_premium_divergence_ratio")
+    assert metric is not None and metric.value.value is not None
+    live_bid = Decimal("1.790000")
+    expected = abs(live_bid - Decimal(BOARD_BID)) / Decimal(BOARD_BID)
+    assert abs(metric.value.value - expected) < Decimal("1e-20")
+    assert not [g for g in stored.facts.gaps if g.field == "board_screen"]
+    (decision,) = trace.decisions
+    assert decision.action == "OPEN_CSP"
+    wheelta = [c for c in trace.timeline if c.server == "wheelta"]
+    assert [c.tool for c in wheelta] == ["wheelta_board_query"]
+    assert wheelta[0].caller.startswith("mignon-market")
