@@ -1,8 +1,9 @@
 """MignonReport v1: the typed hand-back of one research Mignon (ADR-0025, INTERFACES.md).
 
-A Mignon's final response must be exactly one JSON object of this shape. It carries claims,
-the code-issued references that support them, fetched web pages, gaps, and questions; never
-a number of its own that a reference does not back. The PostToolUse hook parses it strictly
+A Mignon's final response must contain one JSON object of this shape; prose or a code fence
+around it is dropped (ADR-0043). It carries claims, the code-issued references that support
+them, fetched web pages, gaps, and questions; never a number of its own that a reference does
+not back. The PostToolUse hook parses it strictly
 (`parse_mignon_report`) and then resolves its references against what that Mignon was
 actually delivered this run (`check_report_sources`). Only a report that passes both reaches
 the orchestrator; anything else is replaced by an invalid-report envelope.
@@ -17,6 +18,7 @@ Rules (each checked here, in pure code):
   URL that was not delivered to this Mignon is an issue.
 """
 
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Annotated, Final, Literal, Self
@@ -27,7 +29,6 @@ from wheelta_robinhood_agent.domain.base import DomainModel, require_unique
 from wheelta_robinhood_agent.domain.decision_output import (
     ParseIssue,
     load_strict_json,
-    strip_json_fence,
     validation_issues,
 )
 
@@ -89,15 +90,43 @@ class MignonReportParseFailure:
 MignonReportParseResult = MignonReportParsed | MignonReportParseFailure
 
 
-def parse_mignon_report(raw: str | bytes) -> MignonReportParseResult:
-    """Strictly parse a Mignon's final text into MignonReport v1. Never raises.
+def extract_report_object(raw: str | bytes) -> str | bytes:
+    """The report's JSON object text from a Mignon's final response (ADR-0043).
 
-    The text must be exactly one JSON object (surrounding whitespace allowed; no prose), under
-    the same strict JSON rules as AgentDecisionOutput. ADR-0032: one enclosing ```json (or
-    bare ```) fence around the whole text is removed first; anything else outside the object
-    still fails.
+    A Mignon may write prose, a code fence, or notes around its report. The report is the last
+    top-level JSON object in the text that has a `findings` key, else the last top-level JSON
+    object; the text outside it is dropped. Locating uses a lenient decoder only to find object
+    spans: the chosen span is then parsed under the strict rules. Text with no JSON object, and
+    bytes, come back unchanged so the strict parser reports the issue.
     """
-    loaded = load_strict_json(strip_json_fence(raw))
+    if not isinstance(raw, str):
+        return raw
+    decoder = json.JSONDecoder()
+    spans: list[tuple[str, bool]] = []
+    index = raw.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(raw, index)
+        except (ValueError, RecursionError):
+            index = raw.find("{", index + 1)
+            continue
+        if isinstance(value, dict):
+            spans.append((raw[index:end], "findings" in value))
+        index = raw.find("{", end)
+    if not spans:
+        return raw
+    with_findings = [text for text, has_findings in spans if has_findings]
+    return with_findings[-1] if with_findings else spans[-1][0]
+
+
+def parse_mignon_report(raw: str | bytes) -> MignonReportParseResult:
+    """Parse a Mignon's final text into MignonReport v1. Never raises.
+
+    ADR-0043: the report object is located with `extract_report_object`, so prose or a code
+    fence around it is allowed. The object itself is parsed under the same strict JSON rules as
+    AgentDecisionOutput, and every schema and citation rule still applies.
+    """
+    loaded = load_strict_json(extract_report_object(raw))
     if isinstance(loaded, ParseIssue):
         return MignonReportParseFailure(ok=False, issues=(loaded,))
     _, data = loaded

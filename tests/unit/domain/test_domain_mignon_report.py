@@ -10,6 +10,7 @@ from hypothesis import strategies as st
 from wheelta_robinhood_agent.domain.mignon_report import (
     MignonReportParsed,
     check_report_sources,
+    extract_report_object,
     parse_mignon_report,
 )
 
@@ -52,10 +53,8 @@ def test_empty_findings_with_gaps_is_valid() -> None:
 @pytest.mark.parametrize(
     ("raw", "kind"),
     [
-        ("Here is my report.\n" + json.dumps(doc()), "invalid_json"),  # prose before
-        (json.dumps(doc()) + "\nDone.", "invalid_json"),  # prose after
-        ("```json\n" + json.dumps(doc()) + "\n```\nDone.", "invalid_json"),  # text after fence
-        ("```json\n```json\n" + json.dumps(doc()) + "\n```\n```", "invalid_json"),  # two fences
+        ("No report here.", "invalid_json"),
+        ("Prose {not json} only.", "invalid_json"),
         ("```json\n{}\n```", "missing"),  # the fence is removed; the schema still applies
         ("[]", "not_object"),
         ('{"task": "t", "task": "u"}', "duplicate_key"),
@@ -120,3 +119,53 @@ def test_one_enclosing_fence_is_accepted(fence: str) -> None:
 def test_a_fence_inside_a_claim_is_left_alone() -> None:
     report = doc(f("Scan note: ```x```", ("evidence:e-1",)))
     assert parsed(report).report.findings[0].claim == "Scan note: ```x```"
+
+
+# -- ADR-0043: prose or a code fence around the report is dropped --------------------------------
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda body: "Here is my report.\n" + body,
+        lambda body: body + "\nDone.",
+        lambda body: "I have everything needed. Compiling the final report.\n\n" + body,
+        lambda body: "```json\n" + body + "\n```\n\nSources:\n- [BLS](https://www.bls.gov/)",
+        lambda body: "```json\n```json\n" + body + "\n```\n```",
+    ],
+)
+def test_prose_or_fence_around_the_report_is_accepted(wrap: Any) -> None:
+    body = json.dumps(doc(f("Bid is 1.20.", ("evidence:e-1",))), indent=2)
+    result = parse_mignon_report(wrap(body))
+    assert isinstance(result, MignonReportParsed), result
+    assert result.report.cited_refs() == {"evidence:e-1"}
+
+
+def test_the_last_object_with_findings_is_the_report() -> None:
+    example = json.dumps({"example": "shape"})
+    first = json.dumps(doc(task="draft"))
+    final = json.dumps(doc(task="final"))
+    raw = f'Shape: {example}. Draft: {first}\nFinal: {final}\nNote {{braces}} and {{"a": 1}}.'
+    assert parsed_raw(raw).report.task == "final"
+
+
+def test_without_findings_the_last_object_is_parsed() -> None:
+    assert failure_kinds('Notes. {"task": "t"}') == ["missing", "missing", "missing"]
+
+
+def test_strict_rules_still_apply_to_the_extracted_report() -> None:
+    assert failure_kinds("Report:\n" + json.dumps(doc(n=1))) == ["json_number"]
+    assert failure_kinds("Report:\n" + json.dumps(doc(extra="x"))) == ["extra_forbidden"]
+    uncited = json.dumps(doc(f("Last trade 22.23.", urls=("https://example.com/q",))))
+    assert failure_kinds("Report:\n" + uncited) == ["value_error"]
+
+
+def test_extract_leaves_text_without_an_object_and_bytes_unchanged() -> None:
+    assert extract_report_object("no object [1, 2]") == "no object [1, 2]"
+    assert extract_report_object(b"{}") == b"{}"
+
+
+def parsed_raw(raw: str) -> MignonReportParsed:
+    result = parse_mignon_report(raw)
+    assert isinstance(result, MignonReportParsed), result
+    return result
