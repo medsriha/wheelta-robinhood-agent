@@ -16,7 +16,14 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
-from e2e_fake_cli import FakeCli, FakeModel, FakeToolFailure, factory, world_upstreams
+from e2e_fake_cli import (
+    FakeCli,
+    FakeModel,
+    FakeToolFailure,
+    ToolTurn,
+    factory,
+    world_upstreams,
+)
 from e2e_fakes import (
     ACCOUNT_NUMBER,
     COMPANY,
@@ -48,7 +55,11 @@ from e2e_support import (
 )
 
 from wheelta_robinhood_agent.agent.account_scope import AGENTIC_ACCOUNT_PLACEHOLDER
-from wheelta_robinhood_agent.agent.session import plan_session
+from wheelta_robinhood_agent.agent.session import (
+    MAX_OUTPUT_REPAIRS,
+    OUTPUT_REPAIR_DENIAL,
+    plan_session,
+)
 from wheelta_robinhood_agent.config.prompts import load_prompt
 from wheelta_robinhood_agent.config.rules import load_rules
 from wheelta_robinhood_agent.config.settings import Settings
@@ -97,13 +108,15 @@ class Harness:
         self.mailer = RecordingMailer()
         self.world = build_world(clock.now)
         self.run_id = run_id_for(settings.APP_ENV, slot_for(clock.now))
+        # Answers output repair turns (ADR-0044); None repeats the previous final text.
+        self.followup: Script | None = None
 
     def deps(self, script: Script, **overrides: Any) -> OrchestratorDeps:
         values: dict[str, Any] = {
             "notifier": self.notifier,
             "summary_mailer": self.mailer,
             "clock": self.clock,
-            "transport_factory": factory(self.world, script, self.clis),
+            "transport_factory": factory(self.world, script, self.clis, self.followup),
             "upstream_factory": world_upstreams(self.world),
             "install_signals": False,
             "remote_boundary_accepted": True,
@@ -616,13 +629,52 @@ def test_invalid_agent_output_still_assembles_from_events(harness: Callable[...,
     assert "invalid_agent_output" in h.notifier.alert_kinds()
     with h.conn() as c:
         (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
-        (output,) = ledger_evidence.agent_outputs_for_run(c, h.run_id)
+        outputs = ledger_evidence.agent_outputs_for_run(c, h.run_id)
         calls = tool_call_records(c, h.run_id)
-    assert output.raw_redacted == "I would sell the AAPL put."
+    # ADR-0044: the original and MAX_OUTPUT_REPAIRS repeats, each correcting the one before.
+    assert len(outputs) == 1 + MAX_OUTPUT_REPAIRS
+    assert all(o.raw_redacted == "I would sell the AAPL put." for o in outputs)
+    assert [o.corrects_id for o in outputs] == [None, *(o.record_id for o in outputs[:-1])]
+    (cli,) = h.clis
+    assert len(cli.user_messages) == 1 + MAX_OUTPUT_REPAIRS
+    assert "did not validate" in cli.user_messages[1] and "invalid_json" in cli.user_messages[1]
     assert stored.record.decisions == ()
     assert stored.record.decision_output_status.value != "valid"
     # Agent + the Mignon's chain and quote + the orchestrator's re-quote, 3 account reads, facts.
     assert len(calls) == 8
+
+
+def test_invalid_output_is_repaired_with_tools_denied(harness: Callable[..., Harness]) -> None:
+    """ADR-0044: the issues go back to the agent; its corrected output completes the run, and
+    a tool call during the repair turn is denied."""
+    valid: list[str] = []
+    repair_turns: list[ToolTurn] = []
+
+    async def script(model: FakeModel) -> str:
+        text = await dry_run_script(model)
+        assert text is not None
+        valid.append(text)
+        return "Proposal ready.\n" + text.replace('"decisions"', '"decision"', 1)
+
+    async def followup(model: FakeModel) -> str:
+        assert model.message is not None and "did not validate" in model.message
+        repair_turns.append(await model.call("mcp__robinhood__get_portfolio", {}))
+        return valid[0]
+
+    h = harness()
+    h.followup = followup
+    assert h.run(script) == 0
+    assert h.status() is RunStatus.COMPLETED
+    (turn,) = repair_turns
+    assert turn.denied and turn.reason == OUTPUT_REPAIR_DENIAL
+    with h.conn() as c:
+        (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
+        first, repaired = ledger_evidence.agent_outputs_for_run(c, h.run_id)
+        denied = [r for r in tool_call_records(c, h.run_id) if r.status.value == "denied"]
+    assert repaired.corrects_id == first.record_id
+    assert stored.record.decision_output_status.value == "parsed"
+    assert len(stored.record.decisions) == 1
+    assert [d.deny_reason for d in denied] == [OUTPUT_REPAIR_DENIAL]
 
 
 def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness]) -> None:

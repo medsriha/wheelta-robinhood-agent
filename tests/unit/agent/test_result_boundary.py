@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from wheelta_robinhood_agent.agent.facts_tool import FactsRequestError, parse_request
 from wheelta_robinhood_agent.agent.hooks import EnvelopeKind, ValidationRequest
@@ -50,12 +51,13 @@ def _text(value: object) -> dict[str, Any]:
 
 
 def test_only_captured_tools_have_verified_mappers() -> None:
-    # The Robinhood set is pinned in test_robinhood_mappers.py; Wheelta maps only the board
-    # query (ADR-0041); every other Wheelta tool is context only.
-    assert {t for s, t in VERIFIED_MAPPERS if s == "wheelta"} == {"wheelta_board_query"}
+    # The Robinhood set is pinned in test_robinhood_mappers.py; Wheelta maps the board query
+    # (ADR-0041) and the macro snapshot (ADR-0045); every other Wheelta tool is context only.
+    mapped = {"wheelta_board_query", "wheelta_macro_snapshot"}
+    assert {t for s, t in VERIFIED_MAPPERS if s == "wheelta"} == mapped
     assert {s for s, _ in VERIFIED_MAPPERS} == {"robinhood", "wheelta"}
     wheelta_context = {t for s, t in CONTEXT_ONLY_TOOLS if s == "wheelta"}
-    assert len(wheelta_context) == 11 and "wheelta_board_query" not in wheelta_context
+    assert len(wheelta_context) == 10 and not wheelta_context & mapped
 
 
 @pytest.mark.parametrize(
@@ -100,6 +102,29 @@ def test_tool_error_becomes_an_error_envelope() -> None:
     response = {"isError": True, "content": [{"type": "text", "text": "denied"}]}
     outcome = BoundaryValidator(Redactor())(_req("robinhood", "x", response))
     assert outcome.envelope.kind is EnvelopeKind.ERROR
+    assert outcome.envelope.gaps == ("the tool returned an error: denied",)
+
+
+def test_tool_error_gap_carries_the_tools_message_redacted_and_truncated() -> None:
+    """The 2026-09-29 dry run: Wheelta's reason reached the ledger but not the agent."""
+    message = (
+        "The Wheelta API rejected these inputs: date range must span at most 45 days\n\n"
+        "(requestId: 40f54fc8b457489bace666a3cf8fcef1)"
+    )
+    response = {"isError": True, "content": [{"type": "text", "text": message}]}
+    outcome = BoundaryValidator(Redactor())(_req("wheelta", "wheelta_calendar_events", response))
+    (gap,) = outcome.envelope.gaps
+    assert "date range must span at most 45 days (requestId:" in gap
+    secret = SecretStr("s3cret-token")
+    long = {"isError": True, "content": [{"type": "text", "text": "s3cret-token " + "x" * 900}]}
+    (gap,) = BoundaryValidator(Redactor(secrets=[secret]))(
+        _req("robinhood", "x", long)
+    ).envelope.gaps
+    assert "s3cret-token" not in gap
+    assert gap.endswith("…") and len(gap) < 600
+    empty = {"isError": True, "content": [{"type": "text", "text": "  "}]}
+    (gap,) = BoundaryValidator(Redactor())(_req("robinhood", "x", empty)).envelope.gaps
+    assert gap == "the tool returned an error"
 
 
 def test_local_and_builtin_results_are_validated() -> None:

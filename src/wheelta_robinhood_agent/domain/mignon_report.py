@@ -18,7 +18,6 @@ Rules (each checked here, in pure code):
   URL that was not delivered to this Mignon is an issue.
 """
 
-import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Annotated, Final, Literal, Self
@@ -28,6 +27,7 @@ from pydantic import StrictStr, StringConstraints, ValidationError, model_valida
 from wheelta_robinhood_agent.domain.base import DomainModel, require_unique
 from wheelta_robinhood_agent.domain.decision_output import (
     ParseIssue,
+    extract_json_object,
     load_strict_json,
     validation_issues,
 )
@@ -91,32 +91,9 @@ MignonReportParseResult = MignonReportParsed | MignonReportParseFailure
 
 
 def extract_report_object(raw: str | bytes) -> str | bytes:
-    """The report's JSON object text from a Mignon's final response (ADR-0043).
-
-    A Mignon may write prose, a code fence, or notes around its report. The report is the last
-    top-level JSON object in the text that has a `findings` key, else the last top-level JSON
-    object; the text outside it is dropped. Locating uses a lenient decoder only to find object
-    spans: the chosen span is then parsed under the strict rules. Text with no JSON object, and
-    bytes, come back unchanged so the strict parser reports the issue.
-    """
-    if not isinstance(raw, str):
-        return raw
-    decoder = json.JSONDecoder()
-    spans: list[tuple[str, bool]] = []
-    index = raw.find("{")
-    while index != -1:
-        try:
-            value, end = decoder.raw_decode(raw, index)
-        except (ValueError, RecursionError):
-            index = raw.find("{", index + 1)
-            continue
-        if isinstance(value, dict):
-            spans.append((raw[index:end], "findings" in value))
-        index = raw.find("{", end)
-    if not spans:
-        return raw
-    with_findings = [text for text, has_findings in spans if has_findings]
-    return with_findings[-1] if with_findings else spans[-1][0]
+    """The report's JSON object text from a Mignon's final response (ADR-0043): the last
+    top-level JSON object with a `findings` key, else the last one (`extract_json_object`)."""
+    return extract_json_object(raw, "findings")
 
 
 def parse_mignon_report(raw: str | bytes) -> MignonReportParseResult:

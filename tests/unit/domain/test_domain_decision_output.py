@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from hypothesis import given, settings
@@ -149,9 +149,11 @@ def test_serializes_limit_price_as_string() -> None:
     [
         ("not json", "invalid_json"),
         ("```json\n{}\n```", "missing"),  # ADR-0035: the fence is removed; the schema applies
-        ("Here it is:\n```json\n{}\n```", "invalid_json"),  # prose before the fence
-        ("```json\n{}\n```\nDone.", "invalid_json"),  # text after the fence
-        ("```json\n```json\n{}\n```\n```", "invalid_json"),  # two fences
+        # ADR-0044: prose and fences around the object are dropped; the schema still applies.
+        ("Here it is:\n```json\n{}\n```", "missing"),
+        ("```json\n{}\n```\nDone.", "missing"),
+        ("```json\n```json\n{}\n```\n```", "missing"),
+        ("Prose {not json} only.", "invalid_json"),
         ("[]", "not_object"),
         ('"x"', "not_object"),
         ('{"decisions": [], "decisions": []}', "duplicate_key"),
@@ -175,6 +177,29 @@ def test_one_enclosing_fence_is_accepted(fence: str) -> None:
     result = parse_agent_decision_output(raw)
     assert isinstance(result, DecisionOutputParsed), result
     assert result.output.decisions[0].proposed_legs[0].limit_price == Decimal("1.25")
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        # 2026-09-29 dry run 006a73a1: one line of prose before the JSON failed the run.
+        lambda body: "NCLH is resting at the mid as a day order. I'll end the run here.\n\n" + body,
+        lambda body: body + "\nDone.",
+        lambda body: 'Example: {"decisions": "x"}\nFinal:\n```json\n' + body + "\n```",
+    ],
+)
+def test_prose_around_the_output_is_accepted(wrap: Any) -> None:
+    result = parse_agent_decision_output(wrap(json.dumps(_valid(), indent=2)))
+    assert isinstance(result, DecisionOutputParsed), result
+    assert result.output.decisions[0].proposed_legs[0].limit_price == Decimal("1.25")
+
+
+def test_prose_wrapped_failure_preserves_the_raw_text() -> None:
+    raw = 'Here:\n{"decisions": 1}'
+    result = parse_agent_decision_output(raw)
+    assert isinstance(result, DecisionOutputParseFailure)
+    assert result.raw_text == raw
+    assert result.issues[0].kind == "json_number"
 
 
 def test_fenced_failure_preserves_the_raw_text() -> None:

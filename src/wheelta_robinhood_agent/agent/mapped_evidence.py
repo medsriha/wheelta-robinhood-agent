@@ -242,6 +242,53 @@ class OptionChainObservation(_Observed):
     tick_cutoff_price: Decimal
 
 
+class MacroRegimeInput(_Model):
+    """One series value the Wheelta regime classification used, as of its own observation."""
+
+    series_id: NonEmptyStr
+    value: Decimal
+    observed_on: date
+
+
+class MacroRegime(_Observed):
+    """Wheelta's macro regime classification (`wheelta_macro_snapshot`, ADR-0045).
+
+    A descriptive label with Wheelta's own summary and guidance prose, not a forecast.
+    `snapshot_as_of` is when Wheelta built the snapshot.
+    """
+
+    snapshot_as_of: AwareDatetime
+    tag: NonEmptyStr
+    label: NonEmptyStr
+    summary: str
+    guidance: str
+    inputs: tuple[MacroRegimeInput, ...]
+
+
+class MacroIndicator(_Observed):
+    """One macro indicator from `wheelta_macro_snapshot` (ADR-0045).
+
+    `value` and `change` are in `unit` as Wheelta reports it (`pct` = percent, e.g. 3.63;
+    `pct_points`, `index`, `count`, `thousands`, `usd`, `binary`). `change_ratio` is the
+    relative change as a ratio (-0.0118 = -1.18%) over `change_period`. `observed_on` is the
+    observation date; `observed_at` is set only when the source gives a time.
+    `direction` is Wheelta's own reading for put sellers (good, bad, flat).
+    """
+
+    series_id: NonEmptyStr
+    name: NonEmptyStr
+    category: NonEmptyStr
+    unit: NonEmptyStr
+    value: Decimal
+    change: Decimal | None
+    change_ratio: Decimal | None
+    change_period: str
+    direction: str
+    source: NonEmptyStr
+    observed_on: date
+    observed_at: AwareDatetime | None
+
+
 class MappedEvidence(_Model):
     """Normalized, typed evidence produced from one validated tool result."""
 
@@ -265,6 +312,9 @@ class MappedEvidence(_Model):
     fundamentals: tuple[EquityFundamentals, ...] = ()
     analyst_ratings: tuple[AnalystRatings, ...] = ()
     option_chains: tuple[OptionChainObservation, ...] = ()
+    # ADR-0045: Wheelta macro snapshot. Citable context; no decision fact uses it.
+    macro_regimes: tuple[MacroRegime, ...] = ()
+    macro_indicators: tuple[MacroIndicator, ...] = ()
     # Non-citable context delivered beside the evidence (the other selected board columns);
     # it carries no evidence identity and can back no number or decision.
     screen_context: tuple[dict[str, JsonValue], ...] = ()
@@ -282,6 +332,8 @@ class MappedEvidence(_Model):
             *self.fundamentals,
             *self.analyst_ratings,
             *self.option_chains,
+            *self.macro_regimes,
+            *self.macro_indicators,
         )
 
     def evidence_ids(self) -> tuple[uuid.UUID, ...]:

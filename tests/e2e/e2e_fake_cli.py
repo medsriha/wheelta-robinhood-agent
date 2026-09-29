@@ -113,9 +113,13 @@ Script = Callable[["FakeModel"], Awaitable[str | None]]
 class FakeModel:
     """The orchestrator's model, or with `agent` = (agent_id, agent_type) a Mignon's."""
 
-    def __init__(self, cli: FakeCli, agent: tuple[str, str] | None = None) -> None:
+    def __init__(
+        self, cli: FakeCli, agent: tuple[str, str] | None = None, message: str | None = None
+    ) -> None:
         self._cli = cli
         self.agent = agent
+        # The user message this turn answers: the start message, or an output repair request.
+        self.message = message
 
     async def call(self, name: str, tool_input: dict[str, Any]) -> ToolTurn:
         return await self._cli.tool_call(name, tool_input, self.agent)
@@ -145,10 +149,20 @@ class FakeModel:
 class FakeCli(Transport):
     """The scripted CLI. One instance per session (one `ClaudeSDKClient`)."""
 
-    def __init__(self, options: ClaudeAgentOptions, world: FakeWorld, script: Script) -> None:
+    def __init__(
+        self,
+        options: ClaudeAgentOptions,
+        world: FakeWorld,
+        script: Script,
+        followup: Script | None = None,
+    ) -> None:
         self.options = options
         self.world = world
         self.script = script
+        # Answers every user message after the first (ADR-0044 output repair turns). Without
+        # one, the model repeats its previous final text and calls no tool.
+        self.followup = followup
+        self.final_texts: list[str | None] = []
         self.model_inputs: list[Any] = []
         self.turns: list[ToolTurn] = []
         self.user_messages: list[str] = []
@@ -238,8 +252,9 @@ class FakeCli(Transport):
         if kind == "user":
             content = message.get("message", {}).get("content")
             self.user_messages.append(content if isinstance(content, str) else json.dumps(content))
+            first = not self._queried
             self._queried = True
-            self._spawn(self._run_script())
+            self._spawn(self._run_script(self.user_messages[-1], first))
 
     async def _control(self, request_id: str, request: dict[str, Any]) -> None:
         subtype = request.get("subtype")
@@ -495,7 +510,10 @@ class FakeCli(Transport):
 
     # -- the turn ----------------------------------------------------------------------------
 
-    async def _run_script(self) -> None:
+    async def _run_script(self, message: str, first: bool) -> None:
+        if not first:
+            await self._run_followup(message)
+            return
         await self._ensure_local()  # the real CLI connects in-process servers at startup
         servers = [*self._http_servers(), *self._sdk_servers()]
         await self._emit(
@@ -511,10 +529,20 @@ class FakeCli(Transport):
                 ],
             }
         )
+        await self._answer(self.script, message)
+
+    async def _run_followup(self, message: str) -> None:
+        if self.followup is not None:
+            await self._answer(self.followup, message)
+            return
+        text = self.final_texts[-1] if self.final_texts else None
+        await self._answer(lambda _model: _returning(text), message)
+
+    async def _answer(self, script: Script, message: str) -> None:
         text: str | None = None
         stopped = False
         try:
-            text = await self.script(FakeModel(self))
+            text = await script(FakeModel(self, message=message))
         except ScriptStopped:
             stopped = True
         except Exception as exc:  # noqa: BLE001 - a broken script must end, not hang, the run
@@ -524,6 +552,7 @@ class FakeCli(Transport):
             # A real CLI keeps the stream open until it winds down; emit the aborted result.
             await self._emit(self._result(None, error=True))
             return
+        self.final_texts.append(text)
         if text is not None:
             await self._emit(
                 {
@@ -605,13 +634,17 @@ def world_upstreams(
     return open_upstream
 
 
+async def _returning(text: str | None) -> str | None:
+    return text
+
+
 def factory(
-    world: FakeWorld, script: Script, created: list[FakeCli]
+    world: FakeWorld, script: Script, created: list[FakeCli], followup: Script | None = None
 ) -> Callable[[ClaudeAgentOptions], FakeCli]:
     """A transport factory for `OrchestratorDeps.transport_factory` that records instances."""
 
     def make(options: ClaudeAgentOptions) -> FakeCli:
-        cli = FakeCli(options, world, script)
+        cli = FakeCli(options, world, script, followup)
         created.append(cli)
         return cli
 

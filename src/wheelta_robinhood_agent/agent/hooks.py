@@ -293,6 +293,24 @@ WebPrecheck = Callable[[str, dict[str, Any]], str | None]
 WebCapture = Callable[[uuid.UUID, str, dict[str, Any], JsonValue], None]
 
 
+class OutputRepairGate:
+    """Closed while the session asks the agent to correct an invalid final output (ADR-0044).
+
+    While closed, the PreToolUse hook denies every tool call, so a repair turn can only restate
+    the output and never act (no order, workspace write, or Mignon). It never reopens.
+    """
+
+    def __init__(self) -> None:
+        self._reason: str | None = None
+
+    @property
+    def reason(self) -> str | None:
+        return self._reason
+
+    def close(self, reason: str) -> None:
+        self._reason = reason
+
+
 @dataclass(frozen=True)
 class HookDeps:
     """Everything the hooks need, injected. Safety values come from Settings, never the model."""
@@ -337,6 +355,8 @@ class HookDeps:
     # Where order tools go (ADR-0038). None: the mode's venue without a simulator (live:
     # broker, off: none). `simulated` requires the server to be proxied.
     order_venue: OrderVenue | None = None
+    # ADR-0044: closed during final-output repair turns; every call is then denied.
+    output_gate: OutputRepairGate | None = None
 
     @classmethod
     def from_settings(
@@ -626,6 +646,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
 
         The upstream input is the effective input with the account placeholder replaced by the
         configured number (ADR-0030), or None when nothing was replaced."""
+        if deps.output_gate is not None and deps.output_gate.reason is not None:
+            raise _Denied(deps.output_gate.reason)
         tier = resolved.tier
         if tier is None:
             raise _Denied(

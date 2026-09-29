@@ -4,7 +4,7 @@ import copy
 import json
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -20,7 +20,9 @@ from wheelta_robinhood_agent.agent.wheelta_mappers import (
     CONTEXT_GAP,
     GROUPS_GAP,
     IDENTITY_GAP,
+    MACRO_DIRECTION_GAP,
     map_board_query,
+    map_macro_snapshot,
 )
 from wheelta_robinhood_agent.domain.enums import CandidateOrigin, ToolTier
 from wheelta_robinhood_agent.integrations.registry import diff_discovered
@@ -228,3 +230,81 @@ def test_the_robinhood_scanner_fallback_is_delivered_as_context() -> None:
     data = envelope.data
     assert isinstance(data, dict) and data["context_only"] is True
     assert "evidence_ref" not in data and "Symbol" not in json.dumps(data)
+
+
+# ---------------------------------------------------------------------------- macro (ADR-0045)
+
+MACRO = json.loads((FIXTURES / "wheelta" / "results" / "macro_snapshot.json").read_text())
+
+
+def _macro_request(payload: Any) -> MappingRequest:
+    return MappingRequest(
+        tool_call_id=CALL,
+        server="wheelta",
+        tool="wheelta_macro_snapshot",
+        effective_input={},
+        payload=payload,
+        retrieved_at=RETRIEVED,
+    )
+
+
+def _macro() -> dict[str, Any]:
+    return copy.deepcopy(MACRO["structuredContent"])
+
+
+def test_macro_snapshot_becomes_regime_and_indicators() -> None:
+    out = map_macro_snapshot(_macro_request(_macro()), _ids())
+    (regime,) = out.macro_regimes
+    assert regime.tag == "risk_on_expansion"
+    assert regime.snapshot_as_of == datetime(2026, 9, 29, 11, 35, 3, tzinfo=UTC)
+    vix_input = next(i for i in regime.inputs if i.series_id == "VIXCLS")
+    assert vix_input.value == Decimal("14.21") and vix_input.observed_on == date(2026, 9, 22)
+    by_id = {i.series_id: i for i in out.macro_indicators}
+    assert len(by_id) == 18
+    vix = by_id["VIXCLS"]
+    assert (vix.value, vix.change, vix.change_ratio) == (
+        Decimal("15.89"),
+        Decimal("-0.19"),
+        Decimal("-0.011816"),
+    )
+    assert vix.observed_at == datetime(2026, 9, 29, 14, 17, 27, tzinfo=UTC)
+    fed = by_id["FEDFUNDS"]
+    assert fed.unit == "pct" and fed.observed_on == date(2026, 8, 1) and fed.observed_at is None
+    assert by_id["T10Y2Y"].change_ratio is None
+    assert all(i.as_of == RETRIEVED for i in out.macro_indicators)
+    assert out.gaps == (MACRO_DIRECTION_GAP,)
+    assert "description" not in vix.model_dump()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda p: p["indicators"][0].update(value="n/a"),
+        lambda p: p["indicators"][0].update(value=True),
+        lambda p: p["indicators"][0].update(updatedAt="2026-08-01T00:00:00"),
+        lambda p: p.pop("regime"),
+        lambda p: p["indicators"].append(copy.deepcopy(p["indicators"][0])),
+    ],
+)
+def test_malformed_macro_snapshots_raise(change: Callable[[dict[str, Any]], None]) -> None:
+    payload = _macro()
+    change(payload)
+    with pytest.raises(ValueError):
+        map_macro_snapshot(_macro_request(payload), _ids())
+
+
+def test_macro_snapshot_is_citable_through_the_boundary() -> None:
+    response = {"content": [], "structuredContent": _macro(), "isError": False}
+    outcome = BoundaryValidator(Redactor())(
+        ValidationRequest(
+            tool_call_id=CALL,
+            server="wheelta",
+            tool="wheelta_macro_snapshot",
+            tier=ToolTier.R,
+            effective_input={},
+            tool_response=response,
+            retrieved_at=RETRIEVED,
+        )
+    )
+    data = outcome.envelope.data
+    assert isinstance(data, dict) and data["evidence_ref"] == f"evidence:{CALL}"

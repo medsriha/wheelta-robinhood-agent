@@ -1,0 +1,310 @@
+{
+ "provenance": {
+  "tool": "wheelta_macro_snapshot",
+  "arguments": {},
+  "server": "wheelta-mcp",
+  "captured_on": "2026-09-29",
+  "captured_via": "recorded by local dry run 006a73a1-2ae8-55a8-ba50-0951dd2973a7 (read-only call; delivered context payload from the ledger)",
+  "scrubbing": "none needed: public macro data, no account data"
+ },
+ "structuredContent": {
+  "asOf": "2026-09-29T11:35:03Z",
+  "regime": {
+   "tag": "risk_on_expansion",
+   "label": "Risk-on expansion",
+   "inputs": [
+    {
+     "id": "VIXCLS",
+     "value": 14.21,
+     "observedAt": "2026-09-22"
+    },
+    {
+     "id": "BAMLH0A0HYM2",
+     "value": 2.93,
+     "observedAt": "2026-09-25"
+    },
+    {
+     "id": "T10Y2Y",
+     "value": 0.32,
+     "observedAt": "2026-09-28"
+    },
+    {
+     "id": "SAHMREALTIME",
+     "value": -0.07,
+     "observedAt": "2026-08-01"
+    },
+    {
+     "id": "USREC",
+     "value": 0.0,
+     "observedAt": "2026-08-01"
+    }
+   ],
+   "summary": "Volatility is calm, credit spreads are tight, and the curve is positive. A constructive backdrop for selling puts, though thin premiums come with it.",
+   "guidance": "With premiums running thin, be selective on strikes and lean on covered calls against any shares you get assigned.",
+   "liveDivergence": null
+  },
+  "indicators": [
+   {
+    "id": "FEDFUNDS",
+    "name": "Federal Funds Rate",
+    "unit": "pct",
+    "value": 3.63,
+    "change": 0.0,
+    "source": "FRED",
+    "category": "rates",
+    "changePct": 0.0,
+    "direction": "flat",
+    "updatedAt": "2026-08-01",
+    "description": "The average rate at which U.S. banks lend cash to each other overnight, and the Federal Reserve's main policy tool that filters into mortgages, loans, and savings rates. A rise means the Fed is tightening to cool inflation; a fall means easing. Stable or gently easing rates make a calmer backdrop for selling puts; abrupt hikes can jolt stocks.",
+    "changePeriod": "1m"
+   },
+   {
+    "id": "DGS2",
+    "name": "2-Year Treasury",
+    "unit": "pct",
+    "value": 4.926,
+    "change": -0.005,
+    "source": "TradingView",
+    "category": "rates",
+    "changePct": -0.001014,
+    "direction": "good",
+    "updatedAt": "2026-09-29T14:17:27Z",
+    "description": "The yield on U.S. Treasury debt at a constant 2-year maturity, a close proxy for where markets expect the Fed to set short-term rates over the next two years. It rises on expectations of tighter policy and falls on expected rate cuts. Steady readings are calmer for selling puts; sharp swings flag shifting rate bets that can unsettle stocks.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "DGS10",
+    "name": "10-Year Treasury",
+    "unit": "pct",
+    "value": 5.249,
+    "change": 0.013,
+    "source": "TradingView",
+    "category": "rates",
+    "changePct": 0.002483,
+    "direction": "bad",
+    "updatedAt": "2026-09-29T14:17:27Z",
+    "description": "The yield on U.S. Treasury debt at a constant 10-year maturity, a benchmark long-term rate that shapes mortgages and how stocks are valued. It rises with stronger growth or inflation expectations and falls when investors seek safety or expect slowing. Gradual moves are calmer for selling puts; rapid spikes can pressure stocks.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "T10Y2Y",
+    "name": "Yield Curve (10Y-2Y)",
+    "unit": "pct_points",
+    "value": 0.323,
+    "change": 0.018,
+    "source": "TradingView",
+    "category": "rates",
+    "changePct": null,
+    "direction": "good",
+    "updatedAt": "2026-09-29T14:17:27Z",
+    "description": "The gap between 10-year and 2-year Treasury yields. Normally positive; when it turns negative (an inverted curve, short rates above long), it has preceded most U.S. recessions, though often a year or more early. A healthy positive spread suggests a calmer backdrop for selling puts; a deep or lasting inversion is a caution flag.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "SOFR",
+    "name": "SOFR",
+    "unit": "pct",
+    "value": 3.9,
+    "change": 0.02,
+    "source": "FRED",
+    "category": "rates",
+    "changePct": 0.005155,
+    "direction": "bad",
+    "updatedAt": "2026-09-25",
+    "description": "A broad measure of the cost of borrowing cash overnight backed by U.S. Treasury securities, calculated by the New York Fed from real repo-market transactions. It tracks the fed funds rate closely and is a key lending benchmark. Sudden spikes can signal funding stress; steady readings point to smooth market plumbing, a calmer backdrop for selling puts.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "T10YIE",
+    "name": "10Y Breakeven Inflation",
+    "unit": "pct",
+    "value": 2.34,
+    "change": 0.0,
+    "source": "FRED",
+    "category": "inflation",
+    "changePct": 0.0,
+    "direction": "flat",
+    "updatedAt": "2026-09-28",
+    "description": "The bond market's estimate of average annual U.S. inflation over the next 10 years, from the yield gap between regular Treasuries and inflation-protected ones (TIPS). Rising readings mean markets expect hotter inflation; falling ones, cooler. Stable, well-anchored expectations are calmer for selling puts; a sharp jump can unsettle rates and stocks.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "CPIAUCSL",
+    "name": "CPI (All Urban",
+    "unit": "index",
+    "value": 334.131,
+    "change": 1.318,
+    "source": "FRED",
+    "category": "inflation",
+    "changePct": 0.00396,
+    "direction": "bad",
+    "updatedAt": "2026-08-01",
+    "description": "The seasonally adjusted Consumer Price Index tracks the average price of a basket of goods and services urban households buy, the main gauge of U.S. inflation. A rising index means the cost of living is climbing; faster jumps can push the Fed toward higher rates. Cooling, steady inflation is calmer for selling puts; hot surprises can rattle markets.",
+    "changePeriod": "1m"
+   },
+   {
+    "id": "VIXCLS",
+    "name": "CBOE VIX",
+    "unit": "index",
+    "value": 15.89,
+    "change": -0.19,
+    "source": "TradingView",
+    "category": "volatility",
+    "changePct": -0.011816,
+    "direction": "good",
+    "updatedAt": "2026-09-29T14:17:27Z",
+    "description": "The VIX, or fear gauge, measures the stock market's expected volatility over the next 30 days, from S&P 500 options prices. It usually spikes when markets fall and eases when they're calm. A low, steady VIX points to a calmer backdrop for selling puts (though option premiums shrink too); a high or rising VIX flags fear and bigger swings.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "BAMLH0A0HYM2",
+    "name": "HY Credit Spread",
+    "unit": "pct",
+    "value": 2.93,
+    "change": 0.13,
+    "source": "FRED",
+    "category": "volatility",
+    "changePct": 0.046429,
+    "direction": "bad",
+    "updatedAt": "2026-09-25",
+    "description": "The extra yield, or spread, investors demand to hold risky below-investment-grade corporate bonds instead of safe Treasuries. It widens when default fears or market stress rise and narrows when credit is easy. Tight, stable spreads suggest a calmer backdrop for selling puts; sharp widening is one of the earliest warnings of trouble.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "USREC",
+    "name": "NBER Recession",
+    "unit": "binary",
+    "value": 0.0,
+    "change": 0.0,
+    "source": "FRED",
+    "category": "recession",
+    "changePct": null,
+    "direction": "flat",
+    "updatedAt": "2026-08-01",
+    "description": "A simple on/off indicator based on the National Bureau of Economic Research's official recession dates: 1 marks months the U.S. was in recession, 0 marks expansion. Because these dates are set after the fact, it confirms rather than predicts downturns. A 0 (expansion) is a calmer backdrop for selling puts; a 1 confirms a recession is underway.",
+    "changePeriod": "1m"
+   },
+   {
+    "id": "SAHMREALTIME",
+    "name": "Sahm Rule",
+    "unit": "pct_points",
+    "value": -0.07,
+    "change": -0.04,
+    "source": "FRED",
+    "category": "recession",
+    "changePct": 1.333333,
+    "direction": "good",
+    "updatedAt": "2026-08-01",
+    "description": "A real-time recession gauge: it triggers when the unemployment rate's 3-month average rises at least 0.5 point above its low of the past year. Crossing 0.5 has historically signaled a recession has likely begun. Readings well below 0.5 point to a healthy job market and calmer backdrop for selling puts; nearing or crossing it is a warning.",
+    "changePeriod": "1m"
+   },
+   {
+    "id": "ICSA",
+    "name": "Initial Jobless Claims",
+    "unit": "count",
+    "value": 197000.0,
+    "change": -1000.0,
+    "source": "FRED",
+    "category": "recession",
+    "changePct": -0.005051,
+    "direction": "good",
+    "updatedAt": "2026-09-19",
+    "description": "The number of Americans filing new claims for unemployment benefits each week, seasonally adjusted, a timely read on fresh layoffs. Low, steady claims signal a healthy job market; a sustained rise points to weakening jobs. Stable or falling claims support a calmer backdrop for selling puts; a climbing trend is an early sign of stress.",
+    "changePeriod": "1w"
+   },
+   {
+    "id": "UNRATE",
+    "name": "Unemployment Rate",
+    "unit": "pct",
+    "value": 4.1,
+    "change": 0.0,
+    "source": "FRED",
+    "category": "labor",
+    "changePct": 0.0,
+    "direction": "flat",
+    "updatedAt": "2026-08-01",
+    "description": "The share of people who want a job and are actively looking but can't find one, as a percent of the labor force (the headline U-3 rate), reported monthly by the BLS. A rising rate signals a weakening economy; a low, steady rate, strength. Low, stable unemployment is a calmer backdrop for selling puts; a rising trend is a caution sign.",
+    "changePeriod": "1m"
+   },
+   {
+    "id": "PAYEMS",
+    "name": "Nonfarm Payrolls",
+    "unit": "thousands",
+    "value": 159075.0,
+    "change": 162.0,
+    "source": "FRED",
+    "category": "labor",
+    "changePct": 0.001019,
+    "direction": "good",
+    "updatedAt": "2026-08-01",
+    "description": "Total nonfarm payrolls: the count of U.S. jobs at businesses and government (excluding farms, the self-employed, and household workers), from the BLS employer survey. Steady monthly gains signal a growing economy; flat or falling payrolls warn of a slowdown. Job growth supports a calmer backdrop for selling puts; job losses are a recession red flag.",
+    "changePeriod": "1m"
+   },
+   {
+    "id": "SP500",
+    "name": "S&P 500",
+    "unit": "index",
+    "value": 7653.85,
+    "change": -0.77,
+    "source": "Alpaca",
+    "category": "markets",
+    "changePct": -0.0001,
+    "direction": "bad",
+    "updatedAt": "2026-09-29T14:17:23Z",
+    "description": "The S&P 500 tracks the share prices of 500 large U.S. companies, the most-watched benchmark for the U.S. stock market (price only, excluding dividends). A rising index reflects optimism and gains; a falling one, stress. A steady uptrend is a calmer backdrop for selling puts; sharp declines raise the odds of being assigned shares.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "NASDAQCOM",
+    "name": "NASDAQ Composite",
+    "unit": "index",
+    "value": 26788.59,
+    "change": -13.4,
+    "source": "Alpaca",
+    "category": "markets",
+    "changePct": -0.0005,
+    "direction": "bad",
+    "updatedAt": "2026-09-29T14:17:23Z",
+    "description": "The Nasdaq Composite tracks the combined value of the 3,000-plus stocks listed on the Nasdaq exchange, heavily weighted toward technology and growth companies. It tends to rise and fall more sharply than broader indexes. A steady uptrend is a calmer backdrop for selling puts, but its tech tilt means bigger swings when sentiment sours.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "DCOILWTICO",
+    "name": "WTI Crude Oil",
+    "unit": "usd",
+    "value": 96.41,
+    "change": -0.56,
+    "source": "FRED",
+    "category": "markets",
+    "changePct": -0.005775,
+    "direction": "flat",
+    "updatedAt": "2026-09-22",
+    "description": "The daily price per barrel of West Texas Intermediate crude, the main U.S. oil benchmark, priced at Cushing, Oklahoma. Rising oil often reflects strong demand or supply worries and feeds into gas prices and inflation; falling oil eases cost pressures. Stable prices support a calmer backdrop for selling puts; sharp spikes can stoke inflation and jitters.",
+    "changePeriod": "1d"
+   },
+   {
+    "id": "UMCSENT",
+    "name": "Consumer Sentiment",
+    "unit": "index",
+    "value": 51.7,
+    "change": -3.5,
+    "source": "FRED",
+    "category": "markets",
+    "changePct": -0.063406,
+    "direction": "bad",
+    "updatedAt": "2026-08-01",
+    "description": "The University of Michigan's monthly survey index of how optimistic U.S. consumers feel about their finances and the economy (100 = 1966 baseline). Higher readings suggest confident consumers likely to keep spending; lower ones warn of caution. Steady or rising sentiment is a calmer backdrop for selling puts; sharp drops can foreshadow weakness.",
+    "changePeriod": "1m"
+   }
+  ],
+  "divergenceNote": null,
+  "liveIndicatorIds": [
+   "DGS2",
+   "DGS10",
+   "T10Y2Y",
+   "VIXCLS",
+   "SP500",
+   "NASDAQCOM"
+  ]
+ }
+}

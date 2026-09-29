@@ -84,6 +84,8 @@ from wheelta_robinhood_agent.ledger.ids import new_id
 from wheelta_robinhood_agent.observability.redaction import REDACTED, Redactor, is_account_key
 
 EVIDENCE_REF_PREFIX: Final = "evidence:"
+# Characters of a tool's own error message kept in the error envelope's gap.
+MAX_TOOL_ERROR_CHARS: Final = 500
 
 
 def evidence_ref_for(tool_call_id: uuid.UUID) -> str:
@@ -200,7 +202,7 @@ class BoundaryValidator:
         except (PayloadError, TypeError, ValueError) as exc:
             return self._invalid(request, EnvelopeKind.ERROR, f"unrecognized result: {exc}")
         if kind is PayloadKind.TOOL_ERROR:
-            return self._invalid(request, EnvelopeKind.ERROR, "the tool returned an error")
+            return self._invalid(request, EnvelopeKind.ERROR, self._tool_error_gap(payload))
         redacted = self.redactor.redact(payload)
         if request.server == LOCAL_SERVER_NAME:
             return self._envelope(request, EnvelopeKind.VALIDATED, data=redacted)
@@ -245,6 +247,18 @@ class BoundaryValidator:
             EVIDENCE_KEY: evidence.model_dump(mode="json"),
         }
         return self._envelope(request, EnvelopeKind.VALIDATED, data=data, gaps=evidence.gaps)
+
+    def _tool_error_gap(self, message: JsonValue) -> str:
+        """The gap for a tool error, carrying the tool's own (redacted, truncated) message so
+        the agent can correct its input (e.g. Wheelta's 45-day calendar window). The message
+        is data, like any tool output; it supplies no fact."""
+        text = " ".join(str(message).split()) if isinstance(message, str) else ""
+        text = self.redactor.redact_text(text)
+        if not text:
+            return "the tool returned an error"
+        if len(text) > MAX_TOOL_ERROR_CHARS:
+            text = text[:MAX_TOOL_ERROR_CHARS] + "…"
+        return f"the tool returned an error: {text}"
 
     def _board_origin(self, evidence: MappedEvidence) -> MappedEvidence:
         """Relabel candidates the run's current board lists (selection.board_comparison: a

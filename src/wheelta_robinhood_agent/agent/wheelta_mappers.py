@@ -11,6 +11,8 @@ Shapes are from our own capture of `wheelta-mcp` on 2026-09-29
   `screen_context`: labelled, non-citable context for ranking, never evidence. A row without
   a contract identity, and grouped (`groupBy`) results, are context only, with a gap.
   `freshness.buildState` other than `ready` raises (a building board is a tool error, 503).
+- `wheelta_macro_snapshot` (ADR-0045) -> one `MacroRegime` and one `MacroIndicator` per
+  series: citable, so a Mignon can back a macro number; no decision fact uses them.
 - Every other Wheelta tool is delivered context-only (`result_boundary.CONTEXT_ONLY_TOOLS`):
   research, macro, calendar, quotes, and board detail inform judgment but cannot back a
   number or a decision.
@@ -23,12 +25,15 @@ from collections.abc import Callable, Mapping
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
-from typing import Any, Final
+from typing import Annotated, Any, Final
 
-from pydantic import JsonValue
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue
 
 from wheelta_robinhood_agent.agent.mapped_evidence import (
     EvidenceMapper,
+    MacroIndicator,
+    MacroRegime,
+    MacroRegimeInput,
     MappedEvidence,
     MappingRequest,
 )
@@ -177,7 +182,125 @@ def map_board_query(request: MappingRequest, new_id: Callable[[], uuid.UUID]) ->
     )
 
 
+# --------------------------------------------------------------------------------------------
+# wheelta_macro_snapshot (ADR-0045)
+# --------------------------------------------------------------------------------------------
+
+MACRO_SNAPSHOT_TOOL: Final = "wheelta_macro_snapshot"
+MACRO_DIRECTION_GAP: Final = (
+    "wheelta_macro_snapshot: direction and the regime summary/guidance are Wheelta's own "
+    "reading, not a forecast"
+)
+
+
+def _observed(value: object) -> tuple[date, datetime | None]:
+    """`updatedAt`/`observedAt`: a date (`2026-08-01`) or an offset timestamp."""
+    if not isinstance(value, str):
+        raise ValueError("expected a date or timestamp string")
+    if len(value) == 10:
+        return date.fromisoformat(value), None
+    at = _timestamp(value)
+    return at.date(), at
+
+
+Num = Annotated[Decimal, BeforeValidator(_decimal)]
+
+
+class _External(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+
+class _RegimeInput(_External):
+    id: Annotated[str, Field(min_length=1)]
+    value: Num
+    observed_at: str = Field(alias="observedAt")
+
+
+class _Regime(_External):
+    tag: Annotated[str, Field(min_length=1)]
+    label: Annotated[str, Field(min_length=1)]
+    summary: str
+    guidance: str
+    inputs: tuple[_RegimeInput, ...]
+
+
+class _Indicator(_External):
+    id: Annotated[str, Field(min_length=1)]
+    name: Annotated[str, Field(min_length=1)]
+    category: Annotated[str, Field(min_length=1)]
+    unit: Annotated[str, Field(min_length=1)]
+    value: Num
+    change: Num | None
+    change_pct: Num | None = Field(alias="changePct")
+    change_period: str = Field(alias="changePeriod")
+    direction: str
+    source: Annotated[str, Field(min_length=1)]
+    updated_at: str = Field(alias="updatedAt")
+
+
+class _MacroSnapshot(_External):
+    as_of: str = Field(alias="asOf")
+    regime: _Regime
+    indicators: tuple[_Indicator, ...]
+
+
+def map_macro_snapshot(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> MappedEvidence:
+    """`wheelta_macro_snapshot` -> one `MacroRegime` and one `MacroIndicator` per series.
+
+    `changePct` is a ratio (checked against `change` / previous value on the capture) and
+    becomes `change_ratio`. Values keep Wheelta's units. `as_of` is the boundary's
+    `retrieved_at`; the snapshot time and each observation date are carried explicitly.
+    Descriptions (explanatory prose) are dropped. A repeated series raises.
+    """
+    parsed = _MacroSnapshot.model_validate(request.payload)
+    snapshot_as_of = _timestamp(parsed.as_of)
+    regime = MacroRegime(
+        evidence_id=new_id(),
+        as_of=request.retrieved_at,
+        source_tool_call_ids=(request.tool_call_id,),
+        snapshot_as_of=snapshot_as_of,
+        tag=parsed.regime.tag,
+        label=parsed.regime.label,
+        summary=parsed.regime.summary,
+        guidance=parsed.regime.guidance,
+        inputs=tuple(
+            MacroRegimeInput(series_id=i.id, value=i.value, observed_on=_observed(i.observed_at)[0])
+            for i in parsed.regime.inputs
+        ),
+    )
+    indicators: list[MacroIndicator] = []
+    for ind in parsed.indicators:
+        observed_on, observed_at = _observed(ind.updated_at)
+        indicators.append(
+            MacroIndicator(
+                evidence_id=new_id(),
+                as_of=request.retrieved_at,
+                source_tool_call_ids=(request.tool_call_id,),
+                series_id=ind.id,
+                name=ind.name,
+                category=ind.category,
+                unit=ind.unit,
+                value=ind.value,
+                change=ind.change,
+                change_ratio=ind.change_pct,
+                change_period=ind.change_period,
+                direction=ind.direction,
+                source=ind.source,
+                observed_on=observed_on,
+                observed_at=observed_at,
+            )
+        )
+    ids = [i.series_id for i in indicators]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate macro series")
+    return MappedEvidence(
+        macro_regimes=(regime,),
+        macro_indicators=tuple(indicators),
+        gaps=(MACRO_DIRECTION_GAP,),
+    )
+
+
 # Tool name -> mapper; `result_boundary.VERIFIED_MAPPERS` keys these by the Wheelta server.
 WHEELTA_MAPPERS: Mapping[str, EvidenceMapper] = MappingProxyType(
-    {BOARD_QUERY_TOOL: map_board_query}
+    {BOARD_QUERY_TOOL: map_board_query, MACRO_SNAPSHOT_TOOL: map_macro_snapshot}
 )

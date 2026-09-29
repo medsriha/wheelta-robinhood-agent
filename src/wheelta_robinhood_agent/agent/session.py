@@ -24,9 +24,11 @@ Two parts:
   proxies) are absent from `get_mcp_status` until the first query (real CLI 2.1.283), so they
   are verified by the init `SystemMessage` check instead, which stops the run if Robinhood or
   `wra_local` is not connected. A RunControl stop (signal, deadline, infrastructure failure)
-  interrupts the SDK. The `ResultMessage` usage/cost feeds `RunMetrics`; its final text is
-  parsed strictly into AgentDecisionOutput v5, and raw (redacted) plus parsed output are
-  persisted.
+  interrupts the SDK. The last `ResultMessage` usage/cost (the session's running totals)
+  feeds `RunMetrics`. Its final text is parsed into AgentDecisionOutput v6; an invalid output
+  gets up to `MAX_OUTPUT_REPAIRS` follow-up turns listing the issues, with every tool denied
+  (ADR-0044). Each raw (redacted) response and its parse are persisted, each repair
+  correcting the one before.
 
 `assert_no_order_tools` re-checks the plan before any session is built: without an order
 venue no Tier X tool is allowed; with one only the three option-order tools are. The venue
@@ -70,7 +72,7 @@ from wheelta_robinhood_agent.agent.facts_tool import (
     build_facts_tool,
     load_run_evidence,
 )
-from wheelta_robinhood_agent.agent.hooks import HookDeps, build_hooks
+from wheelta_robinhood_agent.agent.hooks import HookDeps, OutputRepairGate, build_hooks
 from wheelta_robinhood_agent.agent.ledger_adapters import (
     LedgerWorkspaceCounter,
     LedgerWorkspaceOwnership,
@@ -123,6 +125,7 @@ from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.account import AgenticEligibility
 from wheelta_robinhood_agent.domain.decision_output import (
     DecisionOutputParseResult,
+    ParseIssue,
     parse_agent_decision_output,
 )
 from wheelta_robinhood_agent.domain.enums import (
@@ -447,6 +450,9 @@ class SessionResult:
     observations: list[SourceObservation] = field(default_factory=list)
     withheld: dict[str, str] = field(default_factory=dict)
     raw_output: str | None = None
+    # Every final response in order (ADR-0044): an invalid one, then its repairs. The last
+    # is `raw_output`, the effective output.
+    raw_outputs: list[str] = field(default_factory=list)
     parsed: DecisionOutputParseResult | None = None
     output_id: uuid.UUID | None = None
     interrupted: bool = False
@@ -491,10 +497,12 @@ def build_session_options(
     withholding: ServerWithholding,
     upstreams: Mapping[str, McpUpstream] | None = None,
     account_eligible: bool = False,
+    output_gate: OutputRepairGate | None = None,
 ) -> ClaudeAgentOptions:
     """Hooks, local server, validating proxies (one per open upstream), and options (no I/O).
 
-    `account_eligible` is the result of the session's trusted `get_accounts` check."""
+    `account_eligible` is the result of the session's trusted `get_accounts` check;
+    `output_gate` is closed by the session during final-output repair turns (ADR-0044)."""
     precheck, capture, lookup_tool = _web_cache_parts(deps)
     limits = mignon_limits(deps.rules.rules)
     recorder = LedgerToolEventRecorder(
@@ -533,6 +541,7 @@ def build_session_options(
         proxy_dispatch=dispatch,
         mignon_limits=limits,
         mignon_models=settings.mignon_models,
+        output_gate=output_gate,
     )
     facts_service = DecisionFactsService(
         conn=deps.conn,
@@ -818,15 +827,46 @@ def _record_usage(message: ResultMessage, metrics: RunMetrics) -> None:
     )
 
 
+# ADR-0044: follow-up turns that return an invalid final output's issues to the agent.
+MAX_OUTPUT_REPAIRS: Final = 2
+# Issues listed in one repair message; the rest are counted.
+MAX_REPAIR_ISSUES: Final = 20
+OUTPUT_REPAIR_DENIAL: Final = (
+    "tools are disabled while the final output is corrected; reply with the corrected output only"
+)
+
+
+def repair_message(issues: Sequence[ParseIssue], attempt: int) -> str:
+    """The follow-up turn sent when the final output fails to parse (ADR-0044)."""
+    shown = [
+        f"- {i.loc or '(top level)'}: {i.message} [{i.kind}]" for i in issues[:MAX_REPAIR_ISSUES]
+    ]
+    if len(issues) > MAX_REPAIR_ISSUES:
+        shown.append(f"- and {len(issues) - MAX_REPAIR_ISSUES} more")
+    return (
+        f"Your final output did not validate as AgentDecisionOutput (repair {attempt} of "
+        f"{MAX_OUTPUT_REPAIRS}). Issues:\n" + "\n".join(shown) + "\n\n"
+        "Tools are now disabled; any call is denied. Reply with the corrected "
+        "AgentDecisionOutput JSON object. Keep the same decisions, references, and next run; "
+        "fix only the issues listed. Do not describe or repeat actions."
+    )
+
+
 async def _converse(
     client: ClaudeSDKClient,
     deps: SessionDeps,
     configured: Sequence[str],
     withholding: ServerWithholding,
     result: SessionResult,
+    output_gate: OutputRepairGate | None = None,
 ) -> None:
-    """Send the start message and read until the ResultMessage, interrupting on stop."""
+    """Send the start message and read until the ResultMessage, interrupting on stop.
+
+    ADR-0044: a final output that fails to parse gets up to `MAX_OUTPUT_REPAIRS` follow-up
+    turns in the same session, each listing the issues, with every tool denied (the gate).
+    """
     done = anyio.Event()
+    last_result: ResultMessage | None = None
 
     async def watch(scope: anyio.CancelScope) -> None:
         while not done.is_set():
@@ -842,26 +882,48 @@ async def _converse(
             with anyio.move_on_after(deps.status_poll_interval):
                 await done.wait()
 
+    async def turn(prompt: str) -> str | None:
+        nonlocal last_result
+        await client.query(prompt)
+        text: str | None = None
+        async for message in client.receive_response():
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                _init_check(message, deps, configured, withholding, result)
+            elif isinstance(message, AssistantMessage):
+                # Mignon turns carry their spawning Agent call's id; the run records the
+                # orchestrator's model (a Mignon's model is part of its agent_type).
+                if message.parent_tool_use_id is None:
+                    result.model_id = message.model or result.model_id
+            elif isinstance(message, ResultMessage):
+                last_result = message
+                if isinstance(message.result, str) and not message.is_error:
+                    text = message.result
+                elif message.is_error:
+                    result.error = f"result error ({message.subtype})"
+        return text
+
     async with anyio.create_task_group() as tg:
         receive_scope = anyio.CancelScope()
         tg.start_soon(watch, receive_scope)
         with receive_scope, anyio.move_on_after(max(deps.session_budget_seconds(), 0.0)):
-            await client.query(_start_message(result.withheld))
-            async for message in client.receive_response():
-                if isinstance(message, SystemMessage) and message.subtype == "init":
-                    _init_check(message, deps, configured, withholding, result)
-                elif isinstance(message, AssistantMessage):
-                    # Mignon turns carry their spawning Agent call's id; the run records the
-                    # orchestrator's model (a Mignon's model is part of its agent_type).
-                    if message.parent_tool_use_id is None:
-                        result.model_id = message.model or result.model_id
-                elif isinstance(message, ResultMessage):
-                    _record_usage(message, deps.metrics)
-                    if isinstance(message.result, str) and not message.is_error:
-                        result.raw_output = message.result
-                    elif message.is_error:
-                        result.error = f"result error ({message.subtype})"
+            text = await turn(_start_message(result.withheld))
+            repairs = 0
+            while text is not None:
+                result.raw_outputs.append(text)
+                result.raw_output = text
+                if deps.run_control.stop_requested or repairs >= MAX_OUTPUT_REPAIRS:
+                    break
+                parsed = parse_agent_decision_output(deps.redactor.redact_text(text))
+                if parsed.ok:
+                    break
+                repairs += 1
+                if output_gate is not None:
+                    output_gate.close(OUTPUT_REPAIR_DENIAL)
+                text = await turn(repair_message(parsed.issues, repairs))
         done.set()
+    if last_result is not None:
+        # ResultMessage totals are the session's running totals, so only the last counts.
+        _record_usage(last_result, deps.metrics)
     if not result.interrupted and result.raw_output is None and result.error is None:
         # The budget elapsed (or the stream ended) without a ResultMessage.
         deps.deadline_check()
@@ -869,20 +931,33 @@ async def _converse(
 
 
 def persist_output(deps: SessionDeps, result: SessionResult) -> None:
-    """Store the raw (redacted) final response and its strict parse (ledger/evidence.py).
+    """Store each raw (redacted) final response and its parse (ledger/evidence.py).
 
-    A missing response is stored as None: output coverage is then unknown, never "no trades".
+    ADR-0044: a repaired output corrects the one before it (`corrects_output_id`), so the
+    last response is the effective output and every earlier one stays on record. A missing
+    response is stored as None: output coverage is then unknown, never "no trades".
     """
-    raw = deps.redactor.redact_text(result.raw_output) if result.raw_output is not None else None
-    result.output_id = ledger_evidence.insert_agent_output(
-        deps.conn, run_id=deps.run_id, raw_redacted=raw, observed_at=deps.clock()
-    )
-    if raw is None:
+    texts = result.raw_outputs or ([result.raw_output] if result.raw_output is not None else [])
+    if not texts:
+        result.output_id = ledger_evidence.insert_agent_output(
+            deps.conn, run_id=deps.run_id, raw_redacted=None, observed_at=deps.clock()
+        )
         return
-    result.parsed = parse_agent_decision_output(raw)
-    ledger_evidence.insert_agent_decision(
-        deps.conn, run_id=deps.run_id, output_id=result.output_id, result=result.parsed
-    )
+    previous: uuid.UUID | None = None
+    for text in texts:
+        raw = deps.redactor.redact_text(text)
+        output_id = ledger_evidence.insert_agent_output(
+            deps.conn,
+            run_id=deps.run_id,
+            raw_redacted=raw,
+            observed_at=deps.clock(),
+            corrects_output_id=previous,
+        )
+        parsed = parse_agent_decision_output(raw)
+        ledger_evidence.insert_agent_decision(
+            deps.conn, run_id=deps.run_id, output_id=output_id, result=parsed
+        )
+        previous, result.output_id, result.parsed = output_id, output_id, parsed
 
 
 async def run_agent_session(deps: SessionDeps) -> SessionResult:
@@ -920,7 +995,10 @@ async def _run_client(
     direct = [s.name for s in deps.plan.servers]
     configured = [*direct, *upstreams, LOCAL_SERVER_NAME]
     eligible = result.eligibility is not None and result.eligibility.eligible
-    options = build_session_options(deps, withholding, upstreams, account_eligible=eligible)
+    gate = OutputRepairGate()
+    options = build_session_options(
+        deps, withholding, upstreams, account_eligible=eligible, output_gate=gate
+    )
     transport = deps.transport_factory(options) if deps.transport_factory else None
     client = ClaudeSDKClient(options, transport=transport)
     try:
@@ -933,7 +1011,7 @@ async def _run_client(
         if ROBINHOOD in result.withheld or deps.run_control.stop_requested:
             result.status = SessionStatus.NOT_STARTED
             return
-        await _converse(client, deps, configured, withholding, result)
+        await _converse(client, deps, configured, withholding, result, gate)
         result.status = (
             SessionStatus.STOPPED
             if deps.run_control.stop_requested

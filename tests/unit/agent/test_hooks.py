@@ -19,6 +19,7 @@ from wheelta_robinhood_agent.agent.hooks import (
     ROBINHOOD_WORKSPACE_TARGETS,
     EnvelopeKind,
     HookDeps,
+    OutputRepairGate,
     OwnedWorkspaceObject,
     ResultEnvelope,
     ValidationOutcome,
@@ -569,6 +570,26 @@ def test_stop_latch_does_not_deny_reads() -> None:
     s = session()
     s.deps.run_control.request_stop(StopReason.DEADLINE, NOW)
     assert_allowed(s, s.pre(RH + "get_option_quotes"))
+
+
+# ---- output repair gate (ADR-0044) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        (RH + "get_option_quotes", {}),
+        (PLACE, {"account_number": ACCOUNT}),
+        (RH + "create_watchlist", {"name": PREFIX + "x"}),
+    ],
+)
+def test_closed_output_gate_denies_every_tool(tool: str, args: dict[str, Any]) -> None:
+    gate = OutputRepairGate()
+    s = session(effective_mode=ExecutionMode.LIVE, output_gate=gate)
+    assert_allowed(s, s.pre(tool, args, use_id="before"))
+    gate.close("tools are disabled while the final output is corrected")
+    s.rec.events.clear()
+    assert_denied(s, s.pre(tool, args, use_id="after"), "final output is corrected")
 
 
 # ---- Tier S workspace ----------------------------------------------------------------------

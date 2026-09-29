@@ -213,19 +213,33 @@ def _failure(raw_text: str, *issues: ParseIssue) -> DecisionOutputParseFailure:
     return DecisionOutputParseFailure(ok=False, raw_text=raw_text, issues=tuple(issues))
 
 
-# The whole text is one fence: ```json or ```, a newline, the body, a newline, ```.
-_ENCLOSING_FENCE: Final = re.compile(r"\A```(?:json)?[ \t]*\n(.*)\n```\Z", re.DOTALL)
+def extract_json_object(raw: str | bytes, key: str) -> str | bytes:
+    """The JSON object text inside model output that may carry prose or a code fence.
 
-
-def strip_json_fence(raw: str | bytes) -> str | bytes:
-    """The body of one fence enclosing the whole (stripped) text, else `raw` unchanged.
-
-    ADR-0032 (Mignon reports), ADR-0035 (AgentDecisionOutput). Bytes are left unchanged.
+    ADR-0043 (Mignon reports), ADR-0044 (AgentDecisionOutput). The object is the last
+    top-level JSON object in the text that has `key`, else the last top-level JSON object;
+    the text outside it is dropped. A lenient decoder only locates object spans: the caller
+    parses the chosen span under the strict rules. Text with no JSON object, and bytes, come
+    back unchanged so the strict parser reports the issue.
     """
     if not isinstance(raw, str):
         return raw
-    match = _ENCLOSING_FENCE.fullmatch(raw.strip())
-    return match.group(1) if match else raw
+    decoder = json.JSONDecoder()
+    spans: list[tuple[str, bool]] = []
+    index = raw.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(raw, index)
+        except (ValueError, RecursionError):
+            index = raw.find("{", index + 1)
+            continue
+        if isinstance(value, dict):
+            spans.append((raw[index:end], key in value))
+        index = raw.find("{", end)
+    if not spans:
+        return raw
+    keyed = [text for text, has_key in spans if has_key]
+    return keyed[-1] if keyed else spans[-1][0]
 
 
 def load_strict_json(raw: str | bytes) -> tuple[str, object] | ParseIssue:
@@ -269,16 +283,16 @@ def validation_issues(exc: ValidationError) -> tuple[ParseIssue, ...]:
 
 
 def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
-    """Strictly parse the model's final response into AgentDecisionOutput v6.
+    """Parse the model's final response into AgentDecisionOutput v6.
 
     Never raises on bad model output: returns `DecisionOutputParseFailure` with the raw text
-    and typed issues. The response must be exactly one JSON object (surrounding whitespace
-    allowed; no prose). ADR-0035: one enclosing ```json (or bare ```) fence around the whole
-    text is removed first; anything else outside the object still fails. Duplicate keys, JSON
-    numbers, NaN/Infinity, invalid UTF-8, unknown fields, and type mismatches are all failures
-    (INTERFACES.md: forbid extra fields recursively; preserve the raw response on failure).
+    and typed issues. ADR-0044: the output object is located with `extract_json_object` (key
+    `decisions`), so prose or a code fence around it is dropped. The object itself is strict:
+    duplicate keys, JSON numbers, NaN/Infinity, invalid UTF-8, unknown fields, and type
+    mismatches are all failures (INTERFACES.md: forbid extra fields recursively; preserve the
+    raw response on failure).
     """
-    loaded = load_strict_json(strip_json_fence(raw))
+    loaded = load_strict_json(extract_json_object(raw, "decisions"))
     if isinstance(loaded, ParseIssue):
         text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
         return _failure(text, loaded)
