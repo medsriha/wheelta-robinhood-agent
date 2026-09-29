@@ -54,6 +54,17 @@ from wheelta_robinhood_agent.agent.mapped_evidence import (
 from wheelta_robinhood_agent.agent.mapped_evidence import (
     MappingRequest as MappingRequest,
 )
+from wheelta_robinhood_agent.agent.model_view import (  # re-exported
+    EVIDENCE_KEY as EVIDENCE_KEY,
+)
+from wheelta_robinhood_agent.agent.model_view import (
+    EVIDENCE_REF_KEY as EVIDENCE_REF_KEY,
+)
+from wheelta_robinhood_agent.agent.model_view import (
+    EVIDENCE_VIEW_KEY,
+    flatten,
+    tabulate,
+)
 from wheelta_robinhood_agent.agent.robinhood_mappers import ROBINHOOD_MAPPERS
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
@@ -64,8 +75,6 @@ from wheelta_robinhood_agent.observability.redaction import REDACTED, Redactor, 
 
 CANDIDATE_REF_PREFIX: Final = "candidate:"
 EVIDENCE_REF_PREFIX: Final = "evidence:"
-EVIDENCE_KEY: Final = "evidence"
-EVIDENCE_REF_KEY: Final = "evidence_ref"
 
 
 def evidence_ref_for(tool_call_id: uuid.UUID) -> str:
@@ -272,12 +281,14 @@ _SCAN_DUPLICATE_COLUMNS: Final = frozenset({"Symbol"})
 
 
 def project_scan(payload: JsonValue) -> tuple[JsonValue, tuple[str, ...]]:
-    """`run_scan` context trimmed to fit delivery (ADR-0032). Pure and deterministic.
+    """`run_scan` context trimmed to fit delivery (ADR-0032, ADR-0037). Pure, deterministic.
 
     Drops the tool's `guide` prose and each row's duplicate `Symbol` column. It keeps the
     scan's metadata and, in the scan's own order, as many rows as fit
-    `SCAN_CONTEXT_BUDGET_CHARS`, with a gap naming how many rows were kept. A payload of any
-    other shape is returned unchanged; the proxy's size cap still applies.
+    `SCAN_CONTEXT_BUDGET_CHARS`, with a gap naming how many rows were kept. Rows of one shape
+    are delivered as a table (`model_view.tabulate`: `common`, `columns`, `rows`; a row's
+    scan columns become `columns.<name>`); rows of mixed shapes stay objects. A payload of
+    any other shape is returned unchanged; the proxy's size cap still applies.
     """
     data = payload.get("data") if isinstance(payload, dict) else None
     result = data.get("result") if isinstance(data, dict) else None
@@ -294,15 +305,24 @@ def project_scan(payload: JsonValue) -> tuple[JsonValue, tuple[str, ...]]:
             }
         trimmed.append(row)
     meta = {k: v for k, v in result.items() if k != "results"}
-    kept: list[JsonValue] = []
+    table = tabulate(trimmed) if len(trimmed) >= 2 else None
     used = len(json.dumps(meta, sort_keys=True))
-    for row in trimmed:
-        size = len(json.dumps(row, sort_keys=True)) + 2
-        if used + size > SCAN_CONTEXT_BUDGET_CHARS:
+    if isinstance(table, dict):
+        # A table row is at most its flattened values: `common` only removes values.
+        used += len(json.dumps(table["columns"])) + len('"common":{},"columns":,"rows":[]')
+        sizes = [
+            len(json.dumps(list(flatten(cast(dict[str, JsonValue], r)).values()))) for r in trimmed
+        ]
+    else:
+        sizes = [len(json.dumps(r, sort_keys=True)) for r in trimmed]
+    kept: list[JsonValue] = []
+    for row, size in zip(trimmed, sizes, strict=True):
+        if used + size + 2 > SCAN_CONTEXT_BUDGET_CHARS:
             break
         kept.append(row)
-        used += size
-    projected: JsonValue = {"data": {"result": {**meta, "results": kept}}}
+        used += size + 2
+    results: JsonValue = tabulate(kept) if isinstance(table, dict) and len(kept) >= 2 else kept
+    projected: JsonValue = {"data": {"result": {**meta, "results": results}}}
     if len(kept) == len(rows):
         return projected, ()
     gap = (
@@ -349,10 +369,14 @@ def _check_provenance(evidence: MappedEvidence, tool_call_id: uuid.UUID) -> None
 
 
 def mapped_evidence_of(envelope: Mapping[str, Any]) -> MappedEvidence | None:
-    """The typed evidence inside a stored validated envelope, or None if it carries none."""
+    """The typed evidence inside a stored validated envelope, or None if it carries none.
+
+    A model view (`model_view`) is not typed evidence and yields None; resolve it through
+    the validated envelope it was built from.
+    """
     if envelope.get("kind") != EnvelopeKind.VALIDATED.value:
         return None
     data = envelope.get("data")
-    if not isinstance(data, dict) or EVIDENCE_KEY not in data:
+    if not isinstance(data, dict) or EVIDENCE_KEY not in data or EVIDENCE_VIEW_KEY in data:
         return None
     return MappedEvidence.model_validate(data[EVIDENCE_KEY])

@@ -28,6 +28,7 @@ import psycopg
 
 from wheelta_robinhood_agent.agent.audit.context import AuditContext, InstrumentFact
 from wheelta_robinhood_agent.agent.facts_tool import FACTS_TOOL_NAME
+from wheelta_robinhood_agent.agent.model_view import is_model_view, model_view
 from wheelta_robinhood_agent.agent.result_boundary import (
     evidence_ref_for,
     mapped_evidence_of,
@@ -87,16 +88,31 @@ class DeliveredEvidence:
 
 
 def _delivered_envelopes(conn: Conn, run_id: uuid.UUID) -> list[Mapping[str, Any]]:
+    """Delivered envelopes, each model view (ADR-0037) replaced by the validated envelope it
+    was built from. A view is kept only if rebuilding it from that envelope reproduces it
+    exactly; otherwise nothing of it counts as delivered."""
+    results = ledger_evidence.effective(ledger_evidence.results_for_run(conn, run_id))
+    validated: dict[uuid.UUID, object] = {
+        r.tool_call_id: r.payload
+        for r in results
+        if r.kind is ledger_evidence.ResultKind.VALIDATED and r.tool_call_id is not None
+    }
     envelopes: list[Mapping[str, Any]] = []
-    for stored in ledger_evidence.effective(ledger_evidence.results_for_run(conn, run_id)):
+    for stored in results:
         if stored.kind is not ledger_evidence.ResultKind.DELIVERED:
             continue
         payload = stored.payload
         if not isinstance(payload, dict) or payload.get("replaced") is not True:
             continue
         envelope = payload.get("tool_output")
-        if isinstance(envelope, dict):
-            envelopes.append(envelope)
+        if not isinstance(envelope, dict):
+            continue
+        if is_model_view(envelope):
+            source = validated.get(stored.tool_call_id) if stored.tool_call_id else None
+            if not isinstance(source, dict) or model_view(source) != envelope:
+                continue
+            envelope = source
+        envelopes.append(envelope)
     return envelopes
 
 

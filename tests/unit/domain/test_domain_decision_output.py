@@ -148,7 +148,10 @@ def test_serializes_limit_price_as_string() -> None:
     ("raw", "kind"),
     [
         ("not json", "invalid_json"),
-        ("```json\n{}\n```", "invalid_json"),
+        ("```json\n{}\n```", "missing"),  # ADR-0035: the fence is removed; the schema applies
+        ("Here it is:\n```json\n{}\n```", "invalid_json"),  # prose before the fence
+        ("```json\n{}\n```\nDone.", "invalid_json"),  # text after the fence
+        ("```json\n```json\n{}\n```\n```", "invalid_json"),  # two fences
         ("[]", "not_object"),
         ('"x"', "not_object"),
         ('{"decisions": [], "decisions": []}', "duplicate_key"),
@@ -163,6 +166,23 @@ def test_malformed_json_fails_without_raising(raw: str, kind: str) -> None:
     assert isinstance(result, DecisionOutputParseFailure)
     assert result.raw_text == raw
     assert result.issues[0].kind == kind
+
+
+@pytest.mark.parametrize("fence", ["```json", "```", "```json  "])
+def test_one_enclosing_fence_is_accepted(fence: str) -> None:
+    # ADR-0035: the 2026-09-28 19:45 production output was valid JSON inside a ```json fence.
+    raw = f"{fence}\n{json.dumps(_valid(), indent=2)}\n```\n"
+    result = parse_agent_decision_output(raw)
+    assert isinstance(result, DecisionOutputParsed), result
+    assert result.output.decisions[0].proposed_legs[0].limit_price == Decimal("1.25")
+
+
+def test_fenced_failure_preserves_the_raw_text() -> None:
+    raw = '```json\n{"decisions": 1}\n```'
+    result = parse_agent_decision_output(raw)
+    assert isinstance(result, DecisionOutputParseFailure)
+    assert result.raw_text == raw
+    assert result.issues[0].kind == "json_number"
 
 
 def test_invalid_utf8() -> None:

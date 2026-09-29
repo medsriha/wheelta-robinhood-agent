@@ -36,6 +36,9 @@ _CRON_INTERVAL_SECONDS = 3600
 # An exact model ID: lowercase alphanumerics and dots in hyphen-separated parts (it must fit
 # into a Mignon agent name, agent/mignons.py).
 MODEL_ID_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9.]+)*$")
+# ADR-0036: the orchestrator's model may carry the Claude Code CLI's 1M-context suffix. Only
+# the CLI understands it; the Messages API and Mignon agent names take the plain ID.
+LONG_CONTEXT_SUFFIX = "[1m]"
 MODEL_ALIASES = frozenset({"sonnet", "opus", "haiku", "inherit", "default", "best"})
 # A plain addr-spec: one @, no whitespace or angle brackets, a dotted domain.
 _EMAIL_ADDRESS_PATTERN = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
@@ -86,7 +89,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: SecretStr
     AGENT_MODEL: str = Field(min_length=1)
     # ADR-0025: comma-separated exact model IDs the orchestrator may assign to a Mignon;
-    # unset or blank means AGENT_MODEL only.
+    # unset or blank means AGENT_MODEL only (its plain ID, ADR-0036).
     MIGNON_AGENT_MODELS: str | None = None
     MCP_TIMEOUT: PositiveInt = 30000
     # Must exceed the proxy's 10 s margin (agent/proxy.py PROXY_TIMEOUT_MARGIN_SECONDS, ADR-0023).
@@ -149,9 +152,15 @@ class Settings(BaseSettings):
     @field_validator("AGENT_MODEL")
     @classmethod
     def _model_is_pinned(cls, value: str) -> str:
-        """An exact model ID, never an alias the CLI resolves itself (CLAUDE.md §8, §23)."""
-        if value.strip().lower() in MODEL_ALIASES:
+        """An exact model ID, never an alias the CLI resolves itself (CLAUDE.md §8, §23),
+        optionally with the CLI's 1M-context suffix (ADR-0036)."""
+        base = value.removesuffix(LONG_CONTEXT_SUFFIX)
+        if base.strip().lower() in MODEL_ALIASES:
             raise ValueError(f"must be an exact model ID, not the alias {value!r}")
+        if not MODEL_ID_PATTERN.fullmatch(base):
+            raise ValueError(
+                f"not an exact model ID (optionally ending in {LONG_CONTEXT_SUFFIX}): {value!r}"
+            )
         return value
 
     @field_validator("RUN_SUMMARY_MODEL")
@@ -278,12 +287,18 @@ class Settings(BaseSettings):
         order, or AGENT_MODEL alone."""
         if self.MIGNON_AGENT_MODELS:
             return tuple(self.MIGNON_AGENT_MODELS.split(","))
-        return (self.AGENT_MODEL,)
+        return (self.agent_base_model,)
+
+    @property
+    def agent_base_model(self) -> str:
+        """AGENT_MODEL without the CLI-only 1M-context suffix (ADR-0036)."""
+        return self.AGENT_MODEL.removesuffix(LONG_CONTEXT_SUFFIX)
 
     @property
     def run_summary_model(self) -> str:
-        """The model that writes the summary email prose (ADR-0029)."""
-        return self.RUN_SUMMARY_MODEL or self.AGENT_MODEL
+        """The model that writes the summary email prose (ADR-0029). The Messages API takes
+        no context suffix, so the default is AGENT_MODEL's plain ID (ADR-0036)."""
+        return self.RUN_SUMMARY_MODEL or self.agent_base_model
 
     @property
     def account_last4(self) -> str:

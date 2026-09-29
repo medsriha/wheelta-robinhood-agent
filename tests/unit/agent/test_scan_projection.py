@@ -46,26 +46,58 @@ def _scan(n: int) -> dict[str, Any]:
     }
 
 
+def _table_rows(out: Any) -> list[dict[str, Any]]:
+    """ADR-0037: rows are a table; rebuild each as `common` plus its own columns."""
+    table = out["data"]["result"]["results"]
+    return [
+        {**table["common"], **dict(zip(table["columns"], row, strict=True))}
+        for row in table["rows"]
+    ]
+
+
 def test_small_scan_is_kept_whole_without_guide_or_duplicate_symbol() -> None:
     out, gaps = project_scan(_scan(3))
     assert gaps == ()
     assert isinstance(out, dict) and "guide" not in out
-    rows = out["data"]["result"]["results"]
+    rows = _table_rows(out)
     assert [r["ticker"] for r in rows] == ["T000", "T001", "T002"]
-    assert all("Symbol" not in r["columns"] and "Name" in r["columns"] for r in rows)
+    assert all("columns.Symbol" not in r and "columns.Name" in r for r in rows)
+    assert rows[1]["columns.Name"] == "Company 1" and rows[1]["instrument_type"] == "equity"
     assert out["data"]["result"]["total_items"] == 3
 
 
 def test_large_scan_keeps_leading_rows_in_order_with_a_gap() -> None:
     out, gaps = project_scan(_scan(200))
     assert isinstance(out, dict)
-    rows = out["data"]["result"]["results"]
+    rows = _table_rows(out)
     assert 0 < len(rows) < 200
     assert [r["ticker"] for r in rows] == [f"T{i:03d}" for i in range(len(rows))]
-    assert len(json.dumps(out, sort_keys=True)) <= SCAN_CONTEXT_BUDGET_CHARS + 100
+    assert len(json.dumps(out, sort_keys=True)) <= SCAN_CONTEXT_BUDGET_CHARS
     (gap,) = gaps
     assert f"first {len(rows)} of 200 rows" in gap
     assert project_scan(_scan(200)) == (out, gaps)  # deterministic
+
+
+def test_the_table_fits_more_rows_than_row_objects() -> None:
+    """ADR-0037: the same budget held 39 rows of a real scan as objects."""
+    out, _ = project_scan(_scan(200))
+    objects = [_row(i) for i in range(200)]
+    as_objects = 0
+    used = 0
+    for row in objects:
+        used += len(json.dumps(row, sort_keys=True)) + 2
+        if used > SCAN_CONTEXT_BUDGET_CHARS:
+            break
+        as_objects += 1
+    assert len(_table_rows(out)) > as_objects * 1.3
+
+
+def test_rows_of_mixed_shapes_stay_objects() -> None:
+    payload = _scan(3)
+    payload["data"]["result"]["results"][1]["extra"] = "x"
+    out, gaps = project_scan(payload)
+    rows = out["data"]["result"]["results"]
+    assert gaps == () and isinstance(rows, list) and rows[1]["extra"] == "x"
 
 
 def test_other_shapes_pass_through() -> None:

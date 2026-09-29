@@ -363,11 +363,28 @@ def test_bad_mignon_model_allowlists_are_rejected(env: pytest.MonkeyPatch, value
         load_settings()
 
 
-@pytest.mark.parametrize("alias", ["opus", "Sonnet", "inherit"])
+@pytest.mark.parametrize("alias", ["opus", "Sonnet", "inherit", "opus[1m]"])
 def test_agent_model_aliases_are_rejected(env: pytest.MonkeyPatch, alias: str) -> None:
     env.setenv("AGENT_MODEL", alias)
     with pytest.raises(SettingsError, match="AGENT_MODEL"):
         load_settings()
+
+
+@pytest.mark.parametrize("value", ["Claude Opus", "claude-x[2m]", "claude-x[1m][1m]", "[1m]"])
+def test_agent_model_must_be_an_exact_id(env: pytest.MonkeyPatch, value: str) -> None:
+    env.setenv("AGENT_MODEL", value)
+    with pytest.raises(SettingsError, match="AGENT_MODEL"):
+        load_settings()
+
+
+def test_long_context_suffix_stays_on_the_cli_model_only(env: pytest.MonkeyPatch) -> None:
+    """ADR-0036: the CLI gets `[1m]`; the summary API call and Mignon names get the plain ID."""
+    env.setenv("AGENT_MODEL", "claude-opus-5-5[1m]")
+    s = load_settings()
+    assert s.AGENT_MODEL == "claude-opus-5-5[1m]"
+    assert s.agent_base_model == "claude-opus-5-5"
+    assert s.run_summary_model == "claude-opus-5-5"
+    assert s.mignon_models == ("claude-opus-5-5",)
 
 
 # -- run-summary email (ADR-0029) ---------------------------------------------------------------

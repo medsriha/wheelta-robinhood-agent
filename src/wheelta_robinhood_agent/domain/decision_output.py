@@ -7,6 +7,7 @@ rejected on every object (so `schema_version`, quantities, statuses, broker IDs,
 never from the model. `limit_price` must be a JSON decimal string and is parsed to Decimal;
 JSON numbers anywhere are rejected. `next_run.at` (v6, ADR-0028) is an RFC 3339 string with an
 explicit offset, parsed to a UTC datetime; it is a scheduling request, never a financial fact.
+One ```json (or bare ```) fence enclosing the whole response is removed first (ADR-0035).
 
 Context-dependent semantic validation (reference resolution, action/leg compatibility) is
 a separate, later step and is not performed here.
@@ -212,6 +213,21 @@ def _failure(raw_text: str, *issues: ParseIssue) -> DecisionOutputParseFailure:
     return DecisionOutputParseFailure(ok=False, raw_text=raw_text, issues=tuple(issues))
 
 
+# The whole text is one fence: ```json or ```, a newline, the body, a newline, ```.
+_ENCLOSING_FENCE: Final = re.compile(r"\A```(?:json)?[ \t]*\n(.*)\n```\Z", re.DOTALL)
+
+
+def strip_json_fence(raw: str | bytes) -> str | bytes:
+    """The body of one fence enclosing the whole (stripped) text, else `raw` unchanged.
+
+    ADR-0032 (Mignon reports), ADR-0035 (AgentDecisionOutput). Bytes are left unchanged.
+    """
+    if not isinstance(raw, str):
+        return raw
+    match = _ENCLOSING_FENCE.fullmatch(raw.strip())
+    return match.group(1) if match else raw
+
+
 def load_strict_json(raw: str | bytes) -> tuple[str, object] | ParseIssue:
     """Decode model text as exactly one strict JSON value, or return the first issue.
 
@@ -257,15 +273,18 @@ def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
 
     Never raises on bad model output: returns `DecisionOutputParseFailure` with the raw text
     and typed issues. The response must be exactly one JSON object (surrounding whitespace
-    allowed; no code fences or prose). Duplicate keys, JSON numbers, NaN/Infinity, invalid
-    UTF-8, unknown fields, and type mismatches are all failures (INTERFACES.md: forbid extra
-    fields recursively; preserve the raw response on failure).
+    allowed; no prose). ADR-0035: one enclosing ```json (or bare ```) fence around the whole
+    text is removed first; anything else outside the object still fails. Duplicate keys, JSON
+    numbers, NaN/Infinity, invalid UTF-8, unknown fields, and type mismatches are all failures
+    (INTERFACES.md: forbid extra fields recursively; preserve the raw response on failure).
     """
-    loaded = load_strict_json(raw)
+    loaded = load_strict_json(strip_json_fence(raw))
     if isinstance(loaded, ParseIssue):
         text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
         return _failure(text, loaded)
-    text, data = loaded
+    decoded, data = loaded
+    # A failure preserves what the model sent, fence included.
+    text = raw if isinstance(raw, str) else decoded
     if not isinstance(data, dict):
         return _failure(
             text, ParseIssue(loc="", message="top level must be a JSON object", kind="not_object")

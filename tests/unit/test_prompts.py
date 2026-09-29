@@ -30,10 +30,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v9_with_expected_placeholders() -> None:
+def test_active_prompt_is_v10_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 9
+    assert template.version == 10
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -46,6 +46,13 @@ def test_render_substitutes_everything() -> None:
     assert rendered.template_sha256 == template.sha256
     assert rendered.sha256 != template.sha256
     assert rendered == render_prompt(template, _values(ACTIVE_PLACEHOLDERS))
+
+
+def test_active_prompt_asks_for_bare_json() -> None:
+    # ADR-0035: a fenced final message failed a production run on 2026-09-28.
+    body = load_prompt().body
+    assert "Start your final message with `{` and\nend it with `}`: no code fence" in body
+    assert "fenced only for display here" in body
 
 
 def test_active_prompt_asks_for_next_run() -> None:

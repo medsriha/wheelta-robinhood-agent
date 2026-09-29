@@ -18,9 +18,10 @@ unchanged. Its `tools/call` handler:
    first). No retry, in any tier (CLAUDE.md §14).
 3. Validates the result with the injected `ResultValidator` (the same `BoundaryValidator`
    used for direct delivery), records `raw_invalid` / `validated` or `error` and the
-   outcome, and returns the envelope as one text block (`mcp_tool_output`). An envelope
-   longer than `MAX_DELIVERED_CHARS` is not delivered: the CLI would rewrite it and the
-   delivery check would stop the run. It becomes an `error` envelope naming its size, and
+   outcome, and returns the envelope's model view (`model_view`, ADR-0037) as one text block
+   (`mcp_tool_output`). The ledger keeps the full envelope. A view longer than
+   `MAX_DELIVERED_CHARS` is not delivered: the CLI would rewrite it and the delivery check
+   would stop the run. It becomes an `error` envelope naming its size, and
    is not recorded as validated evidence, because the model never saw it.
 
 Whatever happens, the CLI receives only text our code produced: an upstream failure becomes
@@ -50,6 +51,7 @@ from wheelta_robinhood_agent.agent.hooks import (
     ValidationRequest,
     mcp_tool_output,
 )
+from wheelta_robinhood_agent.agent.model_view import model_view
 from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyCall, ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import ResultKind, ToolEventRecorder
 from wheelta_robinhood_agent.agent.run_control import RunControl
@@ -230,7 +232,9 @@ class ValidatingProxy:
                 call.tool_call_id, ResultKind.RAW_INVALID, outcome.raw_redacted
             )
         payload = envelope.model_dump(mode="json")
-        size = len(mcp_tool_output(payload)[0]["text"])
+        # ADR-0037: the ledger keeps the full envelope; the model gets its view.
+        output = mcp_tool_output(model_view(payload))
+        size = len(output[0]["text"])
         if size > MAX_DELIVERED_CHARS:
             return self._failed(
                 call,
@@ -263,7 +267,7 @@ class ValidatingProxy:
                 self.order_recorder.after_validated(call, payload)
             except Exception:  # noqa: BLE001 - deliver the broker's answer; stop further actions
                 self._stop()
-        return mcp_tool_output(payload)
+        return output
 
     def _error_output(self, call: ProxyCall, gap: str, now: datetime) -> list[dict[str, str]]:
         envelope = ResultEnvelope(

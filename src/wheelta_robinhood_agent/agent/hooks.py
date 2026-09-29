@@ -73,6 +73,7 @@ from wheelta_robinhood_agent.agent.mignons import (
     Role,
     role_of,
 )
+from wheelta_robinhood_agent.agent.model_view import model_view
 from wheelta_robinhood_agent.agent.proxy_dispatch import (
     CallState,
     ProxyCall,
@@ -451,8 +452,9 @@ def mcp_tool_output(envelope: Mapping[str, Any]) -> list[dict[str, str]]:
 
     The CLI expects MCP tool output as a content-block list; a bare dict crashes it and the
     model receives the crash text instead (real-CLI acceptance test 1, DATA_QUALITY.md).
+    Compact separators: whitespace is model input with no content (ADR-0037).
     """
-    return [{"type": "text", "text": json.dumps(envelope, sort_keys=True)}]
+    return [{"type": "text", "text": json.dumps(envelope, sort_keys=True, separators=(",", ":"))}]
 
 
 def mignon_report_output(tool_response: Mapping[str, Any], envelope: Mapping[str, Any]) -> Any:
@@ -888,9 +890,11 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             context_text = filters_context(call)
             # Built-in outputs must match the tool's own schema, so a replacement would be
             # rejected (types.py PostToolUseHookSpecificOutput); they are recorded, not replaced.
+            # ADR-0037: a replaced result is delivered as its model view.
+            view = model_view(payload)
             delivered_output = cast(
                 JsonValue,
-                deps.redactor.redact(data.get("tool_response")) if call.builtin else payload,
+                deps.redactor.redact(data.get("tool_response")) if call.builtin else view,
             )
             delivered_ref = deps.recorder.store_result(
                 call.tool_call_id,
@@ -907,7 +911,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             deps.recorder.delivered(
                 call.tool_call_id, delivered_result_ref=delivered_ref, observed_at=now
             )
-            note_delivered(call, payload)
+            note_delivered(call, view)
         except Exception as exc:
             stop(now)
             reason = f"result validation or recording failed ({type(exc).__name__})"
@@ -932,7 +936,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         specific = PostToolUseHookSpecificOutput(hookEventName="PostToolUse")
         if not call.builtin:
-            specific["updatedToolOutput"] = mcp_tool_output(payload)
+            specific["updatedToolOutput"] = mcp_tool_output(view)
         if context_text is not None:
             specific["additionalContext"] = context_text
         out = SyncHookJSONOutput(hookSpecificOutput=specific)

@@ -8,6 +8,7 @@ import dataclasses
 import json
 import uuid
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -22,6 +23,7 @@ from test_hooks import (
     wire,
 )
 
+from wheelta_robinhood_agent.agent.model_view import is_model_view, model_view
 from wheelta_robinhood_agent.agent.proxy import (
     PROXY_DEDUP_KEY,
     TOOL_USE_ID_META,
@@ -36,6 +38,7 @@ from wheelta_robinhood_agent.agent.proxy_dispatch import (
     ProxyDispatch,
     delivered_matches,
 )
+from wheelta_robinhood_agent.agent.result_boundary import BoundaryValidator, mapped_evidence_of
 from wheelta_robinhood_agent.domain.enums import ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.mcp_upstream import (
@@ -44,6 +47,7 @@ from wheelta_robinhood_agent.integrations.mcp_upstream import (
     UpstreamTool,
 )
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
+from wheelta_robinhood_agent.observability.redaction import Redactor
 
 QUOTES = "mcp__robinhood__get_option_quotes"
 RAW = "RAW-REMOTE-TEXT-must-never-be-delivered"
@@ -444,3 +448,23 @@ def test_an_oversized_envelope_is_an_error_and_the_run_continues() -> None:
     # PostToolUse accepts exactly the delivered error envelope: no stop.
     out = r.session.post(QUOTES, blocks)
     assert "continue_" not in out
+
+
+def test_the_model_gets_the_view_and_the_ledger_keeps_the_full_envelope() -> None:
+    """ADR-0037: validated rows hold the full evidence; the delivered text is its view."""
+    fixture = Path(__file__).parents[2] / "fixtures" / "robinhood" / "results"
+    data = json.loads((fixture / "get_option_quotes.SPY_20261016_P740.json").read_text())["data"]
+    response = {
+        "content": [{"type": "text", "text": json.dumps({"data": data, "guide": "prose"})}],
+        "isError": False,
+    }
+    r = rig(behavior=response, validator=BoundaryValidator(redactor=Redactor()))
+    r.session.pre(QUOTES, {"symbols": ["AAPL"]})
+    blocks = r.call()
+    delivered = wire(blocks)
+    stored = r.rec.event("store_validated")["payload"]
+    assert mapped_evidence_of(stored) is not None  # full typed evidence for facts and audit
+    assert is_model_view(delivered) and delivered == model_view(stored)
+    assert "quote_id" not in blocks[0]["text"]
+    r.session.post(QUOTES, blocks)
+    assert r.rec.event("store_delivered")["payload"]["tool_output"] == delivered

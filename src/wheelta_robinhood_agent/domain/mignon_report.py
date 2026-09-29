@@ -17,7 +17,6 @@ Rules (each checked here, in pure code):
   URL that was not delivered to this Mignon is an issue.
 """
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Annotated, Final, Literal, Self
@@ -28,6 +27,7 @@ from wheelta_robinhood_agent.domain.base import DomainModel, require_unique
 from wheelta_robinhood_agent.domain.decision_output import (
     ParseIssue,
     load_strict_json,
+    strip_json_fence,
     validation_issues,
 )
 
@@ -87,18 +87,6 @@ class MignonReportParseFailure:
 
 
 MignonReportParseResult = MignonReportParsed | MignonReportParseFailure
-
-
-# The whole text is one fence: ```json or ```, a newline, the body, a newline, ```.
-_ENCLOSING_FENCE: Final = re.compile(r"\A```(?:json)?[ \t]*\n(.*)\n```\Z", re.DOTALL)
-
-
-def strip_json_fence(raw: str | bytes) -> str | bytes:
-    """The body of one fence enclosing the whole (stripped) text, else `raw` unchanged."""
-    if not isinstance(raw, str):
-        return raw
-    match = _ENCLOSING_FENCE.fullmatch(raw.strip())
-    return match.group(1) if match else raw
 
 
 def parse_mignon_report(raw: str | bytes) -> MignonReportParseResult:
