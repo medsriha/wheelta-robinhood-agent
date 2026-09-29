@@ -9,6 +9,11 @@ Evidence models here cover broker facts the domain package does not model yet (i
 multiplier/tick, review results, positions/open-order reads). Every broker field mapping is
 **unverified** until captured fixtures exist (CLAUDE.md §9); unknown values are `None`, and
 the checks treat `None` as unverifiable, never as zero.
+
+"Live" in the check docstrings means a run that executes orders: order venue `broker`, or
+`simulated` (a dry run whose review/place/cancel calls the proxy answered in-process,
+ADR-0038); both are audited from their recorded calls alike. "Off" / "dry run" there means a
+proposal-only run (venue `none`).
 """
 
 import hashlib
@@ -31,8 +36,13 @@ from wheelta_robinhood_agent.domain.base import (
     require_unique,
 )
 from wheelta_robinhood_agent.domain.decision_output import AgentDecisionOutput
-from wheelta_robinhood_agent.domain.enums import ExecutionMode
+from wheelta_robinhood_agent.domain.enums import ExecutionMode, OrderVenue
 from wheelta_robinhood_agent.domain.facts import DecisionFacts
+from wheelta_robinhood_agent.domain.gating import (
+    check_venue,
+    executes_orders,
+    with_default_venue,
+)
 from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.orders import OrderRecord
 from wheelta_robinhood_agent.domain.positions import PositionBook
@@ -165,6 +175,8 @@ class AuditContext(DomainModel):
 
     run_id: UUID
     effective_execution_mode: ExecutionMode
+    # ADR-0038; defaults from the mode (live: broker, off: none) when not given.
+    order_venue: OrderVenue
     rules: TradingRules
     rules_version: NonEmptyStr
     rules_hash: NonEmptyStr
@@ -184,8 +196,14 @@ class AuditContext(DomainModel):
 
     _hash: str | None = PrivateAttr(default=None)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_venue(cls, data: object) -> object:
+        return with_default_venue(data)
+
     @model_validator(mode="after")
     def _check_context(self) -> Self:
+        check_venue(self.effective_execution_mode, self.order_venue)
         require_unique(tuple(t.identity.tool_call_id for t in self.tool_calls), "tool call id")
         require_unique(tuple(q.quote_id for q in self.quotes), "quote id")
         require_unique(tuple(r.review_tool_call_id for r in self.reviews), "review call id")
@@ -197,7 +215,15 @@ class AuditContext(DomainModel):
                 raise ValueError("the run record belongs to another run")
             if self.run_record.effective_execution_mode is not self.effective_execution_mode:
                 raise ValueError("the run record disagrees on the effective execution mode")
+            if self.run_record.order_venue is not self.order_venue:
+                raise ValueError("the run record disagrees on the order venue")
         return self
+
+    @property
+    def executes_orders(self) -> bool:
+        """Place/cancel calls exist and attempts come from them (broker or simulated venue);
+        False for a proposal-only dry run (ADR-0038)."""
+        return executes_orders(self.order_venue)
 
     @property
     def context_hash(self) -> str:

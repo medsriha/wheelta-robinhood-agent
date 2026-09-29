@@ -27,10 +27,12 @@ _EXIT_CODES: Final = MappingProxyType(
         RunStatus.SKIPPED_CONCURRENT: EXIT_OK,
         # ARCHITECTURE.md "Market-session gating": exits 0 with skipped_market_closed.
         RunStatus.SKIPPED_MARKET_CLOSED: EXIT_OK,
-        # ADR-0024 (superseded by ADR-0033): no longer produced; kept for recorded runs.
+        # ADR-0039: an off-mode invocation outside APP_ENV=local; dry runs are local only.
         RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL: EXIT_OK,
         # ADR-0028: most ticks are not due; that is the normal outcome, not a failure.
         RunStatus.SKIPPED_NOT_DUE: EXIT_OK,
+        # ADR-0038: with the mode off, scheduled ticks do nothing; dry runs are on demand.
+        RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED: EXIT_OK,
         # Deliberate operator stop; alerted separately, not a failure.
         RunStatus.SKIPPED_KILLED: EXIT_OK,
         # CLAUDE.md §14: non-zero for failures; distinct so alerting can tell them apart.

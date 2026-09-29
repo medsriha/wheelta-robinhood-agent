@@ -137,12 +137,14 @@ class _Observation(DomainModel):
 
 
 class OptionInstrument(_Observation):
-    """Validated instrument identity. `multiplier` is None until verified (VALIDATION.md)."""
+    """Validated instrument identity. `multiplier` is None until verified (VALIDATION.md).
+    `tick_increment` is the price tick when it is the same at every price, else None."""
 
     occ_symbol: OccSymbol
     broker_instrument_id: NonEmptyStr
     underlying: NonEmptyStr
     multiplier: PosCount | None
+    tick_increment: PosDec | None = None
 
 
 class UnderlyingQuote(_Observation):

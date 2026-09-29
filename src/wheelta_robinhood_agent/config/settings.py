@@ -274,11 +274,25 @@ class Settings(BaseSettings):
         return ExecutionMode.LIVE if self.EXECUTION_MODE == "live" else ExecutionMode.OFF
 
     @property
+    def execution_ceiling(self) -> ExecutionMode:
+        """The phase ceiling in production; `off` everywhere else (ADR-0039): live trading runs
+        only on Railway production, so a local process never places a real order."""
+        return PHASE_EXECUTION_CEILING if self.APP_ENV is AppEnv.PRODUCTION else ExecutionMode.OFF
+
+    @property
     def effective_execution_mode(self) -> ExecutionMode:
         return effective_execution_mode(
             self.requested_execution_mode,
             armed=self.EXECUTION_ARMED,
-            ceiling=PHASE_EXECUTION_CEILING,
+            ceiling=self.execution_ceiling,
+        )
+
+    @property
+    def workspace_writes_enabled(self) -> bool:
+        """Tier S writes only in effective live (ADR-0039): a dry run must not change the
+        Robinhood watchlists, scans, or alerts that production uses."""
+        return self.ROBINHOOD_WORKSPACE_WRITES and (
+            self.effective_execution_mode is ExecutionMode.LIVE
         )
 
     @property
@@ -314,7 +328,7 @@ class Settings(BaseSettings):
             "execution_mode_raw": self.EXECUTION_MODE,
             "requested_execution_mode": self.requested_execution_mode.value,
             "effective_execution_mode": self.effective_execution_mode.value,
-            "execution_ceiling": PHASE_EXECUTION_CEILING.value,
+            "execution_ceiling": self.execution_ceiling.value,
             "execution_armed": self.EXECUTION_ARMED,
             "kill_switch": self.KILL_SWITCH,
             "agent_model": self.AGENT_MODEL,
@@ -330,6 +344,7 @@ class Settings(BaseSettings):
             "local_accept_remote_result_risk": self.LOCAL_ACCEPT_REMOTE_RESULT_RISK,
             "robinhood_account_last4": self.account_last4,
             "robinhood_workspace_writes": self.ROBINHOOD_WORKSPACE_WRITES,
+            "workspace_writes_enabled": self.workspace_writes_enabled,
             "robinhood_workspace_prefix": self.ROBINHOOD_WORKSPACE_PREFIX,
             "wheelta_mcp_url": str(self.WHEELTA_MCP_URL),
             "heartbeat_configured": self.HEARTBEAT_URL is not None,

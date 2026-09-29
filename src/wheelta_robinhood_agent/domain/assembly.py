@@ -10,8 +10,9 @@ Order of work:
    become `AssemblyFinding`s; nothing is repaired by ticker/price/time matching.
 3. Bind live attempts to decision legs by recorded place-call identity; anything that cannot
    be attributed stays in `unassociated_actions`. Every place/cancel call appears once.
-4. Off mode: build at most one not_placed/DRY_RUN attempt per valid proposal with a known
-   positive quantity, simulating reservations in priority order against one baseline.
+4. Proposal-only dry run (order venue `none`, ADR-0038): build at most one not_placed/DRY_RUN
+   attempt per valid proposal with a known positive quantity, simulating reservations in
+   priority order against one baseline. Broker and simulated venues follow step 3.
 5. Priorities: closes/rolls before opens (`orders.execution_order`), opens by the fixed
    ranking metrics, array order breaking discretionary ties.
 
@@ -57,12 +58,12 @@ from wheelta_robinhood_agent.domain.enums import (
     AttemptStatus,
     DataQuality,
     DecisionAction,
-    ExecutionMode,
     OptionRight,
     OrderSide,
 )
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.facts import DecisionFacts, DerivedMetric, FactsPurpose
+from wheelta_robinhood_agent.domain.gating import executes_orders
 from wheelta_robinhood_agent.domain.orders import Attempt, Cancellation, ReasonCode
 from wheelta_robinhood_agent.domain.run_record import (
     RUN_RECORD_SCHEMA_VERSION,
@@ -214,7 +215,8 @@ class _Assembler:
         }
         key = str(ctx.output_record_id) if ctx.output_record_id else str(ctx.run_id)
         self.output_key = key
-        self.off = ctx.effective_execution_mode is ExecutionMode.OFF
+        # A proposal-only dry run (ADR-0038); broker and simulated venues record attempts.
+        self.off = not executes_orders(ctx.order_venue)
         # cancellation_rationales index -> the recorded cancel call it validly selected.
         self.rationale_calls: dict[int, UUID] = {}
 
@@ -1058,7 +1060,8 @@ def _summary(
     )
     return (
         f"Run {ctx.run_id} ({ctx.environment.value}, slot {ctx.slot.isoformat()}), "
-        f"effective mode {ctx.effective_execution_mode.value}: decision output {status.value} "
+        f"effective mode {ctx.effective_execution_mode.value}, order venue "
+        f"{ctx.order_venue.value}: decision output {status.value} "
         f"({coverage}); {len(decisions)} decision(s); {recorded} recorded place call(s); "
         f"{dry} dry-run proposal(s); {total_cancels} cancel call(s); "
         f"{len(unassociated)} unassociated action(s); {findings} assembly finding(s)."
@@ -1103,6 +1106,7 @@ def assemble_run_record(context: AssemblyContext, decisions: DecisionsInput) -> 
         terminated_at=context.terminated_at,
         requested_execution_mode=context.requested_execution_mode,
         effective_execution_mode=context.effective_execution_mode,
+        order_venue=context.order_venue,
         rules_version=context.rules_version,
         rules_hash=context.rules_hash,
         prompt_id=context.prompt_id,

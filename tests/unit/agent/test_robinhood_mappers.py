@@ -181,9 +181,21 @@ def test_option_instrument_fixture() -> None:
     assert inst.broker_instrument_id == INSTRUMENT_ID
     assert inst.underlying == "SPY"
     assert inst.multiplier == 100
+    assert inst.tick_increment == Decimal("0.01")  # above_tick == below_tick
     assert inst.as_of == RETRIEVED
     assert out.gaps == ()
     _check_provenance(out, CALL)
+
+
+def test_option_instrument_price_dependent_tick_is_not_one_increment() -> None:
+    data = _data("get_option_instruments.SPY_20261016_P740.json")
+    data["instruments"][0]["min_ticks"] = {
+        "above_tick": "0.10",
+        "below_tick": "0.05",
+        "cutoff_price": "3.00",
+    }
+    (inst,) = map_option_instruments(_request("get_option_instruments", data), _ids()).instruments
+    assert inst.tick_increment is None
 
 
 @pytest.mark.parametrize(

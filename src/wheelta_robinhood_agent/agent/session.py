@@ -28,9 +28,12 @@ Two parts:
   parsed strictly into AgentDecisionOutput v5, and raw (redacted) plus parsed output are
   persisted.
 
-`assert_no_order_tools` re-checks the plan before any session is built: in effective mode
-off no Tier X tool is allowed; in live (armed, ADR-0034) only the three option-order tools
-are. Live mode records broker orders through `broker_ledger.BrokerLedger`.
+`assert_no_order_tools` re-checks the plan before any session is built: without an order
+venue no Tier X tool is allowed; with one only the three option-order tools are. The venue
+(ADR-0038) is `broker` in armed live (ADR-0034); in a dry run it is `simulated` when
+Robinhood is proxied (`simulated_broker.SimulatedBroker` answers the order tools in-process)
+and `none` otherwise. `broker_ledger.BrokerLedger` records orders for both venues: broker
+orders under the account scope, simulated ones under the run's own simulated scope.
 """
 
 import contextlib
@@ -65,6 +68,7 @@ from wheelta_robinhood_agent.agent.facts_tool import (
     FACTS_TOOL_NAME,
     DecisionFactsService,
     build_facts_tool,
+    load_run_evidence,
 )
 from wheelta_robinhood_agent.agent.hooks import HookDeps, build_hooks
 from wheelta_robinhood_agent.agent.ledger_adapters import (
@@ -98,6 +102,7 @@ from wheelta_robinhood_agent.agent.result_boundary import (
     extract_mcp_payload,
 )
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
+from wheelta_robinhood_agent.agent.simulated_broker import SimulatedBroker, simulated_scope_id
 from wheelta_robinhood_agent.agent.tool_access import (
     ALLOWED_BUILTINS,
     ToolAccess,
@@ -123,10 +128,12 @@ from wheelta_robinhood_agent.domain.decision_output import (
 from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
     MignonType,
+    OrderVenue,
     SourceStatus,
     ToolCallStatus,
     ToolTier,
 )
+from wheelta_robinhood_agent.domain.gating import executes_orders, order_venue
 from wheelta_robinhood_agent.integrations.mcp_upstream import (
     McpUpstream,
     UpstreamAuthError,
@@ -215,15 +222,20 @@ class SessionPlan:
     def may_start(self) -> bool:
         return not self.required_unavailable
 
+    @property
+    def order_venue(self) -> OrderVenue:
+        return self.tool_access.order_venue
+
 
 def assert_no_order_tools(access: ToolAccess, registries: Sequence[ToolRegistry]) -> None:
-    """No Tier X tool in off mode; in live mode only the live option-order tools (ADR-0006,
-    ADR-0034). Raises SessionPlanError."""
+    """No Tier X tool without an order venue; with one (broker in armed live, ADR-0034, or
+    the simulated broker in a proxied dry run, ADR-0038) only the live option-order tools.
+    Raises SessionPlanError."""
     allowed = set(access.allowed_tools)
-    live = access.effective_mode is ExecutionMode.LIVE
+    orders = executes_orders(access.order_venue)
     for registry in registries:
         for spec in registry.by_tier(ToolTier.X):
-            if registry.qualified(spec.name) in allowed and not (live and spec.live_order_tool):
+            if registry.qualified(spec.name) in allowed and not (orders and spec.live_order_tool):
                 raise SessionPlanError(f"order tool {spec.name} would be exposed")
 
 
@@ -242,14 +254,10 @@ def plan_session(
 
     A server with a token is proxied when the proxy is accepted; otherwise, or without a
     token our code can present, it is direct only if direct delivery is accepted.
+    The order venue (ADR-0038) follows: broker in live; in off, simulated when Robinhood is
+    proxied (the proxy answers order calls in-process), else none (no order tools).
     """
     registries = (*(s.registry for s in sources), local_registry)
-    base = build_tool_access(
-        effective_mode=effective_mode,
-        workspace_writes=workspace_writes,
-        registries=registries,
-        mignons=mignons,
-    )
     withheld: dict[str, str] = {}
     observations: list[SourceObservation] = []
     servers: list[McpHttpServer] = []
@@ -279,6 +287,14 @@ def plan_session(
             )
             continue
         (proxied if proxy else servers).append(source.server)
+    venue = order_venue(effective_mode, robinhood_proxied=any(p.name == ROBINHOOD for p in proxied))
+    base = build_tool_access(
+        effective_mode=effective_mode,
+        workspace_writes=workspace_writes,
+        registries=registries,
+        mignons=mignons,
+        venue=venue,
+    )
     allowed = set(base.allowed_tools)
     disallowed = set(base.disallowed_tools)
     for registry in registries:
@@ -289,6 +305,7 @@ def plan_session(
 
     access = ToolAccess(
         effective_mode=effective_mode,
+        order_venue=venue,
         allowed_tools=tuple(sorted(allowed)),
         disallowed_tools=tuple(sorted(disallowed)),
     )
@@ -492,8 +509,9 @@ def build_session_options(
     prefix = settings.ROBINHOOD_WORKSPACE_PREFIX
     hook_deps = HookDeps(
         effective_mode=deps.plan.effective_mode,
+        order_venue=deps.plan.order_venue,
         kill_switch=settings.KILL_SWITCH,
-        workspace_writes=settings.ROBINHOOD_WORKSPACE_WRITES,
+        workspace_writes=settings.workspace_writes_enabled,
         workspace_prefix=prefix,
         account_number=settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
         rules=deps.rules.rules,
@@ -524,7 +542,16 @@ def build_session_options(
     sdk_servers: dict[str, McpSdkServerConfig] = {LOCAL_SERVER_NAME: local}
     registry_by_name = {r.server: r for r in deps.plan.registries}
     timeout = upstream_timeout_seconds(settings.MCP_TOOL_TIMEOUT)
+    venue = deps.plan.order_venue
     for name, upstream in upstreams.items():
+        if venue is OrderVenue.SIMULATED and name == ROBINHOOD:
+            # ADR-0038: order tools are answered in-process; none reaches Robinhood.
+            upstream = SimulatedBroker(
+                upstream=upstream,
+                registry=registry_by_name[name],
+                instruments=lambda iid: load_run_evidence(deps.conn, deps.run_id).instrument(iid),
+                clock=deps.clock,
+            )
         proxy = ValidatingProxy(
             server=name,
             upstream=upstream,
@@ -535,8 +562,14 @@ def build_session_options(
             clock=deps.clock,
             upstream_timeout_seconds=timeout,
             order_recorder=(
-                BrokerLedger(deps.conn, deps.run_id, deps.account_scope_id)
-                if deps.plan.effective_mode is ExecutionMode.LIVE and name == ROBINHOOD
+                BrokerLedger(
+                    deps.conn,
+                    deps.run_id,
+                    deps.account_scope_id
+                    if venue is OrderVenue.BROKER
+                    else simulated_scope_id(deps.run_id),
+                )
+                if executes_orders(venue) and name == ROBINHOOD
                 else None
             ),
         )

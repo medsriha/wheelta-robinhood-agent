@@ -31,6 +31,7 @@ from wheelta_robinhood_agent.agent.withholding import ServerWithholding
 from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
     MignonType,
+    OrderVenue,
     SourceStatus,
     ToolTier,
 )
@@ -95,6 +96,34 @@ def test_production_defaults_proxy_token_servers_and_never_deliver_directly() ->
     assert "mcp__robinhood__get_option_quotes" in plan.tool_access.allowed_tools
 
 
+def test_proxied_dry_run_gets_the_live_order_tools_on_the_simulated_venue() -> None:
+    """ADR-0038: with Robinhood proxied, a dry run sees exactly the live option-order tools
+    (answered by the simulated broker); every other Tier X tool stays denied."""
+    plan = plan_session(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=True,
+        sources=(RemoteSource(RH_VERIFIED, RH, required=True),),
+        observed_at=NOW,
+    )
+    assert plan.order_venue is OrderVenue.SIMULATED
+    allowed = set(plan.tool_access.allowed_tools)
+    assert ORDER_TOOLS <= allowed
+    denied_x = {
+        RH_VERIFIED.qualified(t.name)
+        for t in RH_VERIFIED.by_tier(ToolTier.X)
+        if not t.live_order_tool
+    }
+    assert denied_x and not denied_x & allowed
+    assert denied_x <= set(plan.tool_access.disallowed_tools)
+
+
+def test_direct_robinhood_dry_run_has_no_order_venue() -> None:
+    """ADR-0038: a direct server cannot be intercepted, so its dry run is proposal-only."""
+    plan = _plan()
+    assert plan.servers == (RH,) and plan.order_venue is OrderVenue.NONE
+    assert not ORDER_TOOLS & set(plan.tool_access.allowed_tools)
+
+
 def test_stored_cli_login_cannot_be_proxied_and_needs_direct_acceptance() -> None:
     login = McpHttpServer(
         name="robinhood",
@@ -126,6 +155,7 @@ def test_missing_token_is_needs_auth_and_required() -> None:
 
 def test_order_tools_only_in_live_and_never_in_off() -> None:
     plan = _plan()
+    assert plan.order_venue is OrderVenue.NONE
     assert not ORDER_TOOLS & set(plan.tool_access.allowed_tools)
     assert ORDER_TOOLS <= set(plan.tool_access.disallowed_tools)
     live = plan_session(
@@ -142,8 +172,10 @@ def test_order_tools_only_in_live_and_never_in_off() -> None:
         if not t.live_order_tool
     }
     assert not denied_x & set(live.tool_access.allowed_tools)
+    assert live.order_venue is OrderVenue.BROKER
     leaky_live = ToolAccess(
         effective_mode=ExecutionMode.LIVE,
+        order_venue=OrderVenue.BROKER,
         allowed_tools=tuple(sorted(denied_x)),
         disallowed_tools=(),
     )
@@ -151,6 +183,7 @@ def test_order_tools_only_in_live_and_never_in_off() -> None:
         assert_no_order_tools(leaky_live, (ROBINHOOD_REGISTRY,))
     leaky = ToolAccess(
         effective_mode=ExecutionMode.OFF,
+        order_venue=OrderVenue.NONE,
         allowed_tools=tuple(sorted(ORDER_TOOLS)),
         disallowed_tools=(),
     )

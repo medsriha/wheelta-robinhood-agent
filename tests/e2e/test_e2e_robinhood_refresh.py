@@ -236,14 +236,16 @@ def test_refresh_failure_is_needs_auth(
     _assert_no_token_leak(h, tokens, caplog)
 
 
-# -- ADR-0033: production runs the dry-run session with the refreshed credential ----------------
+# -- production runs the live session with the refreshed credential (ADR-0034, ADR-0039) -------
 
 
-def test_production_off_mode_refreshes_the_credential_and_runs_the_session(
+def test_production_refreshes_the_credential_and_runs_the_session(
     make_settings: Any, notifier: RecordingNotifier, key: SecretStr
 ) -> None:
     settings = make_settings(
         APP_ENV="production",
+        EXECUTION_MODE="live",
+        EXECUTION_ARMED=True,
         ROBINHOOD_MCP_AUTH="refresh_token",
         ROBINHOOD_MCP_ACCESS_TOKEN=None,
         ROBINHOOD_TOKEN_ENCRYPTION_KEY=key.get_secret_value(),

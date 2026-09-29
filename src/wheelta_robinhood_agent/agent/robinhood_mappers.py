@@ -269,10 +269,11 @@ def map_option_instruments(
 
     OCC symbol from `chain_symbol`, `expiration_date`, `type`, and `strike_price`; broker ID
     from `id`; underlying is `chain_symbol`; `multiplier` from `trade_value_multiplier`
-    (verified in the capture). `min_ticks` is schema-checked (positive) but not carried:
-    `OptionInstrument` has no tick field. An instrument that is not `active`/`tradable` or
-    whose `underlying_type` is not `equity` yields a gap, because `OptionInstrument` cannot
-    record tradability. A repeated instrument ID raises.
+    (verified in the capture). `min_ticks` is schema-checked (positive); `tick_increment` is
+    carried only when `above_tick == below_tick` (one tick at every price), else None, because
+    a price-dependent tick cannot be stated as one increment. An instrument that is not
+    `active`/`tradable` or whose `underlying_type` is not `equity` yields a gap, because
+    `OptionInstrument` cannot record tradability. A repeated instrument ID raises.
     """
     parsed = _Instruments.model_validate(_unwrap(request.payload))
     instruments: list[OptionInstrument] = []
@@ -312,6 +313,9 @@ def map_option_instruments(
                     broker_instrument_id=str(inst.id),
                     underlying=inst.chain_symbol,
                     multiplier=multiplier,
+                    tick_increment=(
+                        ticks.above_tick if ticks.above_tick == ticks.below_tick else None
+                    ),
                 )
             )
     if not parsed.instruments:

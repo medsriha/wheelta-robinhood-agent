@@ -28,11 +28,12 @@ from wheelta_robinhood_agent.agent.hooks import (
     WorkspaceTargetSpec,
     build_hooks,
 )
+from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import ResultKind
 from wheelta_robinhood_agent.agent.run_control import RunControl
 from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules, load_rules
 from wheelta_robinhood_agent.config.settings import Settings
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolCallStatus, ToolTier
+from wheelta_robinhood_agent.domain.enums import ExecutionMode, OrderVenue, ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 from wheelta_robinhood_agent.observability.redaction import Redactor
@@ -449,7 +450,51 @@ def test_denied_tier_x_never_allowed_even_live(tool: str) -> None:
 )
 def test_order_tools_denied_in_off_mode(tool: str) -> None:
     s = session(effective_mode=ExecutionMode.OFF)
-    assert_denied(s, s.pre(RH + tool, {"account_number": ACCOUNT}), "outside armed live mode")
+    assert_denied(s, s.pre(RH + tool, {"account_number": ACCOUNT}), "not available in this run")
+
+
+@pytest.mark.parametrize(
+    "tool", ["review_option_order", "place_option_order", "cancel_option_order"]
+)
+def test_order_tools_allowed_on_the_simulated_venue_through_the_proxy(tool: str) -> None:
+    """ADR-0038: a proxied dry run hands order calls to the proxy's simulated broker."""
+    from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
+
+    s = session(
+        effective_mode=ExecutionMode.OFF,
+        order_venue=OrderVenue.SIMULATED,
+        proxy_dispatch=ProxyDispatch(frozenset({"robinhood"})),
+        account_scope_table=ROBINHOOD_ACCOUNT_SCOPE,
+    )
+    assert_allowed(s, s.pre(RH + tool, {"account_number": ACCOUNT}))
+
+
+def test_simulated_venue_needs_the_proxy() -> None:
+    s = session(effective_mode=ExecutionMode.OFF, order_venue=OrderVenue.SIMULATED)
+    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "validating proxy")
+    s = session(
+        effective_mode=ExecutionMode.OFF,
+        order_venue=OrderVenue.SIMULATED,
+        proxy_dispatch=ProxyDispatch(frozenset({"wheelta"})),
+    )
+    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "validating proxy")
+
+
+@pytest.mark.parametrize(
+    ("mode", "venue"),
+    [
+        (ExecutionMode.OFF, OrderVenue.BROKER),
+        (ExecutionMode.LIVE, OrderVenue.SIMULATED),
+        (ExecutionMode.LIVE, OrderVenue.NONE),
+    ],
+)
+def test_order_venue_must_match_the_mode(mode: ExecutionMode, venue: OrderVenue) -> None:
+    s = session(
+        effective_mode=mode,
+        order_venue=venue,
+        proxy_dispatch=ProxyDispatch(frozenset({"robinhood"})),
+    )
+    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "inconsistent")
 
 
 def test_order_tool_allowed_live_with_verified_account() -> None:

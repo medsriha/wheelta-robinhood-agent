@@ -14,6 +14,7 @@ from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
     OptionRight,
     OrderSide,
+    OrderVenue,
     RunStatus,
 )
 from wheelta_robinhood_agent.domain.options import OccSymbol
@@ -179,6 +180,58 @@ def test_live_subject_counts_placed_orders_including_unassociated() -> None:
     )
     assert placed_count(record) == 2
     assert "· live · 2 orders placed ·" in build_subject(summary)
+
+
+def test_simulated_dry_run_subject_counts_simulated_orders() -> None:
+    """ADR-0038: a dry run on the simulated venue reports its simulated placements."""
+    venue = {"order_venue": OrderVenue.SIMULATED}
+    record = _record(_decision(_placed()), **venue)
+    summary = _input(record, **venue)
+    assert "· dry run (simulated orders) · 1 simulated order placed ·" in build_subject(summary)
+    assert "Mode: dry run (simulated orders) (requested off)" in render_facts_text(
+        summary, REDACTOR
+    )
+    run = summary_facts(summary, REDACTOR)["run"]
+    assert isinstance(run, dict)
+    assert run["order_venue"] == "simulated" and run["orders_sent_to_broker"] is False
+    idle = _input(_record(**venue), **venue)
+    assert "no trades" in build_subject(idle)
+
+
+def test_unassociated_actions_show_status_and_order() -> None:
+    from wheelta_robinhood_agent.domain.enums import CancellationStatus
+    from wheelta_robinhood_agent.domain.orders import Cancellation
+
+    cancel = UnassociatedAction(
+        kind=UnassociatedActionKind.CANCEL,
+        cancellation=Cancellation(
+            cancel_tool_call_id=uuid4(),
+            broker_order_id="order-9",
+            status=CancellationStatus.CONFIRMED,
+            confirmation_tool_call_ids=(uuid4(),),
+        ),
+    )
+    place = UnassociatedAction(
+        kind=UnassociatedActionKind.PLACE,
+        occ_symbol=OCC,
+        side_raw="sell_to_open",
+        attempt=_placed(),
+    )
+    summary = _input(_record(unassociated_actions=(cancel, place)))
+    text = render_facts_text(summary, REDACTOR)
+    assert "- unassociated cancel (order order-9): confirmed" in text
+    assert "- unassociated place: AAPL  261016P00190000 · sell_to_open (order b-1): filled" in text
+    record = summary_facts(summary, REDACTOR)["record"]
+    assert isinstance(record, dict)
+    assert record["unassociated_actions"] == [
+        {"kind": "cancel", "occ_symbol": None, "status": "confirmed", "broker_order_id": "order-9"},
+        {
+            "kind": "place",
+            "occ_symbol": "AAPL  261016P00190000",
+            "status": "filled",
+            "broker_order_id": "b-1",
+        },
+    ]
 
 
 def test_facts_text_lists_every_decision_leg_and_attempt() -> None:

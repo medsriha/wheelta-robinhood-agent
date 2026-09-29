@@ -5,7 +5,7 @@ from typing import Any
 import psycopg
 import pytest
 
-from wheelta_robinhood_agent.domain.enums import AppEnv
+from wheelta_robinhood_agent.domain.enums import AppEnv, ExecutionMode
 from wheelta_robinhood_agent.orchestrator import main as orchestrator_main
 
 
@@ -29,6 +29,7 @@ class _Settings:
     ALERT_WEBHOOK_URL = None
     HEARTBEAT_URL = None
     RUN_SUMMARY_EMAIL_ENABLED = False
+    effective_execution_mode = ExecutionMode.OFF
 
 
 @pytest.mark.parametrize(
@@ -39,10 +40,13 @@ def test_unhandled_errors_exit_1(monkeypatch: pytest.MonkeyPatch, error: Excepti
     assert orchestrator_main.main() == 1
 
 
-def _patch_run(monkeypatch: pytest.MonkeyPatch, env: AppEnv) -> list[dict[str, Any]]:
+def _patch_run(
+    monkeypatch: pytest.MonkeyPatch, env: AppEnv, mode: ExecutionMode = ExecutionMode.OFF
+) -> list[dict[str, Any]]:
     _patch_startup(monkeypatch, RuntimeError("unused"))
     settings = _Settings()
     settings.APP_ENV = env
+    settings.effective_execution_mode = mode
     monkeypatch.setattr(orchestrator_main, "load_settings", lambda: settings)
     monkeypatch.setattr(orchestrator_main, "load_mignon_prompts", lambda: {})
     calls: list[dict[str, Any]] = []
@@ -62,17 +66,20 @@ def test_no_arguments_is_a_scheduled_tick(monkeypatch: pytest.MonkeyPatch, argv:
     assert calls == [{"run_now": False}]
 
 
-def test_run_now_is_passed_through_locally(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_now_starts_a_local_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR-0039: dry runs are local and on demand."""
     calls = _patch_run(monkeypatch, AppEnv.LOCAL)
     assert orchestrator_main.main(["--run-now"]) == 0
     assert calls == [{"run_now": True}]
 
 
 @pytest.mark.parametrize("env", [AppEnv.PRODUCTION, AppEnv.STAGING])
+@pytest.mark.parametrize("mode", list(ExecutionMode))
 def test_run_now_outside_local_fails_before_any_run(
-    monkeypatch: pytest.MonkeyPatch, env: AppEnv
+    monkeypatch: pytest.MonkeyPatch, env: AppEnv, mode: ExecutionMode
 ) -> None:
-    calls = _patch_run(monkeypatch, env)
+    """ADR-0039: production runs live on its schedule only; no hand-started run there."""
+    calls = _patch_run(monkeypatch, env, mode)
     assert orchestrator_main.main(["--run-now"]) == 1
     assert calls == []
 

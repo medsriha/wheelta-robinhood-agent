@@ -157,10 +157,12 @@ _SUCCESS_STATUSES = frozenset(
     {
         RunStatus.COMPLETED,
         RunStatus.SKIPPED_MARKET_CLOSED,
-        # ADR-0024 (superseded by ADR-0033): no longer produced; kept for recorded runs.
+        # ADR-0039: an off-mode invocation outside APP_ENV=local; dry runs are local only.
         RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL,
         # ADR-0028: a tick before the agent's chosen next run.
         RunStatus.SKIPPED_NOT_DUE,
+        # ADR-0038: a scheduled tick while dry runs are on-demand only.
+        RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED,
     }
 )
 

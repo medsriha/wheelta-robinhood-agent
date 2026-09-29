@@ -36,9 +36,11 @@ from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
     OptionRight,
     OrderSide,
+    OrderVenue,
 )
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.facts import DerivedMetric
+from wheelta_robinhood_agent.domain.gating import check_venue, with_default_venue
 from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.orders import Attempt, Cancellation, ReasonCode
 from wheelta_robinhood_agent.domain.sanity import (
@@ -286,6 +288,8 @@ class RunRecord(DomainModel):
     terminated_at: UtcDatetime
     requested_execution_mode: ExecutionMode
     effective_execution_mode: ExecutionMode
+    # ADR-0038: where the run's orders went. Absent in records before it: from the mode.
+    order_venue: OrderVenue
     rules_version: NonEmptyStr
     rules_hash: NonEmptyStr
     prompt_id: NonEmptyStr | None
@@ -302,8 +306,14 @@ class RunRecord(DomainModel):
     findings: tuple[AssemblyFinding, ...] = ()
     summary: NonEmptyStr
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_venue(cls, data: object) -> object:
+        return with_default_venue(data)
+
     @model_validator(mode="after")
     def _check_run_record(self) -> Self:
+        check_venue(self.effective_execution_mode, self.order_venue)
         if self.effective_execution_mode is ExecutionMode.LIVE and (
             self.requested_execution_mode is not ExecutionMode.LIVE
         ):

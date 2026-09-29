@@ -10,6 +10,7 @@ EXPECTED = {
     RunStatus.SKIPPED_KILLED: 0,
     RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL: 0,
     RunStatus.SKIPPED_NOT_DUE: 0,
+    RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED: 0,
     RunStatus.FAILED: 1,
     RunStatus.TIMED_OUT: 2,
     RunStatus.STOPPED: 3,

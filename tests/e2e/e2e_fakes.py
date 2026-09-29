@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from e2e_fake_cli import FakeModel, FakeWorld
@@ -23,6 +24,7 @@ from wheelta_robinhood_agent.agent.account_scope import (
 )
 from wheelta_robinhood_agent.agent.result_boundary import (
     CANDIDATE_REF_PREFIX,
+    VERIFIED_MAPPERS,
     CandidateEvidence,
     MappedEvidence,
     MappingRequest,
@@ -374,4 +376,125 @@ async def research(model: FakeModel) -> tuple[str, str]:
 
 async def dry_run_script(model: FakeModel) -> str | None:
     candidate_ref, facts_ref = await research(model)
+    return decision_json(candidate_ref, facts_ref)
+
+
+# -- simulated broker (ADR-0038) -----------------------------------------------------------------
+
+# The captured SPY instrument (tests/fixtures/robinhood/results/), read with the verified
+# mapper, so the simulated broker can build a real-shape order for it.
+SPY_INSTRUMENT_ID = "d17decae-92f6-430e-b4c0-3772e5dd27ab"
+_RESULTS = Path(__file__).resolve().parents[1] / "fixtures" / "robinhood" / "results"
+
+
+def _fixture(name: str) -> dict[str, Any]:
+    captured = json.loads((_RESULTS / name).read_text())
+    return {"data": captured["data"]}
+
+
+def simulated_world(as_of: datetime) -> FakeWorld:
+    """`build_world` with a captured instrument and real-shape (empty) order reads. The order
+    tools still raise if they ever reach the fake broker."""
+    world = build_world(as_of)
+    handlers = world.handlers["robinhood"]
+    handlers["get_option_instruments"] = lambda args: _text(
+        _fixture("get_option_instruments.SPY_20261016_P740.json")
+    )
+    handlers["get_option_orders"] = lambda args: _text({"data": {"orders": []}})
+    return world
+
+
+SIMULATED_MAPPERS = {
+    **FIXTURE_MAPPERS,
+    **{
+        key: mapper
+        for key, mapper in VERIFIED_MAPPERS.items()
+        if key[1]
+        in {
+            "get_option_instruments",
+            "get_option_orders",
+            "review_option_order",
+            "place_option_order",
+            "cancel_option_order",
+        }
+    },
+}
+
+
+def simulated_price_walk_script(advance: Callable[[], None]) -> Callable[[FakeModel], Any]:
+    """`simulated_order_script`, then a second, lower price step on the same contract after
+    the first step's cancel is confirmed, itself cancelled and confirmed."""
+
+    async def script(model: FakeModel) -> str | None:
+        output = await _simulated_orders(model, advance)
+        await _step(model, advance, "1.78")
+        return output
+
+    return script
+
+
+async def _step(model: FakeModel, advance: Callable[[], None], price: str) -> None:
+    account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+    order = {
+        **account,
+        "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": "sell", "position_effect": "open"}],
+        "quantity": "1",
+        "price": price,
+        "type": "limit",
+        "time_in_force": "gfd",
+    }
+    advance()
+    await model.call("mcp__robinhood__review_option_order", order)
+    advance()
+    placed = await model.call("mcp__robinhood__place_option_order", order)
+    order_id = placed.data["evidence"]["broker_orders"][0]["broker_order_id"]
+    advance()
+    await model.call("mcp__robinhood__cancel_option_order", {**account, "order_id": order_id})
+    advance()
+    await model.call("mcp__robinhood__get_option_orders", account)
+
+
+def simulated_order_script(advance: Callable[[], None]) -> Callable[[FakeModel], Any]:
+    """Research, then review, place, read, cancel, and read again one SPY put: the live order
+    procedure against the simulated broker. Returns the unsubmitted AAPL proposal. `advance`
+    moves the fake clock between broker steps, as real time would."""
+
+    async def script(model: FakeModel) -> str | None:
+        return await _simulated_orders(model, advance)
+
+    return script
+
+
+async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> str | None:
+    candidate_ref, facts_ref = await research(model)
+    account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+    await model.call("mcp__robinhood__get_option_instruments", {"ids": SPY_INSTRUMENT_ID})
+    order = {
+        **account,
+        "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": "sell", "position_effect": "open"}],
+        "quantity": "1",
+        "price": "1.79",
+        "type": "limit",
+        "time_in_force": "gfd",
+    }
+    advance()
+    review = await model.call("mcp__robinhood__review_option_order", order)
+    assert not review.denied and review.output["kind"] == "validated", review.output
+    advance()
+    placed = await model.call("mcp__robinhood__place_option_order", order)
+    assert not placed.denied and placed.output["kind"] == "validated", placed.output
+    advance()
+    working = await model.call("mcp__robinhood__get_option_orders", account)
+    assert working.output["kind"] == "validated", working.output
+    (listed,) = working.data["evidence"]["broker_orders"]
+    assert listed["state_raw"] == "confirmed" and listed["pending_quantity"] == 1
+    advance()
+    cancel = await model.call(
+        "mcp__robinhood__cancel_option_order",
+        {**account, "order_id": listed["broker_order_id"]},
+    )
+    assert cancel.output["kind"] == "validated", cancel.output
+    final = await model.call("mcp__robinhood__get_option_orders", account)
+    (after,) = final.data["evidence"]["broker_orders"]
+    assert after["state_raw"] == "cancelled" and after["canceled_quantity"] == 1
     return decision_json(candidate_ref, facts_ref)

@@ -32,7 +32,6 @@ from wheelta_robinhood_agent.config.rules import RuleMarker
 from wheelta_robinhood_agent.domain.enums import (
     AuditCheck,
     AuditOutcome,
-    ExecutionMode,
     OptionRight,
     OrderSide,
 )
@@ -288,7 +287,7 @@ def _compare(out: Findings, key: str, cap: int | RuleMarker, known: int, unknown
 def _count_new(ctx: AuditContext, attempts: tuple[AuditAttempt, ...]) -> tuple[int, int]:
     """(known new lineages, possibly-new unattributed ones). Roll replacements never count."""
     opens = [a for a in attempts if a.side is OrderSide.SELL_TO_OPEN and not a.is_roll_replacement]
-    if ctx.effective_execution_mode is not ExecutionMode.LIVE:
+    if not ctx.executes_orders:
         legs = {a.leg_ref for a in opens if a.is_new_open and not a.conditional}
         return len(legs), 0
     known: set[str] = set()

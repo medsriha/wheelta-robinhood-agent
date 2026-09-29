@@ -36,7 +36,9 @@ or failures, alerts, unknown or rejected orders.
 - Then say what the agent did and why: each decision with its underlying and the agent's \
 rationale, in a sentence or two each.
 - If run.orders_sent_to_broker is false, this was a dry run: nothing reached the broker. Call \
-proposals intended orders and never describe them as trades, fills, or placed orders.
+proposals intended orders and never describe them as trades, fills, or placed orders. If \
+run.order_venue is simulated, the agent's orders went to a simulated broker: call them \
+simulated orders, and never real trades or fills.
 - If there are no decisions or no trades, say so plainly and give the agent's reasons if the \
 record has them.
 - End with when the next run is scheduled, if known.

@@ -4,10 +4,24 @@ from enum import StrEnum
 
 
 class ExecutionMode(StrEnum):
-    """Execution mode (ADR-0006). `off` is a dry run with no order tools; `live` places orders."""
+    """Execution mode (ADR-0006). `off` is a dry run: no order reaches the broker; `live`
+    places real orders. Where an off run's orders go is its `OrderVenue` (ADR-0038)."""
 
     OFF = "off"
     LIVE = "live"
+
+
+class OrderVenue(StrEnum):
+    """Where the agent's option-order tools go this run (ADR-0038).
+
+    BROKER: Robinhood (armed live only). SIMULATED: a dry run whose review/place/cancel calls
+    the validating proxy answers in-process, never reaching Robinhood. NONE: a dry run with no
+    order tools (Robinhood served directly, ADR-0019, so no simulator can intercept).
+    """
+
+    BROKER = "broker"
+    SIMULATED = "simulated"
+    NONE = "none"
 
 
 class ToolTier(StrEnum):
@@ -59,10 +73,14 @@ class RunStatus(StrEnum):
     SKIPPED_CONCURRENT = "skipped_concurrent"
     SKIPPED_KILLED = "skipped_killed"
     SKIPPED_MARKET_CLOSED = "skipped_market_closed"
-    # ADR-0024, superseded by ADR-0033: no longer produced; kept for recorded runs and the schema.
+    # ADR-0039 (as ADR-0024 first had it): effective off outside APP_ENV=local runs nothing;
+    # dry runs are local only. Reported by heartbeat before any ledger row.
     SKIPPED_DRY_RUN_NOT_LOCAL = "skipped_dry_run_not_local"
     # ADR-0028: the cron tick is before the recorded next-run time; no session starts.
     SKIPPED_NOT_DUE = "skipped_not_due"
+    # ADR-0038: a scheduled tick while the effective mode is off; dry runs start only on
+    # demand (`--run-now`).
+    SKIPPED_DRY_RUN_NOT_REQUESTED = "skipped_dry_run_not_requested"
     STOPPED = "stopped"
     TIMED_OUT = "timed_out"
     FAILED = "failed"

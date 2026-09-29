@@ -31,8 +31,14 @@ from wheelta_robinhood_agent.domain.base import (
     UtcDatetime,
     require_unique,
 )
-from wheelta_robinhood_agent.domain.enums import AppEnv, CandidateOrigin, ExecutionMode
+from wheelta_robinhood_agent.domain.enums import (
+    AppEnv,
+    CandidateOrigin,
+    ExecutionMode,
+    OrderVenue,
+)
 from wheelta_robinhood_agent.domain.facts import DecisionFacts
+from wheelta_robinhood_agent.domain.gating import check_venue, with_default_venue
 from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.orders import OrderRecord
 from wheelta_robinhood_agent.domain.run_record import (
@@ -166,6 +172,8 @@ class AssemblyContext(DomainModel):
     terminated_at: UtcDatetime
     requested_execution_mode: ExecutionMode
     effective_execution_mode: ExecutionMode
+    # ADR-0038; defaults from the mode (live: broker, off: none) when not given.
+    order_venue: OrderVenue
     account_scope_id: NonEmptyStr
     rules_version: NonEmptyStr
     rules_hash: NonEmptyStr
@@ -187,8 +195,14 @@ class AssemblyContext(DomainModel):
     ranking_keys: tuple[RankingKey, ...] = ()
     prior_findings: tuple[AssemblyFinding, ...] = ()
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_venue(cls, data: object) -> object:
+        return with_default_venue(data)
+
     @model_validator(mode="after")
     def _check_context(self) -> Self:
+        check_venue(self.effective_execution_mode, self.order_venue)
         require_unique(tuple(t.identity.tool_call_id for t in self.tool_calls), "tool call id")
         require_unique(tuple(f.facts_ref for f in self.facts), "facts ref")
         require_unique(tuple(r.ref for r in self.refs), "ref")

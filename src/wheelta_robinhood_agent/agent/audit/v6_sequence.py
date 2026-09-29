@@ -29,7 +29,6 @@ from wheelta_robinhood_agent.agent.audit.context import AuditContext
 from wheelta_robinhood_agent.domain.enums import (
     AuditCheck,
     DecisionAction,
-    ExecutionMode,
     OrderSide,
 )
 from wheelta_robinhood_agent.domain.orders import OrderRecord
@@ -39,7 +38,7 @@ from wheelta_robinhood_agent.domain.run import AuditFinding
 def check_v6(ctx: AuditContext) -> tuple[AuditFinding, ...]:
     """Run V6 over the recorded live placement sequence."""
     out = Findings(ctx, AuditCheck.V6)
-    if ctx.effective_execution_mode is not ExecutionMode.LIVE:
+    if not ctx.executes_orders:
         out.unknown("all", Reason.DRY_RUN_NO_EXECUTION, "no order sequence exists in dry run")
         return out.result()
     _missing_events(ctx, out)

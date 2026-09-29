@@ -107,11 +107,29 @@ def test_phase_2_live_requires_arming(
     env: pytest.MonkeyPatch, armed: str, effective: ExecutionMode
 ) -> None:
     assert PHASE_EXECUTION_CEILING is ExecutionMode.LIVE  # ADR-0034
+    env.setenv("APP_ENV", "production")
     env.setenv("EXECUTION_MODE", "live")
     env.setenv("EXECUTION_ARMED", armed)
     s = load_settings()
     assert s.requested_execution_mode is ExecutionMode.LIVE
     assert s.effective_execution_mode is effective
+    assert s.execution_ceiling is ExecutionMode.LIVE
+    assert s.workspace_writes_enabled is (effective is ExecutionMode.LIVE)
+
+
+@pytest.mark.parametrize("app_env", ["local", "staging"])
+def test_live_runs_only_in_production(env: pytest.MonkeyPatch, app_env: str) -> None:
+    """ADR-0039: outside production the effective mode is off, however armed, and no
+    workspace write is enabled."""
+    env.setenv("APP_ENV", app_env)
+    env.setenv("EXECUTION_MODE", "live")
+    env.setenv("EXECUTION_ARMED", "true")
+    s = load_settings()
+    assert s.execution_ceiling is ExecutionMode.OFF
+    assert s.effective_execution_mode is ExecutionMode.OFF
+    assert s.ROBINHOOD_WORKSPACE_WRITES and not s.workspace_writes_enabled
+    snapshot = s.config_snapshot()
+    assert snapshot["execution_ceiling"] == "off" and snapshot["workspace_writes_enabled"] is False
 
 
 @pytest.mark.parametrize("value", ["3600", "7200", "0", "-5", "abc"])

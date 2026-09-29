@@ -354,7 +354,7 @@ class Scenario:
         *,
         succeeded: bool = True,
         warnings: tuple[str, ...] = (),
-        tif: str | None = "day",
+        tif: str | None = "gfd",
         record: bool = True,
     ) -> ToolCallRecord:
         call = self.call("review_option_order", at - 1)
@@ -387,7 +387,7 @@ class Scenario:
         status: ToolCallStatus = ToolCallStatus.SUCCEEDED,
         denied: bool = False,
         order_type: str = "limit",
-        tif: str = "day",
+        tif: str = "gfd",
         broker_id: str | None = None,
         quotes: tuple[Quote, ...] = (),
         snapshot: BrokerState | None = None,

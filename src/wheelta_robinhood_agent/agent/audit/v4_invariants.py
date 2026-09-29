@@ -26,7 +26,6 @@ from wheelta_robinhood_agent.domain.enums import (
     AttemptStatus,
     AuditCheck,
     DecisionAction,
-    ExecutionMode,
     OptionRight,
     OrderSide,
 )
@@ -55,7 +54,7 @@ def check_v4(ctx: AuditContext) -> tuple[AuditFinding, ...]:
         return out.result()
     _coverage(ctx, out, record)
     _shapes(ctx, out, record)
-    if ctx.effective_execution_mode is ExecutionMode.LIVE:
+    if ctx.executes_orders:
         _actions(ctx, out, record)
         _fills(ctx, out, record)
     else:
@@ -144,7 +143,7 @@ def _shape(ctx: AuditContext, out: Findings, decision: DecisionRecord) -> None:
     ref = decision.decision_ref
     expected = _expected(decision)
     legs = decision.legs
-    live_partial = ctx.effective_execution_mode is ExecutionMode.LIVE and _submitted(decision)
+    live_partial = ctx.executes_orders and _submitted(decision)
     count_ok = len(legs) <= len(expected) if live_partial else len(legs) == len(expected)
     sides_ok = count_ok and all(
         leg.side is side for leg, (side, _) in zip(legs, expected, strict=False)
@@ -363,7 +362,7 @@ def _off_invariants(ctx: AuditContext, out: Findings, record: RunRecord) -> None
     if actions:
         out.bad(
             "5",
-            "order action dispatched in effective off mode",
+            "order action dispatched in a proposal-only dry run",
             tool_call_ids=tuple(c.identity.tool_call_id for c in actions),
         )
     placed = [a for a in _record_attempts(record) if a.place_tool_call_id is not None]
@@ -427,9 +426,9 @@ def _refs(ctx: AuditContext, out: Findings) -> None:
                 problems.append(f"unresolved facts_ref {leg.facts_ref}")
             elif fact.limit_price is not None and fact.limit_price != leg.limit_price:
                 problems.append(f"facts_ref {leg.facts_ref} price differs from proposal")
-        if ctx.effective_execution_mode is ExecutionMode.OFF and decision.execution_refs:
+        if not ctx.executes_orders and decision.execution_refs:
             problems.append("execution_refs in dry run")
-    if ctx.effective_execution_mode is ExecutionMode.OFF and output.cancellation_rationales:
+    if not ctx.executes_orders and output.cancellation_rationales:
         problems.append("cancellation_rationales in dry run")
     if problems:
         out.bad("6", "; ".join(problems))

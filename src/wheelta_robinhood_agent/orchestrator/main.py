@@ -1,20 +1,23 @@
 """Run entrypoint: the full lifecycle of one cron fire (ARCHITECTURE.md "Run lifecycle").
 
-boot (settings, rules, prompt; fail fast) → logging → slot/run_id → ledger connection →
-single-flight lock (`skipped_concurrent`) → run slot (completed → no-op; interrupted →
-reconcile and finalize without a new session) → preflight (kill switch, NYSE session, next-run
-time: ADR-0028, `skipped_not_due`; a due tick records the fallback next run first) →
-Robinhood credential (refresh_token mode only: load, refresh near expiry, persist before use;
-ADR-0021) → session plan (off: no order tool; armed live: the three option-order tools,
-ADR-0034; dry runs start a session in every environment, ADR-0033) → prompt v6 →
-agent session → the agent's `next_run`, if valid, replaces the fallback → `assemble_run_record` →
-position notes (ADR-0018) → `run_audit` → persist →
-alerts/heartbeat → run-summary email (ADR-0029: only when a session started) → exit code.
+boot (settings, rules, prompt; fail fast) → effective mode off without `--run-now`: exit
+`skipped_dry_run_not_requested` before the ledger (ADR-0038) → logging → slot/run_id → ledger
+connection → single-flight lock (`skipped_concurrent`) → run slot (completed → no-op;
+interrupted → reconcile and finalize without a new session) → preflight (kill switch; a dry
+run then proceeds at any time; live checks the NYSE session and next-run time: ADR-0028,
+`skipped_not_due`, and a due live tick records the fallback next run first) → Robinhood
+credential (refresh_token mode only: load, refresh near expiry, persist before use; ADR-0021)
+→ session plan (order venue, ADR-0038: armed live → the broker; a proxied dry run → the
+simulated broker, with the same three option-order tools and a live-rendered prompt; a
+direct-Robinhood dry run → no order tool) → prompt → agent session → the agent's `next_run`,
+if valid, replaces the fallback (live only; a dry run records it unapplied) →
+`assemble_run_record` → position notes (ADR-0018) → `run_audit` → persist → alerts/heartbeat
+→ run-summary email (ADR-0029: only when a session started) → exit code.
 
 Contains no trading logic. Everything the run decides is recorded as run events.
 `python -m wheelta_robinhood_agent.orchestrator [--run-now]` calls `main()`. `--run-now`
-(APP_ENV=local only) makes a hand-started local run due whatever the recorded next run
-(ADR-0028).
+starts a local dry run on demand (ADR-0038, ADR-0039) and is refused outside APP_ENV=local;
+live runs only in production, on its schedule.
 
 `OrchestratorDeps` carries the injectable boundaries (clock, database connect, calendar,
 notifier, SDK transport). Its remaining fields (`remote_boundary_accepted`,
@@ -71,6 +74,7 @@ from wheelta_robinhood_agent.agent.session import (
     plan_session,
     run_session_sync,
 )
+from wheelta_robinhood_agent.agent.trace_loader import load_decision_trace
 from wheelta_robinhood_agent.config.prompts import (
     PromptError,
     PromptTemplate,
@@ -81,7 +85,6 @@ from wheelta_robinhood_agent.config.prompts import (
 )
 from wheelta_robinhood_agent.config.rules import LoadedRules, RulesError, load_rules
 from wheelta_robinhood_agent.config.settings import (
-    PHASE_EXECUTION_CEILING,
     RobinhoodMcpAuth,
     Settings,
     SettingsError,
@@ -94,12 +97,14 @@ from wheelta_robinhood_agent.domain.enums import (
     AuditOutcome,
     ExecutionMode,
     MignonType,
+    OrderVenue,
     RunStatus,
     SourceStatus,
     ToolCallStatus,
     ToolTier,
 )
 from wheelta_robinhood_agent.domain.events import RunEventType
+from wheelta_robinhood_agent.domain.gating import order_venue, prompt_execution_mode
 from wheelta_robinhood_agent.domain.position_notes import notes_from_run_record
 from wheelta_robinhood_agent.domain.positions import PositionBook
 from wheelta_robinhood_agent.domain.run import AuditStatus
@@ -150,6 +155,7 @@ from wheelta_robinhood_agent.observability.alerts import (
     build_alert,
     build_heartbeat,
 )
+from wheelta_robinhood_agent.observability.decision_trace import decision_log_events
 from wheelta_robinhood_agent.observability.logging import (
     RunLoggerAdapter,
     bind,
@@ -348,17 +354,33 @@ def run_once(
     """Run one cron fire and return the process exit code (exit_codes.py).
 
     `mignon_templates` defaults to the packaged Mignon prompts (`main` loads them at startup
-    so a missing file fails before any network call). `run_now` (local only, ADR-0028) makes
-    the tick due whatever the recorded next run; the kill switch and market session still
-    apply. Raises ValueError outside APP_ENV=local."""
+    so a missing file fails before any network call). Dry runs are local and on demand
+    (ADR-0038, ADR-0039): live runs only in production, on its calendar and schedule; with the
+    effective mode off (always, outside production), outside APP_ENV=local nothing runs
+    (`skipped_dry_run_not_local`), and locally only a `run_now` invocation runs, at any time
+    (the kill switch still applies); otherwise `skipped_dry_run_not_requested`. Both skips
+    happen before the ledger. `run_now` outside APP_ENV=local raises ValueError.
+    """
     if run_now and settings.APP_ENV is not AppEnv.LOCAL:
-        raise ValueError("run_now is allowed only with APP_ENV=local")
+        raise ValueError("run_now starts a local dry run; it requires APP_ENV=local")
     if mignon_templates is None:
         mignon_templates = load_mignon_prompts()
     started = deps.clock()
     slot = slot_for(started)
     run_id = run_id_for(settings.APP_ENV, slot)
     log = bind(_LOG, run_id=str(run_id), stage="boot", slot=slot.isoformat())
+    if settings.effective_execution_mode is ExecutionMode.OFF:
+        # ADR-0039: dry runs are local and on demand; outside local an off mode runs nothing.
+        if settings.APP_ENV is not AppEnv.LOCAL:
+            status, reason = RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL, "dry_run_not_local"
+        elif not run_now:
+            status, reason = RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED, "dry_run_not_requested"
+        else:
+            status = None
+        if status is not None:
+            log.info("no dry run here", extra={"status": status.value, "reason": reason})
+            _heartbeat(settings, deps, status, run_id, slot, reason)
+            return exit_code_for(status)
     try:
         conn = deps.connect_db(settings.DATABASE_URL)
     except LedgerError as exc:
@@ -418,6 +440,8 @@ class _Run:
             secrets=settings_secrets(settings),
         )
         self.scope_id = account_scope_id(settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER)
+        # ADR-0038: where order tools go; the plan decides it (`_plan`), recovery reads it back.
+        self.order_venue = order_venue(settings.effective_execution_mode, robinhood_proxied=False)
         self.deadline = RunDeadline(started, settings.RUN_TIMEOUT_SECONDS)
         self._event_counter = 0
         self.alerts_sent: list[AlertKind] = []
@@ -513,6 +537,7 @@ class _Run:
                 reason=reason,
                 requested_execution_mode=self.settings.requested_execution_mode,
                 effective_execution_mode=self.settings.effective_execution_mode,
+                order_venue=self.order_venue,
                 record=self.summary_record,
                 audit_status=(
                     (audit.status.value if audit is not None else AuditStatus.FAILED.value)
@@ -564,6 +589,7 @@ class _Run:
             slot=self.slot,
             requested_mode=self.settings.requested_execution_mode,
             effective_mode=self.settings.effective_execution_mode,
+            order_venue=self.order_venue,
             account_scope_id=self.scope_id,
             rules=self.rules,
             prompt_id=self.template.prompt_id if prompt else None,
@@ -584,7 +610,7 @@ class _Run:
                 "prompt_id": self.template.prompt_id,
                 "prompt_version": self.template.version,
                 "prompt_template_hash": self.template.sha256,
-                "execution_ceiling": PHASE_EXECUTION_CEILING.value,
+                "execution_ceiling": settings.execution_ceiling.value,
             },
             key="started",
         )
@@ -618,7 +644,9 @@ class _Run:
             },
         )
         not_before = latest_next_run_not_before(self.conn, settings.APP_ENV)
-        due = self.run_now or is_due(now, not_before)
+        # ADR-0038: a dry run is on demand only and never reads or writes the live schedule.
+        dry_run = settings.effective_execution_mode is ExecutionMode.OFF
+        due = is_due(now, not_before)
         self.event(
             RunEventType.METADATA,
             {
@@ -636,11 +664,16 @@ class _Run:
             due=due,
             requested_mode=settings.requested_execution_mode,
             armed=settings.EXECUTION_ARMED,
-            ceiling=PHASE_EXECUTION_CEILING,
+            ceiling=settings.execution_ceiling,
+            on_demand=self.run_now,
         )
-        if due and not (
-            isinstance(decision, PreflightSkip)
-            and decision.reason is PreflightReason.OUTSIDE_REGULAR_SESSION
+        if (
+            not dry_run
+            and due
+            and not (
+                isinstance(decision, PreflightSkip)
+                and decision.reason is PreflightReason.OUTSIDE_REGULAR_SESSION
+            )
         ):
             # ADR-0028: a due tick is this cadence's run, even when killed. The fallback keeps
             # a crashed or output-less run (and the kill alert) on the hourly cadence.
@@ -648,7 +681,7 @@ class _Run:
             minutes = self.rules.rules.scheduling.fallback_next_run_minutes
             self.record_next_run(fallback_requested_at(now, minutes), ScheduleSource.FALLBACK)
         if isinstance(decision, PreflightSkip):
-            if decision.status is RunStatus.SKIPPED_KILLED and due:
+            if decision.status is RunStatus.SKIPPED_KILLED and (due or dry_run):
                 self.alert(AlertKind.KILL_SWITCH_ENGAGED, "KILL_SWITCH=true; the run did not start")
             return self.finalize(decision.status, decision.reason.value)
         restore = (
@@ -686,6 +719,21 @@ class _Run:
         if not isinstance(decisions, DecisionOutputParsed) or decisions.output.next_run is None:
             return
         requested = decisions.output.next_run.at
+        if self.settings.effective_execution_mode is ExecutionMode.OFF:
+            # ADR-0038: recorded for comparison with live, never scheduled (dry runs are on
+            # demand and must not move the live schedule).
+            self.event(
+                RunEventType.METADATA,
+                {
+                    "next_run_not_applied": {
+                        "requested_at": requested.isoformat(),
+                        "rationale": decisions.output.next_run.rationale,
+                        "reason": "dry_run_on_demand",
+                    }
+                },
+                key="metadata:next_run_not_applied",
+            )
+            return
         try:
             self.record_next_run(requested, ScheduleSource.AGENT)
             self.next_run_rationale = decisions.output.next_run.rationale
@@ -739,7 +787,7 @@ class _Run:
         now = self.deps.clock()
         plan = plan_session(
             effective_mode=effective_mode,
-            workspace_writes=self.settings.ROBINHOOD_WORKSPACE_WRITES,
+            workspace_writes=self.settings.workspace_writes_enabled,
             sources=(
                 RemoteSource(
                     rh_registry,
@@ -754,11 +802,13 @@ class _Run:
             ),
             mignons=mignon_limits(self.rules.rules) is not None,
         )
+        self.order_venue = plan.order_venue
         self.event(
             RunEventType.METADATA,
             {
                 "tool_access": {
                     "effective_mode": plan.tool_access.effective_mode.value,
+                    "order_venue": plan.order_venue.value,
                     "allowed_tools": list(plan.tool_access.allowed_tools),
                     "disallowed_tools": list(plan.tool_access.disallowed_tools),
                 },
@@ -773,7 +823,9 @@ class _Run:
         owned = ledger_orders.owned_unresolved_orders(self.conn, self.scope_id)
         values = {
             "as_of": now.isoformat(),
-            "execution_mode": plan.effective_mode.value,
+            # ADR-0038: a simulated-venue dry run is told it is live, so it follows the live
+            # procedure exactly; the recorded effective mode and venue say what it was.
+            "execution_mode": prompt_execution_mode(plan.order_venue).value,
             "account_ref": self.settings.account_last4,
             "workspace_prefix": self.settings.ROBINHOOD_WORKSPACE_PREFIX,
             "policy_version": str(self.rules.version),
@@ -794,6 +846,7 @@ class _Run:
                 "prompt_version": rendered.version,
                 "prompt_template_hash": rendered.template_sha256,
                 "rendered_prompt_hash": rendered.sha256,
+                "prompt_execution_mode": values["execution_mode"],
                 "model_id": self.settings.AGENT_MODEL,
                 "mignon_models": list(self.settings.mignon_models) if self.mignon_prompts else [],
                 "position_book": book.model_dump(mode="json"),
@@ -955,6 +1008,7 @@ class _Run:
         record = self._assemble(meta, book, decisions, output_id)
         self.summary_record = record
         audit_ok = self._audit(meta, book, decisions, record)
+        self._log_decisions()
         # After assembly and audit, so nothing in the agent's schedule can keep them from running.
         self._apply_agent_next_run(decisions)
         status, reason = self._status(plan, session, decisions)
@@ -963,6 +1017,26 @@ class _Run:
         if not audit_ok and status is RunStatus.COMPLETED:
             status, reason = RunStatus.FAILED, "audit_failed"
         return self.finalize(status, reason)
+
+    def _log_decisions(self) -> None:
+        """One structured log line per decision from the recorded trace (observability only:
+        never changes the run's status). The full trace: `scripts/trace_run.py`."""
+        log = self.log.bind(stage="decisions")
+        try:
+            trace = load_decision_trace(self.conn, self.run_id)
+            for payload in decision_log_events(trace):
+                log.info("decision", extra=payload)
+            log.info(
+                "decision trace recorded",
+                extra={
+                    "decisions": len(trace.decisions),
+                    "order_venue": trace.order_venue.value if trace.order_venue else None,
+                    "audit": trace.audit_counts,
+                    "tool_calls": trace.tool_call_counts,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - informational: never fail the run
+            log.warning("decision trace unavailable", extra={"error_type": type(exc).__name__})
 
     def _status(
         self, plan: SessionPlan, session: SessionResult | None, decisions: DecisionsInput
@@ -1013,7 +1087,8 @@ class _Run:
                     self.metrics.order(attempt.status)
         for calls in tool_call_records(self.conn, self.run_id):
             self.metrics.tool_call(calls.identity.server)
-        if book is not None:
+        # ADR-0039: a dry run's judgments are not position memory for production's positions.
+        if book is not None and self.settings.effective_execution_mode is ExecutionMode.LIVE:
             self._record_notes(record, book)
         return record
 
@@ -1107,10 +1182,18 @@ class _Run:
         ]
         stored_books = [b for b in book_payloads if isinstance(b, dict)]
         book = PositionBook.model_validate(stored_books[-1]) if stored_books else None
+        venues = [
+            access.get("order_venue")
+            for p in run_event_payloads(self.conn, self.run_id, RunEventType.METADATA)
+            if isinstance(access := p.get("tool_access"), dict)
+        ]
+        if venues and isinstance(venues[-1], str):
+            self.order_venue = OrderVenue(venues[-1])
         meta = self.meta(prompt=None, model_id=None)
         decisions, output_id = load_decisions(self.conn, self.run_id)
         record = self._assemble(meta, book, decisions, output_id)
         self._audit(meta, book, decisions, record)
+        self._log_decisions()
         return self.finalize(RunStatus.FAILED, "interrupted_run_recovered")
 
 
@@ -1121,7 +1204,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Production entrypoint: load and validate everything before any network call.
 
     `argv` excludes the program name; None means no arguments. The only argument is
-    `--run-now`, accepted only with APP_ENV=local (ADR-0028). Anything else fails fast.
+    `--run-now`, which starts an on-demand dry run and is refused when the effective mode is
+    live (ADR-0038). Anything else fails fast.
     """
     args = list(argv or ())
     unknown = [a for a in args if a != RUN_NOW_FLAG]
@@ -1141,7 +1225,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return EXIT_FAILED
     if run_now and settings.APP_ENV is not AppEnv.LOCAL:
         logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
-        _LOG.error("%s is allowed only with APP_ENV=local", RUN_NOW_FLAG)
+        _LOG.error("%s starts a local dry run; it requires APP_ENV=local", RUN_NOW_FLAG)
         return EXIT_FAILED
     configure_logging(
         settings.LOG_LEVEL,

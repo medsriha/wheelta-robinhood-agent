@@ -160,8 +160,22 @@ def test_context_validation() -> None:
         AuditContext.model_validate({**data, "run_id": str(uuid4()), "tool_calls": ()})
     with pytest.raises(ValidationError, match="audited run"):
         AuditContext.model_validate({**data, "run_id": str(uuid4()), "run_record": None})
-    with pytest.raises(ValidationError, match="execution mode"):
+    with pytest.raises(ValidationError, match="order venue broker is invalid"):
         AuditContext.model_validate({**data, "effective_execution_mode": "off"})
+    with pytest.raises(ValidationError, match="execution mode"):
+        AuditContext.model_validate(
+            {**data, "effective_execution_mode": "off", "order_venue": "simulated"}
+        )
+    with pytest.raises(ValidationError, match="order venue"):
+        record = {**data["run_record"], "order_venue": "broker"}
+        AuditContext.model_validate(
+            {
+                **data,
+                "effective_execution_mode": "off",
+                "order_venue": "simulated",
+                "run_record": {**record, "effective_execution_mode": "off"},
+            }
+        )
     with pytest.raises(ValidationError, match="duplicate"):
         AuditContext.model_validate({**data, "quotes": data["quotes"] * 2})
 

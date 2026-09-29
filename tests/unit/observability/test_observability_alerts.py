@@ -88,6 +88,7 @@ def test_direct_construction_still_redacts_and_enforces_spec() -> None:
         (RunStatus.SKIPPED_MARKET_CLOSED, HeartbeatStatus.SUCCESS),
         (RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL, HeartbeatStatus.SUCCESS),
         (RunStatus.SKIPPED_NOT_DUE, HeartbeatStatus.SUCCESS),
+        (RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED, HeartbeatStatus.SUCCESS),
         (RunStatus.SKIPPED_CONCURRENT, HeartbeatStatus.FAILURE),
         (RunStatus.SKIPPED_KILLED, HeartbeatStatus.FAILURE),
         (RunStatus.STOPPED, HeartbeatStatus.FAILURE),
@@ -118,6 +119,7 @@ _non_success = st.sampled_from(
             RunStatus.SKIPPED_MARKET_CLOSED,
             RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL,
             RunStatus.SKIPPED_NOT_DUE,
+            RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED,
         )
     ]
 )

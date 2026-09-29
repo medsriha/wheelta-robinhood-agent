@@ -1,4 +1,4 @@
-"""Which tools the agent session may see, per effective execution mode (CLAUDE.md §8, §18).
+"""Which tools the agent session may see, per order venue (CLAUDE.md §8, §18; ADR-0038).
 
 Layers 1 and 2 of tool access: `disallowed_tools` removes denied tools from the model's
 context, and `allowed_tools` is the explicit allowlist used with `permission_mode="dontAsk"`.
@@ -8,7 +8,8 @@ Layer 3 (the PreToolUse hook) re-checks every call. The prompt never decides any
 from pydantic import BaseModel, ConfigDict
 
 from wheelta_robinhood_agent.agent.mignons import DELEGATION_TOOL, ROLE_TOOLS, Role
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolTier
+from wheelta_robinhood_agent.domain.enums import ExecutionMode, OrderVenue, ToolTier
+from wheelta_robinhood_agent.domain.gating import check_venue, executes_orders, order_venue
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 
 # Built-in Agent SDK tools the session never needs (CLAUDE.md §8). It needs MCP tools, web
@@ -42,6 +43,7 @@ class ToolAccess(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     effective_mode: ExecutionMode
+    order_venue: OrderVenue
     allowed_tools: tuple[str, ...]
     disallowed_tools: tuple[str, ...]
 
@@ -52,14 +54,17 @@ def build_tool_access(
     workspace_writes: bool,
     registries: tuple[ToolRegistry, ...],
     mignons: bool = True,
+    venue: OrderVenue | None = None,
 ) -> ToolAccess:
     """Compute allowed and disallowed tools.
 
     By tier:
     - Tier R: allowed.
     - Tier S: allowed only if `workspace_writes` (ROBINHOOD_WORKSPACE_WRITES); else disallowed.
-    - Tier X live order tools: allowed only when `effective_mode` is live (already requires
-      armed and the phase ceiling); otherwise disallowed so the model never sees them.
+    - Tier X live order tools: allowed only when the order venue executes orders: `broker`
+      (effective live, which already requires armed and the phase ceiling) or `simulated`
+      (a proxied dry run, ADR-0038); otherwise disallowed so the model never sees them.
+      `venue` defaults to the mode's venue without a simulator (live: broker, off: none).
     - Every other Tier X tool and every EXCLUDED tool: disallowed in every mode.
     By role (ADR-0025, agent/mignons.py): a tool is allowed only if some role may use it.
     With `mignons` False (their limits are not integers) only the orchestrator's tools count,
@@ -72,18 +77,22 @@ def build_tool_access(
         usable -= {DELEGATION_TOOL}
     allowed: set[str] = {b for b in SESSION_BUILTINS if b in usable}
     disallowed: set[str] = set(DISALLOWED_BUILTINS) | (set(SESSION_BUILTINS) - allowed)
-    live = effective_mode is ExecutionMode.LIVE
+    if venue is None:
+        venue = order_venue(effective_mode, robinhood_proxied=False)
+    check_venue(effective_mode, venue)
+    orders = executes_orders(venue)
     for registry in registries:
         for tool in registry.tools:
             name = registry.qualified(tool.name)
             permitted = name in usable and (
                 tool.tier is ToolTier.R
                 or (tool.tier is ToolTier.S and workspace_writes)
-                or (tool.tier is ToolTier.X and tool.live_order_tool and live)
+                or (tool.tier is ToolTier.X and tool.live_order_tool and orders)
             )
             (allowed if permitted else disallowed).add(name)
     return ToolAccess(
         effective_mode=effective_mode,
+        order_venue=venue,
         allowed_tools=tuple(sorted(allowed)),
         disallowed_tools=tuple(sorted(disallowed)),
     )

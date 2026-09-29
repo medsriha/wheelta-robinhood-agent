@@ -89,9 +89,11 @@ from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.enums import (
     ExecutionMode,
+    OrderVenue,
     ToolCallStatus,
     ToolTier,
 )
+from wheelta_robinhood_agent.domain.gating import check_venue, executes_orders, order_venue
 from wheelta_robinhood_agent.domain.mignon_report import (
     REF_PREFIXES,
     check_report_sources,
@@ -332,6 +334,9 @@ class HookDeps:
     # Exact model IDs a Mignon may run on (`Settings.mignon_models`); an agent name on any
     # other model is not a Mignon.
     mignon_models: tuple[str, ...] = ()
+    # Where order tools go (ADR-0038). None: the mode's venue without a simulator (live:
+    # broker, off: none). `simulated` requires the server to be proxied.
+    order_venue: OrderVenue | None = None
 
     @classmethod
     def from_settings(
@@ -353,7 +358,7 @@ class HookDeps:
         return cls(
             effective_mode=settings.effective_execution_mode,
             kill_switch=settings.KILL_SWITCH,
-            workspace_writes=settings.ROBINHOOD_WORKSPACE_WRITES,
+            workspace_writes=settings.workspace_writes_enabled,
             workspace_prefix=settings.ROBINHOOD_WORKSPACE_PREFIX,
             account_number=settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
             rules=rules,
@@ -500,6 +505,26 @@ def _report_text(tool_response: object) -> tuple[str, str, str] | None:
     return agent_id, agent_type, "".join(cast(list[str], texts))
 
 
+def _order_tool_denial(deps: HookDeps, server: str) -> str | None:
+    """Why a live option-order tool is denied this run, or None (ADR-0034, ADR-0038).
+
+    Allowed only with an order venue consistent with the mode: the broker in armed live, or
+    the simulated broker in a dry run where the server is served through the validating proxy
+    (so the call is answered in-process and never reaches Robinhood)."""
+    venue = deps.order_venue or order_venue(deps.effective_mode, robinhood_proxied=False)
+    try:
+        check_venue(deps.effective_mode, venue)
+    except ValueError:
+        return "order venue inconsistent with the execution mode"
+    if not executes_orders(venue):
+        return "order tools are not available in this run"
+    if venue is OrderVenue.SIMULATED and (
+        deps.proxy_dispatch is None or not deps.proxy_dispatch.proxied(server)
+    ):
+        return "simulated orders need the validating proxy"
+    return None
+
+
 def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     """Build the PreToolUse, PostToolUse, PostToolUseFailure, and SubagentStart hooks."""
     calls: dict[str, _Call] = {}
@@ -615,8 +640,10 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 raise _Denied(f"source {resolved.server} is withheld this run: {withheld_reason}")
         if tier is ToolTier.X and not (spec is not None and spec.live_order_tool):
             raise _Denied("denied Tier X tool")
-        if tier is ToolTier.X and deps.effective_mode is not ExecutionMode.LIVE:
-            raise _Denied("order tools are not available outside armed live mode")
+        if tier is ToolTier.X:
+            order_reason = _order_tool_denial(deps, resolved.server)
+            if order_reason is not None:
+                raise _Denied(order_reason)
         role = caller_role(data)
         if tier is ToolTier.D and role is not Role.ORCHESTRATOR:
             raise _Denied("Mignons cannot spawn Mignons")

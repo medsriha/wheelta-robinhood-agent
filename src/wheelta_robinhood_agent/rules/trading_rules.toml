@@ -28,9 +28,9 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 8
+version = 9
 status = "signed_off"
-adr = "ADR-0028"
+adr = "ADR-0039"
 signed_off_by = "medsriha (account owner)"
 signed_off_on = "2026-09-28"
 
@@ -115,7 +115,7 @@ open_checks = "Apply selection.underlying_filters, selection.contract_filters, s
 close_checks = "For buy-to-close, verify contract identity, a fresh executable ask and valid bid/ask bounds, current short quantity at least the remaining close quantity, broker-reported funds sufficient for the debit, and no conflicting working order. Do not apply entry DTE, delta, yield, premium, event, or board-comparison filters. Missing facts needed to establish the close decision or execute it still block that close."
 limit_price_rule = "Price in your favor, then walk toward the market to get filled. Sell to open: start above the mid and step down toward the bid. Buy to close: start below the mid and step up toward the ask. Choose the starting price, step size, and wait per step from the live spread and quote (agent_discretion). Every price is on the contract's tick increment and inside orders.limit_price_bounds."
 limit_price_bounds = "Within [bid, ask] of the quote taken immediately before the order."
-time_in_force = "day"
+time_in_force = "gfd"
 working = [
   "Work each order until it fills, one price step at a time per orders.limit_price_rule.",
   "After placing a step, check it with get_option_orders. If it is still unfilled when you move on, cancel it with cancel_option_order and confirm the cancel with get_option_orders before placing the next step.",

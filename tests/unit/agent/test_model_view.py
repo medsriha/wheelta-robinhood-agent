@@ -105,6 +105,7 @@ def test_instruments_become_a_table_with_shared_values_in_common() -> None:
         "occ_symbol.expiration": "2026-10-30",
         "occ_symbol.right": "put",
         "occ_symbol.root": "CCL",
+        "tick_increment": None,
         "underlying": "CCL",
     }
     assert table["columns"] == ["broker_instrument_id", "occ_symbol.strike"]

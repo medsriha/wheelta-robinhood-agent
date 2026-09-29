@@ -24,7 +24,6 @@ from wheelta_robinhood_agent.domain.enums import (
     AuditCheck,
     AuditOutcome,
     DecisionAction,
-    ExecutionMode,
     OptionRight,
     OrderSide,
     ToolCallStatus,
@@ -808,7 +807,7 @@ def pre_states(
     ctx: AuditContext, attempts: tuple[AuditAttempt, ...]
 ) -> dict[str, PreState | Unknown]:
     """Pre-state per attempt: pre-order broker state (live) or the dry-run simulation (off)."""
-    if ctx.effective_execution_mode is ExecutionMode.LIVE:
+    if ctx.executes_orders:
         return {a.key: pre_order_state(ctx, a) for a in attempts}
     return simulate_dry_run(ctx, attempts)
 
@@ -865,7 +864,7 @@ __all__ = [
 
 def audited_attempts(ctx: AuditContext) -> tuple[AuditAttempt, ...] | Unknown:
     """Live: every recorded place call. Off: the assembled dry-run intents, if knowable."""
-    if ctx.effective_execution_mode is ExecutionMode.LIVE:
+    if ctx.executes_orders:
         return live_attempts(ctx)
     attempts = dry_run_attempts(ctx)
     if attempts is not None:

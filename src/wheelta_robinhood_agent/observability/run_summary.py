@@ -12,16 +12,18 @@ import html
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from wheelta_robinhood_agent.domain.enums import (
     AppEnv,
     AttemptStatus,
     ExecutionMode,
+    OrderVenue,
     RunStatus,
 )
+from wheelta_robinhood_agent.domain.gating import executes_orders, with_default_venue
 from wheelta_robinhood_agent.domain.orders import Attempt, ReasonCode
-from wheelta_robinhood_agent.domain.run_record import LegRecord, RunRecord
+from wheelta_robinhood_agent.domain.run_record import LegRecord, RunRecord, UnassociatedAction
 from wheelta_robinhood_agent.observability.redaction import Redactor
 
 SUBJECT_PREFIX = "[Wheelta agent]"
@@ -41,6 +43,8 @@ class RunSummaryInput(BaseModel):
     reason: str | None
     requested_execution_mode: ExecutionMode
     effective_execution_mode: ExecutionMode
+    # ADR-0038; defaults from the mode (live: broker, off: none) when not given.
+    order_venue: OrderVenue
     # None when assembly failed; the email then says so instead of listing decisions.
     record: RunRecord | None
     # None when the audit did not run in this invocation.
@@ -51,6 +55,11 @@ class RunSummaryInput(BaseModel):
     next_run_at: AwareDatetime | None = None
     next_run_source: str | None = None
     next_run_rationale: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_venue(cls, data: object) -> object:
+        return with_default_venue(data)
 
 
 def _is_proposal(attempt: Attempt) -> bool:
@@ -80,23 +89,27 @@ def placed_count(record: RunRecord | None) -> int:
     return sum(1 for a in placed if a.status is not AttemptStatus.NOT_PLACED)
 
 
-def _mode_label(mode: ExecutionMode) -> str:
-    return "live" if mode is ExecutionMode.LIVE else "dry run"
+def _mode_label(mode: ExecutionMode, venue: OrderVenue) -> str:
+    if mode is ExecutionMode.LIVE:
+        return "live"
+    return "dry run (simulated orders)" if venue is OrderVenue.SIMULATED else "dry run"
 
 
 def build_subject(summary: RunSummaryInput) -> str:
     """`[Wheelta agent] <status> · <mode> · <activity> · <slot UTC>`."""
     record = summary.record
-    if summary.effective_execution_mode is ExecutionMode.LIVE:
+    if executes_orders(summary.order_venue):
         count = placed_count(record)
-        activity = f"{count} order{'s' if count != 1 else ''} placed" if count else "no trades"
+        simulated = "simulated " if summary.order_venue is OrderVenue.SIMULATED else ""
+        plural = "s" if count != 1 else ""
+        activity = f"{count} {simulated}order{plural} placed" if count else "no trades"
     else:
         count = proposal_count(record)
         activity = f"{count} proposal{'s' if count != 1 else ''}" if count else "no trades"
     return " · ".join(
         (
             f"{SUBJECT_PREFIX} {summary.status.value}",
-            _mode_label(summary.effective_execution_mode),
+            _mode_label(summary.effective_execution_mode, summary.order_venue),
             activity,
             f"{summary.slot:%Y-%m-%d %H:%M} UTC",
         )
@@ -160,13 +173,24 @@ def _record_facts(record: RunRecord) -> dict[str, JsonValue]:
             {
                 "kind": u.kind.value,
                 "occ_symbol": str(u.occ_symbol) if u.occ_symbol is not None else None,
-                "status": u.attempt.status.value if u.attempt is not None else None,
+                "status": _unassociated(u)[0],
+                "broker_order_id": _unassociated(u)[1],
             }
             for u in record.unassociated_actions
         ],
         "gaps": len(record.gaps),
         "assembly_findings": [f.code for f in record.findings],
     }
+
+
+def _unassociated(action: UnassociatedAction) -> tuple[str | None, str | None]:
+    """(status, broker order ID) of an action no decision selected: the attempt's, else the
+    cancellation's."""
+    if action.attempt is not None:
+        return action.attempt.status.value, action.attempt.broker_order_id
+    if action.cancellation is not None:
+        return action.cancellation.status.value, action.cancellation.broker_order_id
+    return None, None
 
 
 def _enum(value: object) -> str | None:
@@ -188,7 +212,8 @@ def summary_facts(summary: RunSummaryInput, redactor: Redactor) -> dict[str, Jso
             "reason": summary.reason,
             "requested_execution_mode": summary.requested_execution_mode.value,
             "effective_execution_mode": summary.effective_execution_mode.value,
-            "orders_sent_to_broker": summary.effective_execution_mode is ExecutionMode.LIVE,
+            "order_venue": summary.order_venue.value,
+            "orders_sent_to_broker": summary.order_venue is OrderVenue.BROKER,
         },
         "record": _record_facts(summary.record) if summary.record is not None else None,
         "audit": {
@@ -241,7 +266,7 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
         f"Run {summary.run_id} ({summary.environment.value})",
         f"Slot: {summary.slot.isoformat()}",
         f"Status: {summary.status.value}" + (f" ({summary.reason})" if summary.reason else ""),
-        f"Mode: {_mode_label(summary.effective_execution_mode)} "
+        f"Mode: {_mode_label(summary.effective_execution_mode, summary.order_venue)} "
         f"(requested {summary.requested_execution_mode.value})",
     ]
     record = summary.record
@@ -262,8 +287,15 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
         for c in record.cancellations:
             lines.append(f"- cancel: {c.status.value}")
         for u in record.unassociated_actions:
-            status = u.attempt.status.value if u.attempt is not None else "n/a"
-            lines.append(f"- unassociated {u.kind.value}: {status}")
+            status, order_id = _unassociated(u)
+            what = " · ".join(
+                p for p in (str(u.occ_symbol) if u.occ_symbol else None, u.side_raw) if p
+            )
+            order = f" (order {order_id})" if order_id else ""
+            lines.append(
+                f"- unassociated {u.kind.value}{': ' + what if what else ''}{order}: "
+                f"{status or 'unknown'}"
+            )
         for q in record.unresolved_questions:
             lines.append(f"- open question: {q.question}")
     audit = summary.audit_status or "not run"
