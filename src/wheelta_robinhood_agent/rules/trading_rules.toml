@@ -28,9 +28,9 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 11
+version = 12
 status = "signed_off"
-adr = "ADR-0048"
+adr = "ADR-0051" # v12: ADR-0050 (no working order at the end) and ADR-0051 (concurrent closes)
 signed_off_by = "medsriha (account owner)"
 signed_off_on = "2026-09-29"
 
@@ -114,7 +114,7 @@ min_cushion_ratio = "0.04" # owner, 2026-09-29 (ADR-0048)
 # ---------------------------------------------------------------------------------------------
 
 [orders]
-execution_order = "Execute non-HOLD decisions in priority order: closes and rolls before new opens."
+execution_order = "Execute non-HOLD decisions in priority order: closes and rolls before new opens. Buy-to-close orders on different contracts (closes, and the close legs of rolls) may be worked at the same time. Place a sell-to-open (a new open or a roll's replacement) only when no other order of yours is working."
 open_checks = "Apply selection.underlying_filters, selection.contract_filters, selection.sizing, selection.portfolio_caps, and circuit_breakers to each sell-to-open attempt, using fresh account state."
 close_checks = "For buy-to-close, verify contract identity, a fresh executable ask and valid bid/ask bounds, current short quantity at least the remaining close quantity, broker-reported funds sufficient for the debit, and no conflicting working order. Do not apply entry DTE, delta, yield, premium, event, or board-comparison filters. Missing facts needed to establish the close decision or execute it still block that close."
 limit_price_rule = "Price in your favor, then walk toward the market to get filled. Sell to open: start above the mid and step down toward the bid. Buy to close: start below the mid and step up toward the ask. Choose the starting price, step size, and wait per step from the live spread and quote (agent_discretion). Every price is on the contract's tick increment and inside orders.limit_price_bounds."
@@ -126,9 +126,12 @@ working = [
   "A partial fill is a position. After cancellation is confirmed, read the final filled quantity, including fills during cancellation. Work only the target quantity minus confirmed cumulative fills; never infer that a cancel request released the reservation.",
   "Each step is a new order: redo procedure step 4 in full (re-quote, re-check, review, place, confirm) at the new price.",
   "Never have more than one open order of yours on the same contract.",
+  "To work several closes at once, send the placements one at a time (wait for each result), then check them together with one get_option_orders read and step each on its own. Each price step still cancels and confirms that order before its next price.",
+  "Code checks a placement against your other working orders of this run: only buy-to-close orders on different contracts may work together, and only when the fresh account snapshot's available settled cash covers all their debits at their limit prices. A denied placement was never sent; place it after the working orders resolve.",
   "Stop working an order and cancel its unfilled remainder when the next price would fall outside orders.limit_price_bounds, when the applicable orders.open_checks or orders.close_checks fails (QUOTE_MOVED), or when the decision no longer holds. Preserve any fills in the record.",
   "Follow the prompt's stop-on-error protocol for every place or cancel error, timeout, or unknown outcome. Price walking never permits a retry of an uncertain action.",
-  "An order still open when you return your output stays open as a day order. The next run cancels it (procedure step 1) and decides again.",
+  "Do not leave an order working when you finish. Before returning your output, cancel every order of yours that is still working, confirm its terminal state with get_option_orders, and count the final fills. An order whose cancellation you already sent is only confirmed, never cancelled again.",
+  "Only an order you could not resolve (its cancel was uncertain, or an error ended placement and reads cannot confirm it) may remain after you finish; code reports it. The next run cancels it (procedure step 1) and decides again.",
 ]
 
 # ---------------------------------------------------------------------------------------------

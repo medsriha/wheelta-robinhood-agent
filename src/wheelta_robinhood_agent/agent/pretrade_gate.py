@@ -14,13 +14,26 @@ can adjust the trade and try again; the reason is recorded as the call's `denied
 Buy-to-close legs pass unchecked (filters apply to sell-to-open legs only). A leg whose side,
 position effect, or option_id cannot be read is denied: an unidentified contract cannot be
 validated.
+
+Before the leg checks, `placements` (when wired) supplies this run's unresolved orders and
+in-flight placements for pure `domain.order_concurrency.check_concurrency` (ADR-0051): only
+buy-to-close orders on different contracts may work at the same time, funded together by the
+fresh account snapshot. Its denial reaches the agent the same way.
 """
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from wheelta_robinhood_agent.agent.facts_tool import RunEvidence
+from wheelta_robinhood_agent.domain.order_concurrency import (
+    NewPlacement,
+    PlacementLeg,
+    WorkingPlacement,
+    check_concurrency,
+)
+from wheelta_robinhood_agent.domain.orders import OrderRecord
 from wheelta_robinhood_agent.domain.pretrade import (
     PRETRADE_DENIAL_PREFIX,
     OpeningLeg,
@@ -34,13 +47,60 @@ def _text(value: object) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _count(value: object) -> int | None:
+    text = str(value).strip() if isinstance(value, int | str) and value is not True else ""
+    return int(text) if text.isdigit() and int(text) > 0 else None
+
+
+def _price(value: object) -> Decimal | None:
+    if not isinstance(value, str | int) or isinstance(value, bool):
+        return None
+    try:
+        price = Decimal(str(value).strip())
+    except InvalidOperation:
+        return None
+    return price if price.is_finite() and price > 0 else None
+
+
+@dataclass(frozen=True)
+class PlacementState:
+    """This run's unresolved owned orders and its place calls that have no outcome yet
+    (the one being checked included)."""
+
+    unresolved: tuple[OrderRecord, ...]
+    placements_in_flight: int
+
+
+def _working(record: OrderRecord) -> WorkingPlacement:
+    intent = record.intent
+    label = (
+        record.broker_order.broker_order_id
+        if record.broker_order is not None
+        else f"place:{intent.place_tool_call_id}"
+        if intent is not None
+        else "unknown order"
+    )
+    filled = record.filled_quantity
+    remaining = intent.quantity - (filled or 0) if intent is not None and intent.quantity else None
+    return WorkingPlacement(
+        label=label,
+        option_id=intent.broker_instrument_id if intent is not None else None,
+        # side_raw is the recorded "<side>_to_<position_effect>" (broker_ledger._leg_side).
+        closing=intent is not None and (intent.side_raw or "").lower() == "buy_to_close",
+        remaining_quantity=remaining,
+        limit_price=intent.limit_price if intent is not None else None,
+    )
+
+
 @dataclass(frozen=True)
 class PretradeGate:
-    """Validates the sell-to-open legs of one `place_option_order` input (ADR-0048)."""
+    """Validates one `place_option_order` input: concurrency (ADR-0051), then the
+    sell-to-open legs (ADR-0048)."""
 
     evidence: Callable[[], RunEvidence]
     rules: PretradeRules
     clock: Callable[[], datetime]
+    placements: Callable[[], PlacementState] | None = None
 
     def __call__(self, tool_input: Mapping[str, object]) -> str | None:
         """A denial reason with the failed checks and values, or None when all legs pass."""
@@ -51,6 +111,7 @@ class PretradeGate:
                 + "The order has no legs to validate; list each leg's option_id."
             )
         opening: list[str] = []
+        parsed: list[PlacementLeg] = []
         for index, leg in enumerate(legs):
             if not isinstance(leg, Mapping):
                 return PRETRADE_DENIAL_PREFIX + f"Leg {index} is not an object."
@@ -64,10 +125,22 @@ class PretradeGate:
                 )
             if side.lower() == "sell" and effect.lower() == "open":
                 opening.append(option_id)
+            closing = side.lower() == "buy" and effect.lower() == "close"
+            parsed.append(PlacementLeg(option_id=option_id, closing=closing))
+        as_of = self.clock()
+        state = self.placements() if self.placements is not None else None
+        concurrent = state is not None and (
+            bool(state.unresolved) or state.placements_in_flight > 1
+        )
+        if not opening and not concurrent:
+            return None  # a lone buy-to-close: nothing to check (ADR-0048, ADR-0051)
+        evidence = self.evidence()
+        if state is not None and concurrent:
+            denial = self._concurrency(tool_input, parsed, state, evidence, as_of)
+            if denial is not None:
+                return denial
         if not opening:
             return None
-        evidence = self.evidence()
-        as_of = self.clock()
         validations = []
         for option_id in opening:
             instrument = evidence.instrument(option_id)
@@ -83,3 +156,31 @@ class PretradeGate:
             )
             validations.append(validate_opening_leg(leg_input, self.rules, as_of))
         return pretrade_feedback(validations)
+
+    def _concurrency(
+        self,
+        tool_input: Mapping[str, object],
+        legs: list[PlacementLeg],
+        state: PlacementState,
+        evidence: RunEvidence,
+        as_of: datetime,
+    ) -> str | None:
+        working = tuple(_working(r) for r in state.unresolved)
+        ids = {leg.option_id for leg in legs} | {w.option_id for w in working if w.option_id}
+        multipliers: dict[str, int | None] = {}
+        for iid in ids:
+            inst = evidence.instrument(iid)
+            multipliers[iid] = inst.multiplier if inst is not None else None
+        return check_concurrency(
+            NewPlacement(
+                legs=tuple(legs),
+                quantity=_count(tool_input.get("quantity")),
+                limit_price=_price(tool_input.get("price")),
+            ),
+            working,
+            other_placements_in_flight=max(state.placements_in_flight - 1, 0),
+            multipliers=multipliers,
+            account=evidence.account(),
+            account_max_age=self.rules.account_state_max_age_seconds,
+            as_of=as_of,
+        )

@@ -88,7 +88,18 @@ from wheelta_robinhood_agent.agent.mignons import (
     mignon_limits,
 )
 from wheelta_robinhood_agent.agent.options import build_agent_options
-from wheelta_robinhood_agent.agent.pretrade_gate import PretradeGate
+from wheelta_robinhood_agent.agent.order_cleanup import (
+    CLEANUP_DENIAL,
+    CLEANUP_TOOLS,
+    MAX_ORDER_CLEANUPS,
+    ORDER_WIND_DOWN_SECONDS,
+    WIND_DOWN_DENIAL,
+    cleanup_message,
+    needs_cleanup,
+    order_scope,
+    unresolved_orders,
+)
+from wheelta_robinhood_agent.agent.pretrade_gate import PlacementState, PretradeGate
 from wheelta_robinhood_agent.agent.proxy import (
     ValidatingProxy,
     build_proxy_server,
@@ -138,6 +149,7 @@ from wheelta_robinhood_agent.domain.enums import (
     ToolTier,
 )
 from wheelta_robinhood_agent.domain.gating import executes_orders, order_venue
+from wheelta_robinhood_agent.domain.orders import OrderRecord
 from wheelta_robinhood_agent.integrations.mcp_upstream import (
     McpUpstream,
     UpstreamAuthError,
@@ -146,6 +158,9 @@ from wheelta_robinhood_agent.integrations.mcp_upstream import (
 )
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry, diff_discovered
 from wheelta_robinhood_agent.integrations.robinhood.accounts import check_eligibility
+from wheelta_robinhood_agent.integrations.robinhood.registry import (
+    PLACE_ORDER_TOOL,
+)
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     SERVER_NAME as ROBINHOOD,
 )
@@ -463,6 +478,10 @@ class SessionResult:
     tool_drift: list[str] = field(default_factory=list)
     # The trusted Agentic-eligibility check (proxied Robinhood only); None if it did not run.
     eligibility: AgenticEligibility | None = None
+    # ADR-0050: cleanup turns sent, and owned orders still unresolved when the session ended
+    # (broker order IDs, or the place call ID when no broker order is known).
+    order_cleanups: int = 0
+    orders_left_unresolved: tuple[str, ...] = ()
 
 
 def _web_cache_parts(
@@ -548,6 +567,7 @@ def build_session_options(
             evidence=lambda: load_run_evidence(deps.conn, deps.run_id),
             rules=pretrade_rules_from(deps.rules),
             clock=deps.clock,
+            placements=lambda: placement_state(deps),
         ),
     )
     facts_service = DecisionFactsService(
@@ -871,13 +891,23 @@ async def _converse(
 
     ADR-0044: a final output that fails to parse gets up to `MAX_OUTPUT_REPAIRS` follow-up
     turns in the same session, each listing the issues, with every tool denied (the gate).
+    ADR-0050 (order venue only): in the last `ORDER_WIND_DOWN_SECONDS` of the budget the gate
+    lets only order reads and cancels through, and a final output returned while owned orders
+    are unresolved gets up to `MAX_ORDER_CLEANUPS` turns to cancel them, before any repair.
     """
     done = anyio.Event()
     last_result: ResultMessage | None = None
+    scope_id = order_scope(deps.plan.order_venue, deps.account_scope_id, deps.run_id)
 
     async def watch(scope: anyio.CancelScope) -> None:
         while not done.is_set():
             deps.deadline_check()
+            if (
+                scope_id is not None
+                and output_gate is not None
+                and deps.session_budget_seconds() <= ORDER_WIND_DOWN_SECONDS
+            ):
+                output_gate.restrict(WIND_DOWN_DENIAL, CLEANUP_TOOLS)
             if deps.run_control.stop_requested and not result.interrupted:
                 result.interrupted = True
                 with contextlib.suppress(Exception), anyio.move_on_after(10):
@@ -923,7 +953,17 @@ async def _converse(
             while text is not None:
                 result.raw_outputs.append(text)
                 result.raw_output = text
-                if deps.run_control.stop_requested or repairs >= MAX_OUTPUT_REPAIRS:
+                if deps.run_control.stop_requested:
+                    break
+                if repairs == 0 and result.order_cleanups < MAX_ORDER_CLEANUPS:
+                    unresolved = cleanup_candidates(deps)
+                    if unresolved:
+                        result.order_cleanups += 1
+                        if output_gate is not None:
+                            output_gate.restrict(CLEANUP_DENIAL, CLEANUP_TOOLS)
+                        text = await turn(cleanup_message(unresolved, result.order_cleanups))
+                        continue
+                if repairs >= MAX_OUTPUT_REPAIRS:
                     break
                 parsed = parse_agent_decision_output(deps.redactor.redact_text(text))
                 if parsed.ok:
@@ -995,7 +1035,65 @@ async def run_agent_session(deps: SessionDeps) -> SessionResult:
     if result.status is not SessionStatus.NOT_STARTED:
         close_unresolved_calls(deps)
         persist_output(deps, result)
+        result.orders_left_unresolved = orders_left_unresolved(deps)
     return result
+
+
+def placement_state(deps: SessionDeps) -> PlacementState:
+    """This run's unresolved owned orders and its place calls without an outcome (ADR-0051).
+
+    Only this run's placements count: an older order the ledger cannot resolve (paged order
+    history, ADR-0034) must not block trading; the prompt's step 1 and ADR-0050 handle those.
+    """
+    scope = order_scope(deps.plan.order_venue, deps.account_scope_id, deps.run_id)
+    unresolved = tuple(
+        r
+        for r in unresolved_orders(deps.conn, scope)
+        if r.intent is not None and r.intent.run_id == deps.run_id
+    )
+    in_flight = sum(
+        1
+        for r in ledger_tool_calls.tool_call_records(deps.conn, deps.run_id)
+        if r.identity.tool == PLACE_ORDER_TOOL and r.status is ToolCallStatus.REQUESTED
+    )
+    return PlacementState(unresolved=unresolved, placements_in_flight=in_flight)
+
+
+def cleanup_candidates(deps: SessionDeps) -> tuple[OrderRecord, ...]:
+    """Unresolved owned orders that can still be working (ADR-0050, `needs_cleanup`)."""
+    scope = order_scope(deps.plan.order_venue, deps.account_scope_id, deps.run_id)
+    unresolved = unresolved_orders(deps.conn, scope)
+    if not unresolved:
+        return ()
+    call_ids = {
+        r.identity.tool_call_id for r in ledger_tool_calls.tool_call_records(deps.conn, deps.run_id)
+    }
+    as_of = deps.clock()
+    return tuple(
+        r
+        for r in unresolved
+        if needs_cleanup(r, run_id=deps.run_id, run_tool_call_ids=call_ids, as_of=as_of)
+    )
+
+
+LEFT_LOOKUP_FAILED: Final = "unknown: the order lookup failed"
+
+
+def orders_left_unresolved(deps: SessionDeps) -> tuple[str, ...]:
+    """Owned orders still unresolved once the session ended (ADR-0050): broker order IDs, or
+    `place:<tool call ID>` for an intent with no known broker order. A failed lookup is
+    reported as `LEFT_LOOKUP_FAILED`, so the alert fires rather than claiming none are left."""
+    try:
+        records = cleanup_candidates(deps)
+    except Exception:  # noqa: BLE001 - unknown is reported, never read as "none left"
+        return (LEFT_LOOKUP_FAILED,)
+    left: list[str] = []
+    for record in records:
+        if record.broker_order is not None:
+            left.append(record.broker_order.broker_order_id)
+        elif record.intent is not None:
+            left.append(f"place:{record.intent.place_tool_call_id}")
+    return tuple(left)
 
 
 async def _run_client(

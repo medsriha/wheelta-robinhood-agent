@@ -20,8 +20,9 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # AgentDecisionOutput v6. v10 (ADR-0035): the final message is bare JSON. v11 (ADR-0040):
 # cash and capacity come from decision facts, not the raw snapshot's missing fields. v12
 # (ADR-0048): code validates sell-to-open placements and returns failed checks as feedback.
+# v13 (ADR-0050): finish with no order working; order cleanup turns and wind-down.
 ACTIVE_PROMPT_ID = "wheel_agent"
-ACTIVE_PROMPT_VERSION = 12
+ACTIVE_PROMPT_VERSION = 13
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {

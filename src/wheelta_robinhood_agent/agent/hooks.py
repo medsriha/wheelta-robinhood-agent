@@ -318,20 +318,36 @@ WebCapture = Callable[[uuid.UUID, str, dict[str, Any], JsonValue], None]
 
 
 class OutputRepairGate:
-    """Closed while the session asks the agent to correct an invalid final output (ADR-0044).
+    """Narrows the session's tools once its main work ends (ADR-0044, ADR-0050).
 
-    While closed, the PreToolUse hook denies every tool call, so a repair turn can only restate
-    the output and never act (no order, workspace write, or Mignon). It never reopens.
+    `restrict` (order wind-down and cleanup, ADR-0050) lets only the named fully qualified
+    tools through; `close` (final-output repair, ADR-0044) denies every call, so a repair turn
+    can only restate the output and never act. Other checks still apply to a permitted tool.
+    The gate only narrows: it never reopens or widens.
     """
 
     def __init__(self) -> None:
         self._reason: str | None = None
+        self._permitted: frozenset[str] | None = None  # None: no restriction
 
     @property
     def reason(self) -> str | None:
         return self._reason
 
+    def denial(self, qualified_tool: str) -> str | None:
+        """The deny reason for this tool, or None when the gate lets it through."""
+        if self._permitted is None or qualified_tool in self._permitted:
+            return None
+        return self._reason
+
+    def restrict(self, reason: str, permitted: frozenset[str]) -> None:
+        if self._permitted is not None and not self._permitted:
+            return  # already closed; nothing left to narrow
+        self._permitted = permitted if self._permitted is None else self._permitted & permitted
+        self._reason = reason
+
     def close(self, reason: str) -> None:
+        self._permitted = frozenset()
         self._reason = reason
 
 
@@ -380,6 +396,7 @@ class HookDeps:
     # broker, off: none). `simulated` requires the server to be proxied.
     order_venue: OrderVenue | None = None
     # ADR-0044: closed during final-output repair turns; every call is then denied.
+    # ADR-0050: restricted to order reads and cancels during wind-down and order cleanup.
     output_gate: OutputRepairGate | None = None
     # ADR-0048: pre-trade validation of place_option_order (agent/pretrade_gate.py). None
     # denies every placement.
@@ -747,8 +764,10 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
 
         The upstream input is the effective input with the account placeholder replaced by the
         configured number (ADR-0030), or None when nothing was replaced."""
-        if deps.output_gate is not None and deps.output_gate.reason is not None:
-            raise _Denied(deps.output_gate.reason)
+        if deps.output_gate is not None:
+            gate_reason = deps.output_gate.denial(resolved.qualified)
+            if gate_reason is not None:
+                raise _Denied(gate_reason)
         tier = resolved.tier
         if tier is None:
             raise _Denied(

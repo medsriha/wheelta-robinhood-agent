@@ -43,6 +43,7 @@ RULES = PretradeRules(
     min_annualized_yield_ratio=D("0.25"),
     option_quote_max_age_seconds=60,
     equity_quote_max_age_seconds=60,
+    account_state_max_age_seconds=120,
 )
 
 

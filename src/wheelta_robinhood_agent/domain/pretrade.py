@@ -65,6 +65,8 @@ class PretradeRules(DomainModel):
     min_annualized_yield_ratio: DecimalSetting
     option_quote_max_age_seconds: CountSetting
     equity_quote_max_age_seconds: CountSetting
+    # ADR-0051: freshness of the snapshot that funds concurrent buy-to-close orders.
+    account_state_max_age_seconds: CountSetting
 
 
 class CheckName(StrEnum):

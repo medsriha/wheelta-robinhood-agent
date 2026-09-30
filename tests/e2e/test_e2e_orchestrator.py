@@ -721,6 +721,134 @@ def test_invalid_output_is_repaired_with_tools_denied(harness: Callable[..., Har
     assert [d.deny_reason for d in denied] == [OUTPUT_REPAIR_DENIAL]
 
 
+def _unresolved_order(h: Harness) -> Any:
+    """An owned broker order with no status observation (ledger status unknown)."""
+    import uuid
+
+    from wheelta_robinhood_agent.agent.simulated_broker import simulated_scope_id
+    from wheelta_robinhood_agent.domain.orders import BrokerOrder, OrderRecord
+
+    return OrderRecord(
+        intent=None,
+        broker_order=BrokerOrder(
+            order_id=uuid.uuid4(),
+            account_scope_id=simulated_scope_id(h.run_id),
+            broker_order_id="ord-working-1",
+            intent_id=None,
+            first_observed_at=h.clock.now,
+        ),
+    )
+
+
+def _fake_unresolved(
+    monkeypatch: pytest.MonkeyPatch, h: Harness, rounds: int | None
+) -> list[str | None]:
+    """Make the session see one unresolved order for `rounds` lookups (None: always)."""
+    from wheelta_robinhood_agent.agent import session as session_module
+
+    scopes: list[str | None] = []
+
+    def fake(conn: Any, scope: str | None) -> tuple[Any, ...]:
+        scopes.append(scope)
+        return (_unresolved_order(h),) if rounds is None or len(scopes) <= rounds else ()
+
+    monkeypatch.setattr(session_module, "unresolved_orders", fake)
+    return scopes
+
+
+def test_working_orders_get_a_cleanup_turn_before_the_output_is_accepted(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0050: output returned with an owned order unresolved sends the agent back to cancel
+    it. Only order reads and cancels are allowed in that turn; placing is denied."""
+    from wheelta_robinhood_agent.agent.order_cleanup import CLEANUP_DENIAL
+    from wheelta_robinhood_agent.agent.simulated_broker import simulated_scope_id
+
+    valid: list[str] = []
+    turns: list[ToolTurn] = []
+
+    async def script(model: FakeModel) -> str | None:
+        text = await dry_run_script(model)
+        assert text is not None
+        valid.append(text)
+        return text
+
+    async def followup(model: FakeModel) -> str:
+        assert model.message is not None and "cleanup 1 of 2" in model.message
+        assert "broker order ord-working-1" in model.message
+        account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+        turns.append(await model.call("mcp__robinhood__get_portfolio", account))
+        turns.append(await model.call("mcp__robinhood__get_option_orders", account))
+        return valid[0]
+
+    h = harness()
+    h.world = simulated_world(h.clock.now)
+    h.followup = followup
+    scopes = _fake_unresolved(monkeypatch, h, rounds=1)
+    assert h.run(script, mappers=SIMULATED_MAPPERS) == 0, h.notifier.alert_kinds()
+    assert h.status() is RunStatus.COMPLETED
+    denied, read = turns
+    assert denied.denied and denied.reason == CLEANUP_DENIAL
+    assert not read.denied
+    assert set(scopes) == {simulated_scope_id(h.run_id)}
+    assert "orders_left_working" not in h.notifier.alert_kinds()
+    (cleanup,) = [
+        e["order_cleanup"] for e in h.events(RunEventType.METADATA) if "order_cleanup" in e
+    ]
+    assert cleanup == {"cleanup_turns": 1, "left_unresolved": []}
+    with h.conn() as c:
+        first, second = ledger_evidence.agent_outputs_for_run(c, h.run_id)
+    assert second.corrects_id == first.record_id
+
+
+def test_orders_still_unresolved_after_cleanup_alert(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-0050: after MAX_ORDER_CLEANUPS turns the output is accepted and R19 alerts."""
+    from wheelta_robinhood_agent.agent.order_cleanup import MAX_ORDER_CLEANUPS
+
+    h = harness()
+    h.world = simulated_world(h.clock.now)
+    _fake_unresolved(monkeypatch, h, rounds=None)
+    assert h.run(dry_run_script, mappers=SIMULATED_MAPPERS) == 0
+    assert h.status() is RunStatus.COMPLETED
+    (cli,) = h.clis
+    assert "orders_left_working" in h.notifier.alert_kinds()
+    (cleanup,) = [
+        e["order_cleanup"] for e in h.events(RunEventType.METADATA) if "order_cleanup" in e
+    ]
+    assert cleanup == {"cleanup_turns": MAX_ORDER_CLEANUPS, "left_unresolved": ["ord-working-1"]}
+
+
+def test_wind_down_allows_only_order_reads_and_cancels(harness: Callable[..., Harness]) -> None:
+    """ADR-0050: in the last ORDER_WIND_DOWN_SECONDS of the session budget a new placement is
+    denied and an order read still passes, so the agent can cancel and finish."""
+    from wheelta_robinhood_agent.agent.order_cleanup import (
+        ORDER_WIND_DOWN_SECONDS,
+        WIND_DOWN_DENIAL,
+    )
+    from wheelta_robinhood_agent.orchestrator.main import FINALIZE_RESERVE_SECONDS
+
+    turns: list[ToolTurn] = []
+
+    async def script(model: FakeModel) -> str | None:
+        text = await dry_run_script(model)
+        budget = h.settings.RUN_TIMEOUT_SECONDS - FINALIZE_RESERVE_SECONDS
+        h.clock.advance(budget - ORDER_WIND_DOWN_SECONDS + 10)
+        await asyncio.sleep(0.3)  # the session's watch loop polls every 0.05 s
+        account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+        turns.append(await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": []}))
+        turns.append(await model.call("mcp__robinhood__get_option_orders", account))
+        return text
+
+    h = harness()
+    h.world = simulated_world(h.clock.now)
+    assert h.run(script, mappers=SIMULATED_MAPPERS) == 0, h.notifier.alert_kinds()
+    quote, read = turns
+    assert quote.denied and quote.reason == WIND_DOWN_DENIAL
+    assert not read.denied
+
+
 def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness]) -> None:
     """ADR-0018: earlier notes reach the prompt; this run's HOLD and question become notes."""
     import json

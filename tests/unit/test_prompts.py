@@ -30,10 +30,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v12_with_expected_placeholders() -> None:
+def test_active_prompt_is_v13_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 12
+    assert template.version == 13
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -141,5 +141,22 @@ def test_v12_explains_pretrade_denials() -> None:
     """ADR-0048: a pre-trade validation denial is feedback, not an order error."""
     text = load_prompt().text
     assert "no code checks them against trading limits" not in text
-    assert "pre-trade validation was never sent: it is not an order error" in text
+    assert (
+        "pre-trade validation or by the concurrency check was never sent: it is not an order error"
+        in text
+    )
     assert "Never repeat the same order\n   unchanged after a denial." in text
+
+
+def test_v13_finishes_with_no_order_working() -> None:
+    """ADR-0050: cleanup turns and wind-down replace "stays open as a day order"."""
+    text = load_prompt().text
+    assert "Finish with no order of yours working (`orders.working`)." in text
+    assert "(wind-down)" in text
+    assert "open day orders" not in text
+
+
+def test_v13_allows_concurrent_closes_only() -> None:
+    """ADR-0051: closes on different contracts may work together; opens stay sequential."""
+    text = load_prompt().text
+    assert "Closes on different contracts may be worked at the same time" in text

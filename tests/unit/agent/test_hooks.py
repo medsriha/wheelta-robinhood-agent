@@ -599,6 +599,28 @@ def test_closed_output_gate_denies_every_tool(tool: str, args: dict[str, Any]) -
     assert_denied(s, s.pre(tool, args, use_id="after"), "final output is corrected")
 
 
+def test_restricted_gate_passes_only_permitted_tools() -> None:
+    """ADR-0050: wind-down/cleanup lets order reads and cancels through, nothing else."""
+    gate = OutputRepairGate()
+    gate.restrict("orders are being cleaned up", frozenset({RH + "get_option_quotes"}))
+    s = session(effective_mode=ExecutionMode.LIVE, output_gate=gate)
+    assert_allowed(s, s.pre(RH + "get_option_quotes", use_id="r"))
+    s.rec.events.clear()
+    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}, use_id="p"), "cleaned up")
+
+
+def test_gate_only_narrows() -> None:
+    gate = OutputRepairGate()
+    assert gate.denial(RH + "get_option_orders") is None
+    gate.restrict("a", frozenset({RH + "get_option_orders", RH + "cancel_option_order"}))
+    gate.restrict("b", frozenset({RH + "get_option_orders", PLACE}))
+    assert gate.denial(RH + "get_option_orders") is None
+    assert gate.denial(PLACE) == "b"  # never widened by a later restriction
+    gate.close("closed")
+    gate.restrict("c", frozenset({RH + "get_option_orders"}))
+    assert gate.denial(RH + "get_option_orders") == "closed"
+
+
 # ---- Tier S workspace ----------------------------------------------------------------------
 
 

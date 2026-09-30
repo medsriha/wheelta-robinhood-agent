@@ -143,3 +143,83 @@ def test_malformed_orders_are_denied_without_reading_evidence() -> None:
         reason = g(tool_input)
         assert reason is not None and reason.startswith(PRETRADE_DENIAL_PREFIX), tool_input
         assert loads.count == 0
+
+
+# ---- concurrency (ADR-0051) -----------------------------------------------------------------
+
+
+def _unresolved_close(option_id: str = "inst-2") -> Any:
+    from wheelta_robinhood_agent.domain.orders import BrokerOrder, OrderIntent, OrderRecord
+
+    return OrderRecord(
+        intent=OrderIntent(
+            intent_id=UUID(int=10),
+            run_id=UUID(int=11),
+            place_tool_call_id=UUID(int=12),
+            account_scope_id="acct:1234",
+            occ_symbol=None,
+            broker_instrument_id=option_id,
+            side_raw="buy_to_close",
+            quantity=1,
+            order_type_raw="limit",
+            time_in_force_raw="gfd",
+            limit_price=D("0.50"),
+            requested_at=T0,
+        ),
+        broker_order=BrokerOrder(
+            order_id=UUID(int=13),
+            account_scope_id="acct:1234",
+            broker_order_id="ord-2",
+            intent_id=UUID(int=10),
+            first_observed_at=T0,
+        ),
+    )
+
+
+def btc(option_id: str = "inst-1") -> dict[str, Any]:
+    return {"option_id": option_id, "side": "buy", "position_effect": "close"}
+
+
+def concurrent_gate(unresolved: tuple[Any, ...], in_flight: int = 1) -> tuple[PretradeGate, Loads]:
+    from wheelta_robinhood_agent.agent.pretrade_gate import PlacementState
+
+    loads = Loads(evidence())
+    state = PlacementState(unresolved=unresolved, placements_in_flight=in_flight)
+    return PretradeGate(
+        evidence=loads, rules=RULES, clock=lambda: T0, placements=lambda: state
+    ), loads
+
+
+def test_a_lone_close_loads_no_evidence() -> None:
+    g, loads = concurrent_gate(())
+    assert g(order(btc())) is None
+    assert loads.count == 0
+
+
+def test_a_second_placement_in_flight_is_denied() -> None:
+    g, _ = concurrent_gate((), in_flight=2)
+    reason = g(order(btc()))
+    assert reason is not None and "one at a time" in reason
+
+
+def test_an_open_while_a_close_works_is_denied_before_leg_checks() -> None:
+    g, _ = concurrent_gate((_unresolved_close(),))
+    reason = g(order(sto()))
+    assert reason is not None and "Only buy-to-close orders" in reason and "ord-2" in reason
+
+
+def test_a_concurrent_close_needs_verified_funds() -> None:
+    """No account snapshot and no instrument for the working order: funds unverifiable."""
+    g, _ = concurrent_gate((_unresolved_close(),))
+    reason = g({**order(btc()), "quantity": "1"})
+    assert reason is not None and "cannot be verified" in reason
+    assert "no validated account snapshot" in reason
+
+
+def test_a_working_close_is_recognised_whatever_the_case() -> None:
+    """The recorded side is the agent's raw text; "BUY_to_Close" is still a close."""
+    record = _unresolved_close()
+    intent = record.intent.model_copy(update={"side_raw": "BUY_to_Close"})
+    g, _ = concurrent_gate((record.model_copy(update={"intent": intent}),))
+    reason = g({**order(btc()), "quantity": "1"})
+    assert reason is not None and "Only buy-to-close" not in reason

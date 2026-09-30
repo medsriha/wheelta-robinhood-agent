@@ -53,6 +53,8 @@ class AlertKind(StrEnum):
     CONSECUTIVE_RUN_FAILURES = "consecutive_run_failures"
     AUDIT_VIOLATION = "audit_violation"
     AUDIT_FAILURE = "audit_failure"
+    # ADR-0050: an owned order was still unresolved when the session ended.
+    ORDERS_LEFT_WORKING = "orders_left_working"
 
 
 class AlertSpec(BaseModel):
@@ -80,6 +82,7 @@ ALERT_SPECS: Mapping[AlertKind, AlertSpec] = {
     AlertKind.CONSECUTIVE_RUN_FAILURES: AlertSpec(severity=AlertSeverity.ERROR, runbook="R14"),
     AlertKind.AUDIT_VIOLATION: AlertSpec(severity=AlertSeverity.ERROR, runbook="R12"),
     AlertKind.AUDIT_FAILURE: AlertSpec(severity=AlertSeverity.ERROR, runbook="R16"),
+    AlertKind.ORDERS_LEFT_WORKING: AlertSpec(severity=AlertSeverity.WARNING, runbook="R19"),
 }
 
 

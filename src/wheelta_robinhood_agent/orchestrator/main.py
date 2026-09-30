@@ -1030,6 +1030,23 @@ class _Run:
                     "expected tools missing on a connected MCP server",
                     {"servers": list(session.tool_drift)},
                 )
+            if session.order_cleanups or session.orders_left_unresolved:
+                self.event(
+                    RunEventType.METADATA,
+                    {
+                        "order_cleanup": {
+                            "cleanup_turns": session.order_cleanups,
+                            "left_unresolved": list(session.orders_left_unresolved),
+                        }
+                    },
+                )
+            if session.orders_left_unresolved:
+                # ADR-0050: the next run's step 1 cancels them; an operator may cancel sooner.
+                self.alert(
+                    AlertKind.ORDERS_LEFT_WORKING,
+                    "owned orders were still unresolved when the session ended",
+                    {"orders": list(session.orders_left_unresolved)},
+                )
             if session.observations and any(
                 o.server == ROBINHOOD and o.status is SourceStatus.NEEDS_AUTH
                 for o in session.observations[len(plan.observations) :]

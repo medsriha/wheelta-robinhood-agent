@@ -61,4 +61,5 @@ def pretrade_rules_from(loaded: LoadedRules) -> PretradeRules:
         min_annualized_yield_ratio=_decimal(filters.min_annualized_yield_ratio),
         option_quote_max_age_seconds=_count(freshness.option_quote_max_age_seconds),
         equity_quote_max_age_seconds=_count(freshness.equity_quote_max_age_seconds),
+        account_state_max_age_seconds=_count(freshness.account_state_max_age_seconds),
     )
