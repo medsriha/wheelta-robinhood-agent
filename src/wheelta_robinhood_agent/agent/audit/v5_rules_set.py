@@ -39,6 +39,7 @@ _FILTER_KEYS = (
     "max_spread_ratio_of_mid",
     "min_premium_usd",
     "min_annualized_yield_ratio",
+    "min_cushion_ratio",
 )
 _PUT_LIMIT_KEYS = (
     "min_cash_reserve_usd",

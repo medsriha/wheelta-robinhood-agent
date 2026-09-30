@@ -1,4 +1,5 @@
-"""Rules-derived filters for `wheelta_board_query` (ADR-0009 item 4, ADR-0010, ADR-0014).
+"""Rules-derived filters for `wheelta_board_query` (ADR-0009 item 4, ADR-0010, ADR-0014,
+ADR-0049).
 
 Pure: no I/O, no clock. The `agent/` `PreToolUse` hook calls `append_rules_filters` and
 returns the result as `updatedInput`; on `BoardFilterError` the hook denies the call
@@ -13,7 +14,9 @@ Wheelta contract (read-only source, `/Users/deepset/wheelta-mcp`):
 - `src/wheelta_mcp/fields.py` units: `contract.dte` days (integer), `contract.greeks.delta`
   negative for these put rows, `contract.openInterest` contracts (integer),
   `contract.spreadPct` a decimal fraction (full width / midpoint, 0.30 = 30%),
-  `contract.bid` USD/share.
+  `contract.bid` USD/share, `risk.cushionPct` spot-to-strike distance as a fraction of spot
+  (definitions.cushion for these put rows), `risk.annualizedYield` a decimal fraction,
+  mid / strike x 365 / DTE (turn-the-wheels-api screener.py; ADR-0014).
 
 Board values are build-time screens (CLAUDE.md §10). These filters narrow what the board
 returns; they are not order enforcement (ADR-0009 "Consequences").
@@ -58,6 +61,8 @@ class BoardField(StrEnum):
     OPEN_INTEREST = "contract.openInterest"
     SPREAD_PCT = "contract.spreadPct"
     BID = "contract.bid"
+    CUSHION = "risk.cushionPct"
+    ANNUALIZED_YIELD = "risk.annualizedYield"
     SYMBOL = "symbol"
 
 
@@ -119,10 +124,13 @@ def rules_board_filters(rules: TradingRules) -> tuple[BoardFilter, ...]:
     - `filters.max_spread_ratio_of_mid` → `contract.spreadPct lte v` (same definition)
     - `scope.underlying_denylist` (non-empty list) → `symbol notIn [...]`
     - `filters.min_premium_usd` → `contract.bid gte v` (ADR-0014 item 1)
+    - `filters.min_cushion_ratio` → `risk.cushionPct gte v` (ADR-0049; same definition)
+    - `filters.min_annualized_yield_ratio` → `risk.annualizedYield gte v` (ADR-0049). The board
+      yield is mid-based and mid >= bid, so this only drops rows whose bid-based yield also
+      fails at build time; the live bid-based check is still pre-trade validation (ADR-0048).
 
     Deliberately not mapped: `scope.leveraged_inverse_etfs_allowed` (ADR-0010: stocks have
-    `fund=null` and an AND-only predicate would drop them), `filters.min_annualized_yield_ratio`
-    (ADR-0014 item 2: `risk.annualizedYield` is mid-based), and every rule absent from the
+    `fund=null` and an AND-only predicate would drop them), and every rule absent from the
     ADR table. Raises `BoardFilterError` if a set value can't produce a filter.
     """
     f = rules.filters
@@ -169,6 +177,17 @@ def rules_board_filters(rules: TradingRules) -> tuple[BoardFilter, ...]:
     if _is_set(f.min_premium_usd):
         v = _require_ratio("filters.min_premium_usd", f.min_premium_usd)
         add(BoardField.BID, BoardFilterOp.GTE, v, "filters.min_premium_usd")
+    if _is_set(f.min_cushion_ratio):
+        v = _require_ratio("filters.min_cushion_ratio", f.min_cushion_ratio, upper=one)
+        add(BoardField.CUSHION, BoardFilterOp.GTE, v, "filters.min_cushion_ratio")
+    if _is_set(f.min_annualized_yield_ratio):
+        v = _require_ratio("filters.min_annualized_yield_ratio", f.min_annualized_yield_ratio)
+        add(
+            BoardField.ANNUALIZED_YIELD,
+            BoardFilterOp.GTE,
+            v,
+            "filters.min_annualized_yield_ratio",
+        )
     return tuple(out)
 
 

@@ -24,6 +24,8 @@ EXPECTED_CURRENT = [
     {"field": "contract.openInterest", "op": "gte", "value": 100},
     {"field": "contract.spreadPct", "op": "lte", "value": 0.3},
     {"field": "contract.bid", "op": "gte", "value": 0.1},
+    {"field": "risk.cushionPct", "op": "gte", "value": 0.04},
+    {"field": "risk.annualizedYield", "op": "gte", "value": 0.25},
 ]
 
 
@@ -39,7 +41,17 @@ def test_current_rules_produce_exact_filters() -> None:
 def test_wire_values_are_json_numbers_of_the_right_type() -> None:
     wire = append_rules_filters({}, RULES)["filters"]
     assert isinstance(wire, list)
-    assert [type(f["value"]) for f in wire] == [int, int, float, float, int, float, float]
+    assert [type(f["value"]) for f in wire] == [
+        int,
+        int,
+        float,
+        float,
+        int,
+        float,
+        float,
+        float,
+        float,
+    ]
     # Serializes to the plain decimal text, with no binary rounding artefacts.
     assert '"value": -0.15' in json.dumps(wire)
 
@@ -86,6 +98,8 @@ def test_markers_inject_nothing(marker: RuleMarker) -> None:
         min_open_interest=marker,
         max_spread_ratio_of_mid=marker,
         min_premium_usd=marker,
+        min_cushion_ratio=marker,
+        min_annualized_yield_ratio=marker,
     )
     rules = rules.model_copy(
         update={"scope": rules.scope.model_copy(update={"underlying_denylist": marker})}
@@ -95,8 +109,35 @@ def test_markers_inject_nothing(marker: RuleMarker) -> None:
 
 def test_unmapped_rules_inject_nothing() -> None:
     fields = {f.field.value for f in rules_board_filters(RULES)}
-    assert not any(f.startswith("fund.") or f.startswith("risk.") for f in fields)
+    assert not any(f.startswith("fund.") for f in fields)
+    # ADR-0049: the only risk.* columns are the cushion and yield floors.
+    assert {f for f in fields if f.startswith("risk.")} == {
+        "risk.cushionPct",
+        "risk.annualizedYield",
+    }
     assert "isEtf" not in fields
+
+
+def test_cushion_and_yield_floors_map_to_board_columns() -> None:
+    """ADR-0049: filters.min_cushion_ratio and min_annualized_yield_ratio narrow the board."""
+    by_rule = {f.rule: f for f in rules_board_filters(RULES)}
+    cushion = by_rule["filters.min_cushion_ratio"]
+    assert (cushion.field.value, cushion.op.value, cushion.value) == (
+        "risk.cushionPct",
+        "gte",
+        Decimal("0.04"),
+    )
+    yld = by_rule["filters.min_annualized_yield_ratio"]
+    assert (yld.field.value, yld.op.value, yld.value) == (
+        "risk.annualizedYield",
+        "gte",
+        Decimal("0.25"),
+    )
+
+
+def test_cushion_floor_above_one_cannot_map() -> None:
+    with pytest.raises(BoardFilterError, match="min_cushion_ratio"):
+        rules_board_filters(_with("filters", min_cushion_ratio=Decimal("1.5")))
 
 
 def test_no_fund_predicate_even_when_leveraged_disallowed() -> None:
@@ -115,6 +156,7 @@ def test_no_fund_predicate_even_when_leveraged_disallowed() -> None:
             "spreadPct": 0.0455,
             "greeks": {"delta": -0.29},
         },
+        "risk": {"cushionPct": 0.06, "annualizedYield": 0.31},
     }
     assert all(_matches(stock_row, f) for f in append_rules_filters({}, RULES)["filters"])
 

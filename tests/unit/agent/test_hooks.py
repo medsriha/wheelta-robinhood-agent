@@ -7,7 +7,7 @@ coroutine is driven with a single `send(None)` (asyncio's self-pipe would need a
 import dataclasses
 import json
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -198,6 +198,7 @@ def make_deps(**overrides: Any) -> HookDeps:
         account_scope_table=SCOPE,
         workspace_targets=TARGETS,
         mignon_models=(TEST_MODEL,),
+        pretrade_gate=lambda tool_input: None,
     )
     return dataclasses.replace(base, **overrides)
 
@@ -815,11 +816,72 @@ def test_arguments_are_redacted_before_recording() -> None:
     assert ACCOUNT not in recorded and "5678" in recorded
 
 
-def test_hooks_never_check_trading_limits() -> None:
-    # A contract count far above limits.max_contracts_per_order is not the hook's business.
+def test_hooks_check_no_trading_limit_beyond_pretrade_validation() -> None:
+    # A contract count far above limits.max_contracts_per_order is not the hook's business:
+    # only the injected pre-trade gate (ADR-0048) judges trading rules, and it passes here.
     s = session(effective_mode=ExecutionMode.LIVE)
     out = s.pre(PLACE, {"account_number": ACCOUNT, "quantity": 10_000})
     assert_allowed(s, out)
+
+
+# ---- pre-trade validation (ADR-0048) -------------------------------------------------------
+
+
+def test_pretrade_failure_denies_the_placement_with_the_feedback() -> None:
+    seen: list[Mapping[str, object]] = []
+
+    def gate(tool_input: Mapping[str, object]) -> str | None:
+        seen.append(tool_input)
+        return "Pre-trade validation failed (ADR-0048); cushion 0.0312 is below 0.04"
+
+    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=gate)
+    order = {"account_number": ACCOUNT, "legs": [{"option_id": "x"}]}
+    assert_denied(s, s.pre(PLACE, order), "cushion 0.0312 is below 0.04")
+    assert seen == [order]
+    assert not s.deps.run_control.stop_requested  # a failed check is feedback, not a failure
+
+
+def test_pretrade_pass_allows_the_placement() -> None:
+    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=lambda tool_input: None)
+    assert_allowed(s, s.pre(PLACE, {"account_number": ACCOUNT}))
+
+
+def test_no_pretrade_gate_denies_every_placement() -> None:
+    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=None)
+    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "pre-trade validation")
+
+
+@pytest.mark.parametrize("tool", ["review_option_order", "cancel_option_order"])
+def test_pretrade_gate_applies_to_placement_only(tool: str) -> None:
+    def gate(tool_input: Mapping[str, object]) -> str | None:
+        raise AssertionError("the gate is for place_option_order only")
+
+    from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
+
+    s = session(
+        effective_mode=ExecutionMode.LIVE,
+        pretrade_gate=gate,
+        account_scope_table=ROBINHOOD_ACCOUNT_SCOPE,
+    )
+    assert_allowed(s, s.pre(RH + tool, {"account_number": ACCOUNT, "order_id": "o-1"}))
+
+
+def test_pretrade_gate_not_reached_when_an_earlier_check_denies() -> None:
+    def gate(tool_input: Mapping[str, object]) -> str | None:
+        raise AssertionError("an off-mode placement never reaches the gate")
+
+    s = session(effective_mode=ExecutionMode.OFF, pretrade_gate=gate)
+    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "not available in this run")
+
+
+def test_pretrade_gate_error_denies_and_stops() -> None:
+    def gate(tool_input: Mapping[str, object]) -> str | None:
+        raise RuntimeError("ledger down")
+
+    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=gate)
+    out = s.pre(PLACE, {"account_number": ACCOUNT})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert out["continue_"] is False and s.deps.run_control.stop_requested
 
 
 # ---- PostToolUse ---------------------------------------------------------------------------

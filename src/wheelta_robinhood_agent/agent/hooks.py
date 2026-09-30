@@ -10,7 +10,11 @@ CLAUDE.md §8 (three-layer tool access), §9 (Tier S rules), §14, §18, §24; d
   Agentic account scope, and a Tier S call that fails ownership (prefix AND ledger-recorded
   ID) or the workspace caps. `wheelta_board_query` gets the ADR-0009 filters appended via
   `updatedInput` without a `permissionDecision`, so `allowed_tools` + `dontAsk` still apply.
-  Allowed calls return no decision for the same reason. It never checks trading limits.
+  Allowed calls return no decision for the same reason. The one trading-rule check is
+  pre-trade validation (ADR-0048): `place_option_order` runs the injected `pretrade_gate`
+  over its sell-to-open legs (DTE, delta, cushion, annualized yield) and is denied, with the
+  failed checks and values as the reason the agent receives, when any check fails or cannot
+  be computed. No gate configured denies every placement (fail closed).
 - `PostToolUse` validates the raw result through the injected validator, persists it, and
   replaces the model-visible output (`updatedToolOutput`) with the persisted envelope.
 - `PostToolUseFailure` records the failure. Tier S/X failures are `unknown`, never retried.
@@ -116,7 +120,10 @@ from wheelta_robinhood_agent.domain.mignon_report import (
 )
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry, ToolSpec
-from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
+from wheelta_robinhood_agent.integrations.robinhood.registry import (
+    PLACE_ORDER_TOOL,
+    ROBINHOOD_REGISTRY,
+)
 from wheelta_robinhood_agent.integrations.wheelta.board_filters import (
     FILTERS_ARG,
     BoardFilterError,
@@ -305,6 +312,8 @@ class ResultValidator(Protocol):
 
 
 WebPrecheck = Callable[[str, dict[str, Any]], str | None]
+# ADR-0048: `place_option_order` input → denial reason naming the failed checks, or None.
+PretradeCheck = Callable[[Mapping[str, object]], str | None]
 WebCapture = Callable[[uuid.UUID, str, dict[str, Any], JsonValue], None]
 
 
@@ -372,6 +381,9 @@ class HookDeps:
     order_venue: OrderVenue | None = None
     # ADR-0044: closed during final-output repair turns; every call is then denied.
     output_gate: OutputRepairGate | None = None
+    # ADR-0048: pre-trade validation of place_option_order (agent/pretrade_gate.py). None
+    # denies every placement.
+    pretrade_gate: PretradeCheck | None = None
 
     @classmethod
     def from_settings(
@@ -782,6 +794,12 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             upstream = resolve_account_argument(scope, tool_input, deps.account_number)
         if tier is ToolTier.S:
             check_workspace(resolved.tool, tool_input)
+        if tier is ToolTier.X and resolved.tool == PLACE_ORDER_TOOL:
+            if deps.pretrade_gate is None:
+                raise _Denied("pre-trade validation is not configured; orders cannot be placed")
+            pretrade_reason = deps.pretrade_gate(tool_input)
+            if pretrade_reason is not None:
+                raise _Denied(pretrade_reason)
         if resolved.server == WHEELTA and resolved.tool == BOARD_QUERY_TOOL:
             try:
                 updated = append_rules_filters(tool_input, deps.rules)

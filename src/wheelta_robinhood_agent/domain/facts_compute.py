@@ -13,6 +13,9 @@ Rules applied (each formula id below is stamped at version "1"):
 - `annualized_yield_on_collateral`: live BID x multiplier / collateral x 365 / DTE
   (filters.min_annualized_yield_ratio, ADR-0014, definitions.annualization). Opening only.
 - `spread_ratio_of_mid`: (ask - bid) / mid, mid = (bid + ask) / 2 (filters notes).
+- `cushion`: put (live underlying - strike) / live underlying; call (strike - live underlying)
+  / live underlying (definitions.cushion, filters.min_cushion_ratio, ADR-0048). Opening only;
+  the same formula pre-trade validation applies before placement.
 - `board_premium_divergence`: |live BID - board BID| / board BID for a board-derived
   candidate (selection.board_comparison: the same premium measure, the bid, for the same
   contract, from the run's current Wheelta build; ADR-0041). The agent compares it with
@@ -43,7 +46,7 @@ Rules applied (each formula id below is stamped at version "1"):
 fact unavailable with a gap. Zero is a real zero. A missing quantity is never rounded to one.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import ROUND_HALF_EVEN, Context, Decimal, DivisionByZero, InvalidOperation, Overflow
 from functools import cached_property
 from typing import Self, TypeVar
@@ -91,6 +94,7 @@ F_DTE = "dte_calendar_days"
 F_COLLATERAL = "collateral_per_contract"
 F_YIELD = "annualized_yield_on_collateral"
 F_SPREAD = "spread_ratio_of_mid"
+F_CUSHION = "cushion"
 F_BOARD = "board_premium_divergence"
 F_CSP = "csp_capacity"
 F_CC = "cc_capacity"
@@ -122,6 +126,28 @@ _R_EQUITY_AGE = "data_quality.freshness.equity_quote_max_age_seconds"
 _R_ACCOUNT_AGE = "data_quality.freshness.account_state_max_age_seconds"
 
 T = TypeVar("T", int, Decimal)
+
+
+# --------------------------------------------------------------------------------------------
+# Formulas shared with pre-trade validation (domain/pretrade.py, ADR-0048), so the facts the
+# agent screens with and the check before placement can never disagree.
+# --------------------------------------------------------------------------------------------
+
+
+def dte_days(expiration: date, as_of: datetime) -> int:
+    """Calendar days from as_of's New York date to expiration (definitions.annualization)."""
+    return (expiration - as_of.astimezone(ZoneInfo(_MARKET_TZ)).date()).days
+
+
+def cushion_ratio(right: OptionRight, strike: Decimal, underlying_price: Decimal) -> Decimal:
+    """definitions.cushion: put (price - strike) / price; call (strike - price) / price."""
+    distance = underlying_price - strike if right is OptionRight.PUT else strike - underlying_price
+    return _CTX.divide(distance, underlying_price)
+
+
+def annualized_ratio(premium: Decimal, collateral: Decimal, dte: int) -> Decimal:
+    """premium / collateral x 365 / DTE (definitions.annualization); DTE must be positive."""
+    return _CTX.divide(premium * _DAYS_PER_YEAR, collateral * dte)
 
 
 # --------------------------------------------------------------------------------------------
@@ -598,8 +624,7 @@ class _Computation:
 
     @cached_property
     def dte(self) -> int | None:
-        today = self.as_of.astimezone(ZoneInfo(_MARKET_TZ)).date()
-        days = (self.inst.occ_symbol.expiration - today).days
+        days = dte_days(self.inst.occ_symbol.expiration, self.as_of)
         if days < 0:
             self.gap("dte", DataQuality.MISSING, "the contract expired before as_of")
             return None
@@ -633,7 +658,7 @@ class _Computation:
         if dte == 0:
             self.gap(name, DataQuality.MISSING, "DTE is 0; annualization is undefined")
             return
-        value = _CTX.divide(price * m * _DAYS_PER_YEAR, collateral[0] * dte)
+        value = annualized_ratio(price * m, collateral[0], dte)
         self.metric(name, "ratio", value, formula, (*ids, *collateral[1]))
 
     def spread(self) -> None:
@@ -649,9 +674,19 @@ class _Computation:
         if q is not None:
             name = "annualized_yield_on_collateral_ratio"
             self.annualized(name, q.bid, F_YIELD, (q.quote_id,))
+        self.cushion()
         candidate = self.i.candidate
         if candidate is not None and candidate.origin is CandidateOrigin.BOARD:
             self.board_divergence(q)
+
+    def cushion(self) -> None:
+        """definitions.cushion from the live underlying price (ADR-0048)."""
+        spot = self.underlying
+        if spot is None:
+            return
+        price, spot_id = spot
+        value = cushion_ratio(self.inst.occ_symbol.right, self.inst.occ_symbol.strike, price)
+        self.metric("cushion_ratio", "ratio", value, F_CUSHION, (self.inst.evidence_id, spot_id))
 
     def board_divergence(self, q: Quote | None) -> None:
         """selection.board_comparison inputs for a board-derived candidate (ADR-0041)."""

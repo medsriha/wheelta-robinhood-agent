@@ -143,6 +143,7 @@ class Filters(_Section):
     max_spread_ratio_of_mid: DecimalRule
     min_premium_usd: DecimalRule
     min_annualized_yield_ratio: DecimalRule
+    min_cushion_ratio: DecimalRule  # ADR-0048
 
 
 class Orders(_Section):
@@ -167,6 +168,7 @@ class Definitions(_Section):
     broken_thesis: StrictStr
     remaining_yield: StrictStr
     annualization: StrictStr
+    cushion: StrictStr  # ADR-0048
     captured_ratio: StrictStr
     cash_accounting: StrictStr
 

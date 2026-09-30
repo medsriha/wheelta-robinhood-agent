@@ -258,6 +258,7 @@ def open_inputs(**kw: Any) -> FactInputs:
         "purpose": FactsPurpose.OPEN,
         "instrument": instrument(),
         "option_quote": quote(),
+        "underlying_quote": underlying("55.00"),  # cushion needs it (ADR-0048)
         "account": snapshot(),
         "positions": positions(),
         "open_orders": orders(),
@@ -337,6 +338,33 @@ def test_opening_metrics_use_the_live_bid() -> None:
     assert yield_metric.value.derivation.formula == "annualized_yield_on_collateral"
     assert set(yield_metric.value.derivation.input_evidence_ids) == {uid(1), uid(2)}
     assert yield_metric.value.as_of == T0 - timedelta(seconds=10)  # oldest input
+
+
+def test_opening_facts_report_cushion() -> None:
+    """ADR-0048, definitions.cushion: put (55 - 50) / 55; call (50 - 40) / 40."""
+    f = facts(open_inputs())
+    assert metric(f, "cushion_ratio") == D(5) / D(55)
+    cushion = f.metric("cushion_ratio")
+    assert cushion is not None and cushion.value.derivation is not None
+    assert cushion.value.derivation.input_evidence_ids == (uid(1), uid(3))
+    call = open_inputs(instrument=instrument(CALL), underlying_quote=underlying("40.00"))
+    assert metric(facts(call), "cushion_ratio") == D("0.25")
+
+
+def test_in_the_money_cushion_is_negative() -> None:
+    assert metric(facts(open_inputs(underlying_quote=underlying("45.00"))), "cushion_ratio") < 0
+
+
+def test_opening_put_without_a_fresh_underlying_quote_has_a_cushion_gap() -> None:
+    for inputs in (
+        open_inputs(underlying_quote=None),
+        open_inputs(underlying_quote=underlying("55.00", age=61)),
+    ):
+        f = facts(inputs)
+        assert f.metric("cushion_ratio") is None
+        assert "underlying_quote" in {g.field for g in f.gaps}
+        assert f.quality is not DataQuality.OK
+        assert f.initial_quantity == 1  # sizing does not depend on it
 
 
 def test_zero_capacity_is_a_real_zero() -> None:
@@ -760,11 +788,12 @@ def test_formula_versions_and_evidence_are_complete() -> None:
         "annualized_yield_on_collateral": "1",
         "collateral_per_contract": "1",
         "csp_capacity": "1",
+        "cushion": "1",
         "decision_quantity": "1",
         "dte_calendar_days": "1",
         "spread_ratio_of_mid": "1",
     }
-    assert f.input_evidence_ids == (uid(1), uid(2), uid(4), uid(5), uid(6))
+    assert f.input_evidence_ids == (uid(1), uid(2), uid(3), uid(4), uid(5), uid(6))
     assert f.observed_at == T0
 
 

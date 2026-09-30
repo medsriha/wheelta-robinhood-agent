@@ -28,11 +28,11 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 10
+version = 11
 status = "signed_off"
-adr = "ADR-0041"
+adr = "ADR-0048"
 signed_off_by = "medsriha (account owner)"
-signed_off_on = "2026-09-28"
+signed_off_on = "2026-09-29"
 
 [conventions]
 value_conventions = [
@@ -93,6 +93,9 @@ notes = [
   "min_premium_usd is per share, not per contract, and is measured at the live bid: the worst price a sell-to-open price walk can fill at.",
   "max_spread_ratio_of_mid is (ask - bid) / mid.",
   "min_annualized_yield_ratio is premium / collateral, annualized over DTE (CSP collateral = strike x multiplier; CC collateral = share price x multiplier). The premium is the live bid, as for min_premium_usd. Annualize per definitions.annualization.",
+  "min_cushion_ratio is definitions.cushion, measured with the live underlying price.",
+  "Apply min_dte, max_dte, min_abs_delta, max_abs_delta, min_cushion_ratio, and min_annualized_yield_ratio while screening and selecting candidates, not only before placing. Quote both the option and its underlying, then read the dte, cushion_ratio, and annualized_yield_on_collateral_ratio metrics from the decision-facts tool and delta from the live option quote. A candidate that fails any of them, or whose value is missing, is not selectable; do not carry it into the order procedure.",
+  "Pre-trade validation: code checks those six filters again on every sell-to-open leg of place_option_order, from the latest option and underlying quotes recorded in this run within data_quality.freshness. A failed, stale, or missing value denies the order, and the denial names each failed check with its value and bound. The limit price does not change these values.",
 ]
 min_dte = 7
 max_dte = 45 # the board's own gates: DTE 1-45, |delta| 0.15-0.35
@@ -103,7 +106,8 @@ min_volume = "none" # day volume is near zero early in the session even on liqui
 max_spread_usd = "none" # max_spread_ratio_of_mid scales with price instead
 max_spread_ratio_of_mid = "0.30" # board max_entry_slippage_pct 0.15 = 0.30 full spread
 min_premium_usd = "0.10"
-min_annualized_yield_ratio = "0.10" # board junk floor is 0.06; spreadsheet "good trade" 0.10
+min_annualized_yield_ratio = "0.25" # owner, 2026-09-29 (ADR-0048); was 0.10
+min_cushion_ratio = "0.04" # owner, 2026-09-29 (ADR-0048)
 
 # ---------------------------------------------------------------------------------------------
 # Orders
@@ -147,6 +151,7 @@ tested = "A short put is tested when the underlying's live price is at or below 
 broken_thesis = "agent_discretion: the reason you entered the position no longer holds, in your judgment. Compare current evidence with the thesis and invalidation conditions in position_book, and name the evidence in the rationale. Missing entry history does not by itself make a thesis broken."
 remaining_yield = "Current buyback ask per share x contract multiplier / collateral, annualized per definitions.annualization over the remaining DTE. Collateral is defined as in filters (CSP: strike x multiplier; CC: current share price x multiplier)."
 annualization = "ratio x 365 / DTE, with DTE in calendar days."
+cushion = "How far the strike is out of the money, as a fraction of the live underlying price. Put: (underlying price - strike) / underlying price. Call: (strike - underlying price) / underlying price. Negative when in the money."
 captured_ratio = "(credit received - current buyback ask) / credit received"
 cash_accounting = "Use a fresh validated AccountSnapshot immediately before each attempt. available_settled_cash_usd already excludes every broker reservation; csp_reserved_cash_usd includes existing short puts and unfilled working sell-to-open puts, each counted once. The pre-order CSP cash base is their sum. New CSP collateral must fit available settled cash after the reserve; existing plus new CSP collateral must fit limits.max_total_csp_collateral_ratio times that base. Never treat unsettled proceeds or margin buying power as settled cash. If the broker fields or reservation timing cannot establish these amounts, record insufficient data."
 

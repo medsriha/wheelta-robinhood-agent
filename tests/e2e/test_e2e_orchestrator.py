@@ -870,6 +870,40 @@ def test_dry_run_order_tools_go_to_the_simulated_broker(
     _assert_simulated_trace(h)
 
 
+def test_pretrade_validation_denies_a_failing_order_with_feedback_and_the_agent_adjusts(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0048: a sell-to-open placement that fails pre-trade validation never reaches the
+    (simulated) broker; the agent receives each failed check with its values and bound, and a
+    corrected order goes through."""
+    from e2e_fakes import passing_spy_put, pretrade_denial_script
+
+    h = harness()
+    spy_put = passing_spy_put()
+    h.world = simulated_world(h.clock.now, spy_put)
+    feedback: list[str] = []
+    script = pretrade_denial_script(lambda: h.clock.advance(1), feedback, spy_put)
+    h.run(script, mappers=SIMULATED_MAPPERS)
+    unquoted, failing = feedback
+    assert unquoted.startswith("Pre-trade validation failed (ADR-0048)")
+    assert "abs_delta: no validated option quote recorded in this run" in unquoted
+    assert "cushion: no validated SPY quote recorded in this run" in unquoted
+    assert "dte 23" in unquoted  # the instrument is known, so DTE passes
+    assert "abs_delta 0.122280 is below filters.min_abs_delta 0.15" in failing
+    assert "annualized_yield 0.0384 is below filters.min_annualized_yield_ratio 0.25" in failing
+    assert "passed: dte 23, cushion 0.0406" in failing
+    with h.conn() as c:
+        calls = tool_call_records(c, h.run_id)
+    places = [r for r in calls if r.identity.tool == "place_option_order"]
+    assert [r.status for r in places] == [
+        ToolCallStatus.DENIED,
+        ToolCallStatus.DENIED,
+        ToolCallStatus.SUCCEEDED,
+    ]
+    upstream = [tool for _, tool, _ in h.world.upstream_calls]
+    assert not {t for t in upstream if t.endswith("_option_order")}, upstream
+
+
 def _assert_simulated_trace(h: Harness) -> None:
     """The operator trace resolves the run end to end from the ledger alone."""
     from wheelta_robinhood_agent.agent.trace_loader import list_runs, load_decision_trace
@@ -891,11 +925,12 @@ def _assert_simulated_trace(h: Harness) -> None:
     unlinked = {u.kind: [c.tool for c in u.calls] for u in trace.unassociated}
     assert unlinked == {"place": ["review_option_order", "place_option_order"]}
     # The audit sees the simulated order (ADR-0038): the script placed a 740 put on 30,000 of
-    # cash without quoting it. Its time in force matches the rule ("gfd", ADR-0039). Every
-    # such finding sits under the unlinked place, not the run level.
+    # cash. It was quoted, so pre-trade validation (ADR-0048) let it through and its price has
+    # provenance (no V2.1); pre-trade validation checks no cash. Its time in force matches the
+    # rule ("gfd", ADR-0039). Every such finding sits under the unlinked place, not the run level.
     place = next(u for u in trace.unassociated if u.kind == "place")
     checks = {v.split(":")[0] for v in place.findings.violations}
-    assert checks == {"V1.3", "V2.1", "V7.3", "V7.4"}
+    assert checks == {"V1.3", "V7.3", "V7.4"}
     assert place.broker_order_id is not None and place.status == "filled"
     assert not trace.run_findings.violations
     callers = {c.caller for c in trace.timeline}

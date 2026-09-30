@@ -30,10 +30,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v11_with_expected_placeholders() -> None:
+def test_active_prompt_is_v12_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 11
+    assert template.version == 12
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -135,3 +135,11 @@ def test_v11_judges_cash_from_decision_facts_not_raw_snapshot_gaps() -> None:
     assert "Account\nstate is unavailable only when a required read failed" in text
     assert "never from the raw snapshot's missing fields" in text
     assert "Do not skip selection because a raw\nsnapshot field is missing" in text
+
+
+def test_v12_explains_pretrade_denials() -> None:
+    """ADR-0048: a pre-trade validation denial is feedback, not an order error."""
+    text = load_prompt().text
+    assert "no code checks them against trading limits" not in text
+    assert "pre-trade validation was never sent: it is not an order error" in text
+    assert "Never repeat the same order\n   unchanged after a denial." in text

@@ -221,6 +221,7 @@ def map_quotes(req: MappingRequest, new_id: Callable[[], uuid.UUID]) -> MappedEv
                 broker_instrument_id=q["instrument_id"],
                 bid=Decimal(q["bid"]),
                 ask=Decimal(q["ask"]),
+                delta=Decimal(q["delta"]) if "delta" in q else None,
                 as_of=datetime.fromisoformat(q["as_of"]),
                 source_tool_call_ids=(req.tool_call_id,),
             )
@@ -404,15 +405,47 @@ def _fixture(name: str) -> dict[str, Any]:
     return {"data": captured["data"]}
 
 
-def simulated_world(as_of: datetime) -> FakeWorld:
-    """`build_world` with a captured instrument and real-shape (empty) order reads. The order
-    tools still raise if they ever reach the fake broker."""
+# A live quote for the captured SPY 740 put that passes pre-trade validation (ADR-0048) at
+# SESSION_TIME (DTE 23): |delta| 0.20, yield 11.80 x 365 / (740 x 23) = 0.253, cushion
+# (771.30 - 740) / 771.30 = 0.0406 against the captured SPY last trade.
+SPY_PUT_BID, SPY_PUT_ASK, SPY_PUT_DELTA = "11.80", "12.00", "-0.20"
+
+
+def _spy_equity_quote(stamp: str) -> dict[str, Any]:
+    """The captured SPY equity quote, re-stamped to the fake world's time."""
+    fixture = _fixture("get_equity_quotes.SPY.json")
+    quote = fixture["data"]["results"][0]["quote"]
+    quote["venue_last_trade_time"] = stamp
+    return fixture
+
+
+def passing_spy_put() -> dict[str, str]:
+    return {"bid": SPY_PUT_BID, "ask": SPY_PUT_ASK, "delta": SPY_PUT_DELTA}
+
+
+def simulated_world(as_of: datetime, spy_put: dict[str, str] | None = None) -> FakeWorld:
+    """`build_world` with a captured instrument, a SPY option quote (`spy_put`, read on every
+    call so a script can change it; passing by default) and equity quote, and real-shape
+    (empty) order reads. The order tools still raise if they ever reach the fake broker."""
     world = build_world(as_of)
+    put = passing_spy_put() if spy_put is None else spy_put
+    stamp = as_of.isoformat()
     handlers = world.handlers["robinhood"]
     handlers["get_option_instruments"] = lambda args: _text(
         _fixture("get_option_instruments.SPY_20261016_P740.json")
     )
     handlers["get_option_orders"] = lambda args: _text({"data": {"orders": []}})
+
+    def quotes(args: dict[str, Any]) -> dict[str, Any]:
+        rows = [
+            {"instrument_id": INSTRUMENT_ID, "bid": "1.20", "ask": "1.30", "as_of": stamp},
+            {"instrument_id": SPY_INSTRUMENT_ID, **put, "as_of": stamp},
+        ]
+        wanted = set(args.get("instrument_ids") or [])
+        return _text({"quotes": [q for q in rows if q["instrument_id"] in wanted]})
+
+    handlers["get_option_quotes"] = quotes
+    handlers["get_equity_quotes"] = lambda args: _text(_spy_equity_quote(stamp))
     return world
 
 
@@ -423,6 +456,7 @@ SIMULATED_MAPPERS = {
         for key, mapper in VERIFIED_MAPPERS.items()
         if key[1]
         in {
+            "get_equity_quotes",
             "get_option_instruments",
             "get_option_orders",
             "review_option_order",
@@ -439,22 +473,27 @@ def simulated_second_order_script(advance: Callable[[], None]) -> Callable[[Fake
 
     async def script(model: FakeModel) -> str | None:
         output = await _simulated_orders(model, advance)
-        await _step(model, advance, "1.78")
+        await _step(model, advance, "11.85")
         return output
 
     return script
 
 
-async def _step(model: FakeModel, advance: Callable[[], None], price: str) -> None:
-    account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
-    order = {
-        **account,
+def _spy_order(price: str) -> dict[str, Any]:
+    """One-contract limit sell-to-open of the captured SPY 740 put, day order."""
+    return {
+        "account_number": AGENTIC_ACCOUNT_PLACEHOLDER,
         "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": "sell", "position_effect": "open"}],
         "quantity": "1",
         "price": price,
         "type": "limit",
         "time_in_force": "gfd",
     }
+
+
+async def _step(model: FakeModel, advance: Callable[[], None], price: str) -> None:
+    account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+    order = _spy_order(price)
     advance()
     await model.call("mcp__robinhood__review_option_order", order)
     advance()
@@ -479,14 +518,9 @@ async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> st
     candidate_ref, facts_ref = await research(model)
     account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
     await model.call("mcp__robinhood__get_option_instruments", {"ids": SPY_INSTRUMENT_ID})
-    order = {
-        **account,
-        "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": "sell", "position_effect": "open"}],
-        "quantity": "1",
-        "price": "1.79",
-        "type": "limit",
-        "time_in_force": "gfd",
-    }
+    await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]})
+    await model.call("mcp__robinhood__get_equity_quotes", {"symbols": ["SPY"]})
+    order = _spy_order("11.90")
     advance()
     review = await model.call("mcp__robinhood__review_option_order", order)
     assert not review.denied and review.output["kind"] == "validated", review.output
@@ -500,6 +534,43 @@ async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> st
     assert listed["state_raw"] == "filled" and listed["processed_quantity"] == 1
     assert listed["pending_quantity"] == 0
     return decision_json(candidate_ref, facts_ref)
+
+
+def pretrade_denial_script(
+    advance: Callable[[], None], feedback: list[str], spy_put: dict[str, str]
+) -> Callable[[FakeModel], Any]:
+    """ADR-0048: place the SPY put without quoting it (denied: nothing to validate), then with
+    the captured live quote (denied: delta and yield below the rules), appending each denial
+    reason to `feedback`; then quote it passing and place it (filled on the simulated broker).
+    `spy_put` is the world's mutable SPY quote (`simulated_world`)."""
+
+    async def script(model: FakeModel) -> str | None:
+        candidate_ref, facts_ref = await research(model)
+        await model.call("mcp__robinhood__get_option_instruments", {"ids": SPY_INSTRUMENT_ID})
+        order = _spy_order("1.79")
+        advance()
+        unquoted = await model.call("mcp__robinhood__place_option_order", order)
+        assert unquoted.denied, unquoted
+        feedback.append(str(unquoted.reason))
+        spy_put.update(bid="1.79", ask="1.80", delta="-0.122280")  # the captured quote
+        await model.call(
+            "mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]}
+        )
+        await model.call("mcp__robinhood__get_equity_quotes", {"symbols": ["SPY"]})
+        advance()
+        failing = await model.call("mcp__robinhood__place_option_order", order)
+        assert failing.denied, failing
+        feedback.append(str(failing.reason))
+        spy_put.update(passing_spy_put())
+        await model.call(
+            "mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]}
+        )
+        advance()
+        placed = await model.call("mcp__robinhood__place_option_order", {**order, "price": "11.90"})
+        assert not placed.denied and placed.output["kind"] == "validated", placed.output
+        return decision_json(candidate_ref, facts_ref)
+
+    return script
 
 
 # -- Wheelta board as the initial scanner (ADR-0041) ------------------------------------------

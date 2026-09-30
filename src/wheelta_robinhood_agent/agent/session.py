@@ -88,6 +88,7 @@ from wheelta_robinhood_agent.agent.mignons import (
     mignon_limits,
 )
 from wheelta_robinhood_agent.agent.options import build_agent_options
+from wheelta_robinhood_agent.agent.pretrade_gate import PretradeGate
 from wheelta_robinhood_agent.agent.proxy import (
     ValidatingProxy,
     build_proxy_server,
@@ -119,7 +120,7 @@ from wheelta_robinhood_agent.agent.web_cache import (
     capture_web_result,
 )
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
-from wheelta_robinhood_agent.config.facts_rules import facts_rules_from
+from wheelta_robinhood_agent.config.facts_rules import facts_rules_from, pretrade_rules_from
 from wheelta_robinhood_agent.config.rules import LoadedRules
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.account import AgenticEligibility
@@ -543,6 +544,11 @@ def build_session_options(
         mignon_limits=limits,
         mignon_models=settings.mignon_models,
         output_gate=output_gate,
+        pretrade_gate=PretradeGate(
+            evidence=lambda: load_run_evidence(deps.conn, deps.run_id),
+            rules=pretrade_rules_from(deps.rules),
+            clock=deps.clock,
+        ),
     )
     facts_service = DecisionFactsService(
         conn=deps.conn,

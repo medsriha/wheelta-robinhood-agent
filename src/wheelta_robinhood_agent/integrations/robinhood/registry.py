@@ -12,7 +12,9 @@ from wheelta_robinhood_agent.integrations.registry import ToolRegistry, make_reg
 SERVER_NAME = "robinhood"
 
 # ADR-0006: the only Tier X tools the agent may ever call, and only in armed live mode.
-LIVE_ORDER_TOOLS = ("review_option_order", "place_option_order", "cancel_option_order")
+# ADR-0048: the order tool that pre-trade validation gates.
+PLACE_ORDER_TOOL = "place_option_order"
+LIVE_ORDER_TOOLS = ("review_option_order", PLACE_ORDER_TOOL, "cancel_option_order")
 
 _TIER_R = (
     # account and portfolio
