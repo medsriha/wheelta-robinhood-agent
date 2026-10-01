@@ -17,7 +17,7 @@ from wheelta_robinhood_agent.integrations.wheelta.board_filters import (
 RULES = load_rules().rules
 
 EXPECTED_CURRENT = [
-    {"field": "contract.dte", "op": "gte", "value": 1},
+    {"field": "contract.dte", "op": "gte", "value": 3},
     {"field": "contract.dte", "op": "lte", "value": 45},
     {"field": "contract.greeks.delta", "op": "lte", "value": -0.15},
     {"field": "contract.greeks.delta", "op": "gte", "value": -0.3},

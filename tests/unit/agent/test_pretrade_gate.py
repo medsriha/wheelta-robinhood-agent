@@ -81,7 +81,7 @@ def sto(option_id: str = "inst-1") -> dict[str, Any]:
 def test_the_shipped_rules_map_to_the_owner_values() -> None:
     assert RULES.min_cushion_ratio == D("0.04")
     assert RULES.min_annualized_yield_ratio == D("0.25")
-    assert (RULES.min_dte, RULES.max_dte) == (1, 45)
+    assert (RULES.min_dte, RULES.max_dte) == (3, 45)
     assert (RULES.min_abs_delta, RULES.max_abs_delta) == (D("0.15"), D("0.30"))
 
 

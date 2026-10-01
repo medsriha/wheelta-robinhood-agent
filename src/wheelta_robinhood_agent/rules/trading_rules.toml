@@ -97,7 +97,7 @@ notes = [
   "Apply min_dte, max_dte, min_abs_delta, max_abs_delta, min_cushion_ratio, and min_annualized_yield_ratio while screening and selecting candidates, not only before placing. Quote both the option and its underlying, then read the dte, cushion_ratio, and annualized_yield_on_collateral_ratio metrics from the decision-facts tool and delta from the live option quote. A candidate that fails any of them, or whose value is missing, is not selectable; do not carry it into the order procedure.",
   "Pre-trade validation: code checks those six filters again on every sell-to-open leg of place_option_order, from the latest option and underlying quotes recorded in this run within data_quality.freshness.option_quote_max_age_seconds and equity_quote_max_age_seconds. A failed, stale, or missing value denies the order, and the denial names each failed check with its value and bound. The limit price does not change these values.",
 ]
-min_dte = 1 # owner, 2026-09-30 (ADR-0054): weeklies in their last week; was 7
+min_dte = 3 # owner, 2026-09-30 (ADR-0054): was 7; 1 considered, then set to 3
 max_dte = 45 # the board's own gates: DTE 1-45, |delta| 0.15-0.35
 min_abs_delta = "0.15"
 max_abs_delta = "0.30"
@@ -191,8 +191,9 @@ evaluated = ""
 
 [[management.rules]]
 id = 3
-condition = "Earnings before expiration that was not known at entry."
-action = "CLOSE if events.earnings_exclusion excludes it; otherwise HOLD."
+# Owner, 2026-09-30 (ADR-0054): consider buying to close when needed; no longer automatic.
+condition = "An earnings date on or before expiration that was not known at entry, including an estimated date that moved earlier."
+action = "agent_discretion: buy to close (CLOSE, or close part with management.close_quantity) when the earnings risk to this position is material; otherwise HOLD. Weigh the cushion and delta now, how far the underlying has moved on recent earnings, the buyback ask against the premium left, and whether the date is confirmed or estimated. State these and your choice in the rationale. Never ROLL into an expiration that still includes the earnings date."
 evaluated = ""
 
 [[management.rules]]
@@ -343,6 +344,7 @@ notes = [
   "The scheduler checks every 5 minutes, so a session starts at the first check at or after the chosen time. It never starts earlier.",
   "next_run null, or a missing or invalid final output, schedules the next session fallback_next_run_minutes after this run started, moved into the session the same way.",
   "Nothing else starts a session: price alerts and order fills do not wake you. Choose a time that leaves room to manage open positions and working orders.",
+  "While you hold a short option whose earnings date falls on or before its expiration, choose a next_run before that report (before the open for a pre-market report), so you can decide whether to buy it back.",
 ]
 fallback_next_run_minutes = 60
 max_next_run_gap_hours = 48

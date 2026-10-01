@@ -210,17 +210,18 @@ SHIPPED = pretrade_rules_from(load_rules())
 @pytest.mark.parametrize(
     ("at", "dte", "status"),
     [
-        (datetime(2026, 9, 24, 15, 0, tzinfo=UTC), 1, CheckStatus.PASS),  # Thu 11:00 ET
-        (datetime(2026, 9, 25, 3, 30, tzinfo=UTC), 1, CheckStatus.PASS),  # Thu 23:30 ET
-        (datetime(2026, 9, 25, 13, 30, tzinfo=UTC), 0, CheckStatus.FAIL),  # Fri 09:30 ET
+        (datetime(2026, 9, 22, 15, 0, tzinfo=UTC), 3, CheckStatus.PASS),  # Tue 11:00 ET
+        (datetime(2026, 9, 23, 3, 30, tzinfo=UTC), 3, CheckStatus.PASS),  # Tue 23:30 ET
+        (datetime(2026, 9, 23, 13, 30, tzinfo=UTC), 2, CheckStatus.FAIL),  # Wed 09:30 ET
     ],
 )
-def test_shipped_min_dte_admits_tomorrow_and_excludes_same_day(
+def test_shipped_min_dte_is_three_new_york_days(
     at: datetime, dte: int, status: CheckStatus
 ) -> None:
-    """ADR-0054: filters.min_dte = 1, so a weekly expiring tomorrow (New York date) is
-    allowed and a 0DTE contract is not."""
-    assert SHIPPED.min_dte == 1
+    """ADR-0054: filters.min_dte = 3, counted in New York calendar days: a Friday expiry
+    is allowed through Tuesday (even late evening, already Wednesday in UTC) and not from
+    Wednesday on."""
+    assert SHIPPED.min_dte == 3
     lg = leg(
         inst=instrument(OccSymbol.parse("XYZ   260925P00073000")).model_copy(
             update={"as_of": at - timedelta(seconds=5)}
@@ -232,9 +233,9 @@ def test_shipped_min_dte_admits_tomorrow_and_excludes_same_day(
     got, value, detail = check(v, CheckName.DTE)
     assert (got, value) == (status, D(dte))
     if status is CheckStatus.PASS:
-        assert v.passed  # 1.00 x 365 / (73 x 1) = 5.0 clears the yield floor
+        assert v.passed  # 1.00 x 365 / (73 x 3) = 1.67 clears the yield floor
     else:
-        assert "below filters.min_dte 1" in detail
+        assert "below filters.min_dte 3" in detail
         assert not v.passed
 
 

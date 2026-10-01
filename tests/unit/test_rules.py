@@ -44,7 +44,7 @@ def test_real_file_loads() -> None:
     assert r.mignons.max_per_run == 12 and r.mignons.max_concurrent == 4
     assert r.mignons.max_turns_per_mignon == 40
     assert r.limits.max_collateral_per_underlying_ratio == Decimal("0.30")
-    assert (r.filters.min_dte, r.filters.max_dte) == (1, 45)
+    assert (r.filters.min_dte, r.filters.max_dte) == (3, 45)
     assert r.data_quality.freshness.screening_quote_max_age_seconds == 300
     tolerances = r.data_quality.tolerances
     assert tolerances.board_vs_live_premium_divergence_usd == Decimal("0.05")
