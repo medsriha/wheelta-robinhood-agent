@@ -18,6 +18,8 @@ from wheelta_robinhood_agent.domain.mignon_report import (
     parse_mignon_report,
     parse_report_patch,
     report_issues,
+    salvage_report,
+    web_sourced_indices,
 )
 
 
@@ -78,12 +80,23 @@ def test_malformed_reports_fail(raw: str, kind: str) -> None:
     "finding",
     [
         f("No source at all."),
-        f("The bid is 1.20.", urls=("https://news.example.com/a",)),
         f("Dup.", ("evidence:e-1", "evidence:e-1")),
     ],
 )
 def test_finding_source_rules(finding: dict[str, Any]) -> None:
     assert "value_error" in failure_kinds(json.dumps(doc(finding)))
+
+
+def test_a_number_from_a_fetched_page_is_web_sourced() -> None:
+    """ADR-0056: a digit claim may rest on a fetched page; code labels it web-sourced."""
+    r = parsed(
+        doc(
+            f("The first round is on October 4, 2026.", urls=("https://news.example.com/a",)),
+            f("The bid is 1.20.", ("evidence:e-1",)),
+            f("Management reaffirmed guidance.", urls=("https://news.example.com/b",)),
+        )
+    )
+    assert web_sourced_indices(r.report) == (0,)
 
 
 def test_check_sources_names_every_undelivered_citation() -> None:
@@ -162,7 +175,7 @@ def test_without_findings_the_last_object_is_parsed() -> None:
 def test_strict_rules_still_apply_to_the_extracted_report() -> None:
     assert failure_kinds("Report:\n" + json.dumps(doc(n=1))) == ["json_number"]
     assert failure_kinds("Report:\n" + json.dumps(doc(extra="x"))) == ["extra_forbidden"]
-    uncited = json.dumps(doc(f("Last trade 22.23.", urls=("https://example.com/q",))))
+    uncited = json.dumps(doc(f("Last trade 22.23.")))
     assert failure_kinds("Report:\n" + uncited) == ["value_error"]
 
 
@@ -235,6 +248,58 @@ def test_prose_around_a_patch_is_dropped() -> None:
 def test_report_issues_are_located_by_finding() -> None:
     data = doc(f("Fine.", ("evidence:a",)), f("Cites nothing."), f("Old.", ("evidence:z",)))
     locs = [i.loc for i in report_issues(data, {"evidence:a"}, set())]
-    assert locs == ["findings.1"]  # schema issues come first; source checks need a valid report
+    # ADR-0056: each finding is checked on its own, so both problems are found at once.
+    assert locs == ["findings.1", "findings.2.refs"]
     fixed = doc(f("Fine.", ("evidence:a",)), f("Old.", ("evidence:z",)))
     assert [i.loc for i in report_issues(fixed, {"evidence:a"}, set())] == ["findings.1.refs"]
+    assert [i.loc for i in report_issues({**fixed, "extra": "x"}, {"evidence:a"}, set())] == [
+        "findings.1.refs",
+        "extra",
+    ]
+
+
+def test_salvage_keeps_valid_findings_and_drops_the_rest_by_original_index() -> None:
+    data = doc(
+        f("Fine.", ("evidence:a",)),
+        f("Cites nothing."),
+        f("Old.", ("evidence:z",)),
+        f("On October 4.", urls=("https://n.example/x",)),
+        f("Unfetched page.", urls=("https://n.example/y",)),
+    )
+    out = salvage_report(data, {"evidence:a"}, {"https://n.example/x"})
+    assert out.report is not None and out.fatal == ()
+    assert [x.claim for x in out.report.findings] == ["Fine.", "On October 4."]
+    assert out.origins == (0, 3)
+    assert [(d.index, d.reasons) for d in out.dropped] == [
+        (1, ("Value error, a finding must cite at least one ref or web_url",)),
+        (2, ("a cited ref was not delivered to this Mignon",)),
+        (4, ("a cited URL was not fetched by this Mignon (or returned an HTTP error)",)),
+    ]
+    assert all("Cites nothing" not in r for d in out.dropped for r in d.reasons)
+
+
+def test_salvage_maps_patched_findings_to_their_original_index() -> None:
+    data = doc(f("Kept.", ("evidence:a",)), f("Bad.", ("evidence:z",)))
+    out = salvage_report(data, {"evidence:a"}, set(), origins=(2, 5))
+    assert out.origins == (2,) and [d.index for d in out.dropped] == [5]
+    with pytest.raises(ValueError):
+        salvage_report(data, {"evidence:a"}, set(), origins=(1,))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {**doc(f("Fine.", ("evidence:a",))), "extra": "x"},
+        {"task": "t", "findings": "not a list", "gaps": [], "follow_up_questions": []},
+        {"findings": []},
+    ],
+)
+def test_a_problem_outside_the_findings_rejects_the_whole_report(data: dict[str, Any]) -> None:
+    out = salvage_report(data, {"evidence:a"}, set())
+    assert out.report is None and out.fatal and out.origins == ()
+
+
+def test_salvage_of_only_bad_findings_is_an_empty_report() -> None:
+    out = salvage_report(doc(f("No source."), f("Nope.")), set(), set())
+    assert out.report is not None and out.report.findings == ()
+    assert [d.index for d in out.dropped] == [0, 1]

@@ -1416,22 +1416,48 @@ def test_follow_up_mignon_may_cite_refs_handed_over_by_the_orchestrator(
     assert h.run(script) == 0, h.notifier.alert_kinds()
 
 
-def test_invalid_mignon_report_is_missing_research_not_a_failed_run(
+def test_an_unsupported_finding_is_dropped_and_never_reaches_the_orchestrator(
     harness: Callable[..., Harness],
 ) -> None:
+    """ADR-0056: a finding citing an invented ref is dropped (index and reason only); its
+    claim never reaches the orchestrator, and the run goes on."""
+
     async def liar(model: FakeModel) -> str:
         return mignon_report("Screen.", ("The bid is 9.99.", ["evidence:invented"]))
 
     async def script(model: FakeModel) -> str | None:
         turn = await model.spawn(MARKET, "Screen AAPL puts.", liar)
-        assert turn.output["kind"] == "missing"
-        assert any("not delivered" in g for g in turn.output["gaps"])
+        assert turn.output["kind"] == "validated"
+        assert turn.output["data"]["report"]["findings"] == []
+        (dropped,) = turn.output["data"]["dropped_findings"]
+        assert dropped["index"] == 0 and "not delivered" in dropped["reasons"][0]
         return await dry_run_script(model)
 
     h = harness()
     assert h.run(script) == 0, h.notifier.alert_kinds()
     (cli,) = h.clis
-    assert "9.99" not in repr(cli.model_inputs[0])  # the unsupported claim never reached it
+    assert "9.99" not in repr(cli.model_inputs)  # the unsupported claim never reached it
+    with h.conn() as c:
+        spawn = tool_call_records(c, h.run_id)[0]
+    assert spawn.identity.tool == "Agent" and spawn.status is ToolCallStatus.SUCCEEDED
+
+
+def test_a_report_that_is_not_a_report_is_missing_research_not_a_failed_run(
+    harness: Callable[..., Harness],
+) -> None:
+    async def rambler(model: FakeModel) -> str:
+        return "I looked around and the bid seemed to be 9.99."
+
+    async def script(model: FakeModel) -> str | None:
+        turn = await model.spawn(MARKET, "Screen AAPL puts.", rambler)
+        assert turn.output["kind"] == "missing"
+        assert any("not one JSON object" in g for g in turn.output["gaps"])
+        return await dry_run_script(model)
+
+    h = harness()
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    (cli,) = h.clis
+    assert "9.99" not in repr(cli.model_inputs)
     with h.conn() as c:
         spawn = tool_call_records(c, h.run_id)[0]
     assert spawn.identity.tool == "Agent" and spawn.status is ToolCallStatus.FAILED

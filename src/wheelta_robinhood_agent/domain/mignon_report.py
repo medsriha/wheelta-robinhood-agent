@@ -12,12 +12,19 @@ Rules (each checked here, in pure code):
 
 - extra fields are rejected on every object; JSON numbers are rejected anywhere;
 - every finding cites at least one source: a reference or a fetched URL;
-- a claim containing a digit needs at least one reference (web pages never supply prices,
-  strikes, premiums, Greeks, positions, or dates of record: CLAUDE.md §11);
+- ADR-0056: a claim containing a digit needs a reference or a fetched URL. A finding whose
+  only sources are web pages is `web_sourced` (`web_sourced_indices`); the rules still forbid
+  a web page to supply prices, strikes, premiums, Greeks, positions, or buying power
+  (CLAUDE.md §11), and orders use only the orchestrator's own quotes and decision facts;
 - references are `evidence:` or `candidate:` strings issued by code; a cited reference or
   URL that was not delivered to this Mignon is an issue.
+
+ADR-0056: `salvage_report` drops only the findings that break these rules (each recorded with
+its reasons, never its claim text) and keeps the rest; a problem outside the findings still
+rejects the whole report.
 """
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Annotated, Final, Literal, Self
@@ -36,7 +43,10 @@ SCHEMA_VERSION: Final = 1
 REF_PREFIXES: Final = ("evidence:", "candidate:")
 
 Text = Annotated[StrictStr, StringConstraints(min_length=1, max_length=2000)]
-SourceRef = Annotated[StrictStr, StringConstraints(pattern=r"^(evidence|candidate):\S+$")]
+# Code-issued refs are a prefix plus a UUID-like id, far below this bound (ADR-0056).
+SourceRef = Annotated[
+    StrictStr, StringConstraints(pattern=r"^(evidence|candidate):\S+$", max_length=200)
+]
 WebUrl = Annotated[StrictStr, StringConstraints(pattern=r"^https://\S+$", max_length=2000)]
 
 
@@ -53,9 +63,12 @@ class Finding(DomainModel):
         require_unique(self.web_urls, "web_url")
         if not self.refs and not self.web_urls:
             raise ValueError("a finding must cite at least one ref or web_url")
-        if not self.refs and any(ch.isdigit() for ch in self.claim):
-            raise ValueError("a claim containing a number must cite a code-issued ref")
         return self
+
+    @property
+    def web_sourced(self) -> bool:
+        """A claim with a number whose only sources are fetched web pages (ADR-0056)."""
+        return not self.refs and any(ch.isdigit() for ch in self.claim)
 
 
 class MignonReport(DomainModel):
@@ -129,26 +142,34 @@ def check_report_sources(
     run; `fetched_urls` the URLs of its successful WebFetch calls. Sorted, so deterministic.
     """
     refs, urls = frozenset(delivered_refs), frozenset(fetched_urls)
-    issues: list[ParseIssue] = []
-    for index, finding in enumerate(report.findings):
-        issues.extend(
-            ParseIssue(
-                loc=f"findings.{index}.refs",
-                message=f"ref not delivered to this Mignon: {r}",
-                kind="unknown_ref",
-            )
-            for r in sorted(set(finding.refs) - refs)
+    return tuple(
+        issue
+        for index, finding in enumerate(report.findings)
+        for issue in _finding_source_issues(index, finding, refs, urls)
+    )
+
+
+def _finding_source_issues(
+    index: int, finding: Finding, refs: frozenset[str], urls: frozenset[str]
+) -> list[ParseIssue]:
+    """Cited refs not delivered to the Mignon and URLs it did not fetch, for one finding."""
+    issues = [
+        ParseIssue(
+            loc=f"findings.{index}.refs",
+            message=f"ref not delivered to this Mignon: {r}",
+            kind="unknown_ref",
         )
-    for index, finding in enumerate(report.findings):
-        issues.extend(
-            ParseIssue(
-                loc=f"findings.{index}.web_urls",
-                message=f"URL not fetched by this Mignon: {u}",
-                kind="unknown_url",
-            )
-            for u in sorted(set(finding.web_urls) - urls)
+        for r in sorted(set(finding.refs) - refs)
+    ]
+    issues.extend(
+        ParseIssue(
+            loc=f"findings.{index}.web_urls",
+            message=f"URL not fetched by this Mignon: {u}",
+            kind="unknown_url",
         )
-    return tuple(issues)
+        for u in sorted(set(finding.web_urls) - urls)
+    )
+    return issues
 
 
 # -- ADR-0047: repairing a report by patch ---------------------------------------------------
@@ -259,7 +280,9 @@ def apply_report_patch(
             dropped.add(p.finding)
             continue
         current = merged[i] if isinstance(merged[i], dict) else {}
-        updated = dict(current)
+        # ADR-0056: only the finding fields survive a patch, so a stray key the Mignon added
+        # cannot keep the finding invalid through every round.
+        updated = {k: current[k] for k in _FINDING_FIELDS if k in current}
         if p.claim is not None:
             updated["claim"] = p.claim
         if p.refs is not None:
@@ -287,11 +310,137 @@ def original_report(data: dict[str, object]) -> PatchedReport:
 def report_issues(
     data: dict[str, object], delivered_refs: Iterable[str], fetched_urls: Iterable[str]
 ) -> tuple[ParseIssue, ...]:
-    """Schema, citation, and source issues of a report object, with `findings.<i>` locs."""
+    """Schema, citation, and source issues of a report object, with `findings.<i>` locs.
+
+    ADR-0056: each finding is checked on its own (schema and sources together), so every
+    finding's problems are found in one pass rather than hidden behind another finding's
+    schema error. Issues outside the findings keep their own locs.
+    """
+    refs, urls = frozenset(delivered_refs), frozenset(fetched_urls)
+    findings = data.get("findings")
+    issues: list[ParseIssue] = []
+    top = data
+    if isinstance(findings, list):
+        top = {**data, "findings": []}
+        for index, item in enumerate(findings):
+            try:
+                finding = Finding.model_validate(item)
+            except ValidationError as exc:
+                issues.extend(
+                    ParseIssue(
+                        loc=f"findings.{index}" + (f".{i.loc}" if i.loc else ""),
+                        message=i.message,
+                        kind=i.kind,
+                    )
+                    for i in validation_issues(exc)
+                )
+            except RecursionError as exc:
+                issues.append(
+                    ParseIssue(loc=f"findings.{index}", message=str(exc), kind="too_deep")
+                )
+            else:
+                issues.extend(_finding_source_issues(index, finding, refs, urls))
     try:
-        report = MignonReport.model_validate(data)
+        MignonReport.model_validate(top)
     except ValidationError as exc:
-        return validation_issues(exc)
+        issues.extend(validation_issues(exc))
     except RecursionError as exc:
-        return (ParseIssue(loc="", message=str(exc), kind="too_deep"),)
-    return check_report_sources(report, delivered_refs, fetched_urls)
+        issues.append(ParseIssue(loc="", message=str(exc), kind="too_deep"))
+    return tuple(issues)
+
+
+# -- ADR-0056: keep the valid part of a report -------------------------------------------------
+
+_FINDING_AT: Final = re.compile(r"^findings\.(\d+)(?:\.|$)")
+
+
+_FINDING_FIELDS: Final = ("claim", "refs", "web_urls")
+_SAFE_REASONS: Final = {
+    "unknown_ref": "a cited ref was not delivered to this Mignon",
+    "unknown_url": "a cited URL was not fetched by this Mignon (or returned an HTTP error)",
+    "extra_forbidden": "the finding has a field other than claim, refs, and web_urls",
+}
+_ECHO: Final = re.compile(r"^(.*?\bduplicate [a-z_ ]+?): .*$", re.DOTALL)
+MAX_REASON_CHARS: Final = 200
+
+
+def _safe_reason(issue: ParseIssue) -> str:
+    """A dropped finding's reason without any text the Mignon wrote (refs, URLs, values): the
+    reason travels to the orchestrator, the claim and its citations do not (ADR-0056)."""
+    if issue.kind in _SAFE_REASONS:
+        return _SAFE_REASONS[issue.kind]
+    reason = _ECHO.sub(r"\1", issue.message)
+    return reason[:MAX_REASON_CHARS]
+
+
+@dataclass(frozen=True, slots=True)
+class DroppedFinding:
+    """A finding code removed from a report: its index in the report the Mignon sent (the
+    original, before any patch) and why. The claim text is not kept: it was not supported."""
+
+    index: int
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SalvagedReport:
+    """The report with only valid findings, or None with the problems outside any finding."""
+
+    report: MignonReport | None
+    fatal: tuple[ParseIssue, ...]
+    dropped: tuple[DroppedFinding, ...]
+    origins: tuple[int, ...]  # original index of each kept finding
+
+
+def salvage_report(
+    data: dict[str, object],
+    delivered_refs: Iterable[str],
+    fetched_urls: Iterable[str],
+    origins: tuple[int, ...] | None = None,
+) -> SalvagedReport:
+    """Drop every finding that fails the schema, citation, or source rules; keep the rest.
+
+    `origins` maps each finding of `data` to its index in the original report (a patched
+    report's `PatchedReport.origins`); identity by default. Any issue not located at one finding
+    (a missing field, a bad top level) is fatal: no report. Pure and deterministic.
+    """
+    refs, urls = frozenset(delivered_refs), frozenset(fetched_urls)
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        return SalvagedReport(None, report_issues(data, refs, urls), (), ())
+    current = list(findings)
+    kept = list(origins) if origins is not None else list(range(len(current)))
+    if len(kept) != len(current):
+        raise ValueError("origins must name every finding")
+    dropped: list[DroppedFinding] = []
+    # Each pass removes at least one finding, so this ends after len(findings) + 1 passes.
+    for _ in range(len(current) + 1):
+        issues = report_issues({**data, "findings": current}, refs, urls)
+        if not issues:
+            report = MignonReport.model_validate({**data, "findings": current})
+            return SalvagedReport(report, (), tuple(dropped), tuple(kept))
+        located: dict[int, list[ParseIssue]] = {}
+        fatal: list[ParseIssue] = []
+        for issue in issues:
+            match = _FINDING_AT.match(issue.loc)
+            if match is None or int(match.group(1)) >= len(current):
+                fatal.append(issue)
+            else:
+                located.setdefault(int(match.group(1)), []).append(issue)
+        if fatal:
+            return SalvagedReport(None, tuple(fatal), tuple(dropped), ())
+        dropped.extend(
+            DroppedFinding(
+                index=kept[i],
+                reasons=tuple(dict.fromkeys(_safe_reason(issue) for issue in located[i])),
+            )
+            for i in sorted(located)
+        )
+        current = [f for i, f in enumerate(current) if i not in located]
+        kept = [o for i, o in enumerate(kept) if i not in located]
+    raise AssertionError("unreachable: every pass drops a finding")  # pragma: no cover
+
+
+def web_sourced_indices(report: MignonReport) -> tuple[int, ...]:
+    """Indexes of findings whose number rests only on fetched web pages (ADR-0056)."""
+    return tuple(i for i, f in enumerate(report.findings) if f.web_sourced)

@@ -23,15 +23,17 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # v13 (ADR-0050): finish with no order working; order cleanup turns and wind-down. v14
 # (ADR-0052): execution_refs cite each order call's delivered `order_call_ref`. v15
 # (ADR-0053): discovery rounds and the rendered work deadline. v16 (ADR-0055): each position's
-# entry_note is weighed before a hold, close, or roll.
+# entry_note is weighed before a hold, close, or roll. v17 (ADR-0056): Mignon reports carry
+# dropped and web-sourced findings.
 ACTIVE_PROMPT_ID = "wheel_agent"
-ACTIVE_PROMPT_VERSION = 16
+ACTIVE_PROMPT_VERSION = 17
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {
-        MignonType.MARKET: ("mignon_market", 4),  # ADR-0053: scanner beside the board
-        MignonType.COMPANY: ("mignon_company", 2),
-        MignonType.MACRO: ("mignon_macro", 2),
+        # ADR-0056: web-sourced numbers, absences as gaps, dropped findings, fetch hygiene.
+        MignonType.MARKET: ("mignon_market", 5),  # v4, ADR-0053: scanner beside the board
+        MignonType.COMPANY: ("mignon_company", 3),
+        MignonType.MACRO: ("mignon_macro", 3),
     }
 )
 

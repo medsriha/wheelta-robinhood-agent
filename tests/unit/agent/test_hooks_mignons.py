@@ -276,15 +276,12 @@ def test_valid_report_is_delivered_as_validated_envelope() -> None:
 @pytest.mark.parametrize(
     ("text", "fragment"),
     [
-        (report(finding("Unsupported.", ["evidence:never-delivered"])), "not delivered"),
-        (report(finding("Bid is 1.20.", urls=[URL])), "must cite a code-issued ref"),
-        (report(finding("A claim with no source.")), "at least one ref"),
         ("Here is my report: ...", "Expecting value"),
         (
             '{"task": "t", "findings": [], "gaps": [], "follow_up_questions": [], "n": 1}',
             "not allowed",
         ),
-        (report(finding("Page says so.", urls=[URL])), "not fetched"),
+        ('["a", "list"]', "top level must be an object"),
     ],
 )
 def test_invalid_report_becomes_missing_envelope(text: str, fragment: str) -> None:
@@ -300,13 +297,43 @@ def test_invalid_report_becomes_missing_envelope(text: str, fragment: str) -> No
     assert outcomes[-1]["status"] is ToolCallStatus.FAILED
 
 
+@pytest.mark.parametrize(
+    ("bad", "fragment"),
+    [
+        (finding("Unsupported.", ["evidence:never-delivered"]), "not delivered"),
+        (finding("A claim with no source."), "at least one ref"),
+        (finding("Page says so.", urls=[URL]), "not fetched"),
+        (finding("Bid is 1.20.", urls=[URL]), "not fetched"),
+    ],
+)
+def test_an_invalid_finding_is_dropped_and_the_rest_is_delivered(
+    bad: dict[str, Any], fragment: str
+) -> None:
+    """ADR-0056: only the failing finding is removed (by index, without its claim); the valid
+    findings still reach the orchestrator and the original text stays on record."""
+    s = session()
+    spawn_and_research(s)
+    text = report(finding("The put bid is 1.20.", [EVIDENCE]), bad)
+    out = s.post("Agent", agent_response(text), use_id="toolu_agent")
+    envelope = delivered_envelope(out)
+    assert envelope["kind"] == "validated"
+    assert [f["claim"] for f in envelope["data"]["report"]["findings"]] == ["The put bid is 1.20."]
+    (dropped,) = envelope["data"]["dropped_findings"]
+    assert dropped["index"] == 1 and any(fragment in r for r in dropped["reasons"])
+    assert bad["claim"] not in json.dumps(envelope)
+    assert "store_raw_invalid" in s.rec.names()
+    outcomes = [kw for n, kw in s.rec.events if n == "outcome"]
+    assert outcomes[-1]["status"] is ToolCallStatus.SUCCEEDED
+
+
 def test_ref_delivered_to_another_mignon_is_not_citable() -> None:
     s = session()
     research(s, COMPANY, use_id="toolu_c")  # the company Mignon saw EVIDENCE
     assert_ok(s.pre("Agent", SPAWN, use_id="toolu_agent"))
     text = report(finding("Bid is 1.20.", [EVIDENCE]))
     envelope = delivered_envelope(s.post("Agent", agent_response(text), use_id="toolu_agent"))
-    assert envelope["kind"] == "missing"
+    assert envelope["data"]["report"]["findings"] == []
+    assert "not delivered" in envelope["data"]["dropped_findings"][0]["reasons"][0]
 
 
 def test_ref_handed_over_in_the_task_is_citable() -> None:
@@ -317,6 +344,115 @@ def test_ref_handed_over_in_the_task_is_citable() -> None:
     text = report(finding("Spread of 0.10 per the quote.", [EVIDENCE]))
     envelope = delivered_envelope(s.post("Agent", agent_response(text), use_id="toolu_agent"))
     assert envelope["kind"] == "validated"
+
+
+def test_a_number_from_a_fetched_page_is_kept_and_labelled_web_sourced() -> None:
+    """ADR-0056: the 2026-09-30 election date, cited to a fetched article, now survives."""
+    s = session()
+    spawn = {**SPAWN, "subagent_type": COMPANY_T}
+    assert_ok(s.pre("Agent", spawn, use_id="toolu_agent"))
+    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
+    s.post("WebFetch", {"url": URL, "code": 200, "result": "page"}, use_id="toolu_f")
+    text = report(finding("The first round is on October 4, 2026.", urls=[URL]))
+    out = s.post("Agent", agent_response(text, COMPANY_ID, COMPANY_T), use_id="toolu_agent")
+    envelope = delivered_envelope(out)
+    assert envelope["kind"] == "validated"
+    assert envelope["data"]["web_sourced_findings"] == [0]
+    assert envelope["data"]["dropped_findings"] == []
+
+
+@pytest.mark.parametrize("code", [403, 404, 500, "403", None])
+def test_a_refused_fetch_is_failed_uncached_and_not_citable(code: Any) -> None:
+    """ADR-0056: a non-2xx WebFetch delivered no page: recorded failed, never captured into the
+    web cache, never a fetched URL, and the session continues."""
+    captured: list[Any] = []
+    s = session(web_capture=lambda *args: captured.append(args))
+    spawn = {**SPAWN, "subagent_type": COMPANY_T}
+    assert_ok(s.pre("Agent", spawn, use_id="toolu_agent"))
+    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
+    out = s.post("WebFetch", {"url": URL, "code": code, "bytes": 0, "result": ""}, use_id="toolu_f")
+    assert "continue_" not in out and not s.deps.run_control.stop_requested
+    outcome = [kw for n, kw in s.rec.events if n == "outcome"][-1]
+    assert outcome["status"] is ToolCallStatus.FAILED and f"HTTP {code}" in outcome["reason"]
+    assert captured == []
+    text = report(finding("Page says so.", urls=[URL]))
+    out = s.post("Agent", agent_response(text, COMPANY_ID, COMPANY_T), use_id="toolu_agent")
+    reasons = delivered_envelope(out)["data"]["dropped_findings"][0]["reasons"]
+    assert any("not fetched" in r for r in reasons)
+
+
+def test_a_refused_or_timed_out_url_is_not_fetched_again_this_run() -> None:
+    """ADR-0056: by any Mignon, after a non-2xx result or a failed (timed-out) call."""
+    from wheelta_robinhood_agent.agent.hooks import REFUSED_FETCH_DENIAL
+
+    s = session()
+    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
+    s.post("WebFetch", {"url": URL, "code": 403, "bytes": 0, "result": ""}, use_id="toolu_f")
+    out = s.pre("WebFetch", {"url": URL, "prompt": "again"}, use_id="toolu_g", **COMPANY)
+    assert denied_reason(out) == REFUSED_FETCH_DENIAL
+    slow = "https://slow.example.com/page"
+    assert_ok(s.pre("WebFetch", {"url": slow, "prompt": "q"}, use_id="toolu_h", **COMPANY))
+    s.fail("WebFetch", use_id="toolu_h", error="timeout of 60000ms exceeded")
+    other = {"agent_id": "a-company-2", "agent_type": COMPANY_T}
+    out = s.pre("WebFetch", {"url": slow, "prompt": "q"}, use_id="toolu_i", **other)
+    assert denied_reason(out) == REFUSED_FETCH_DENIAL
+
+
+def test_a_mignon_may_fetch_a_page_another_mignon_fetched_but_not_repeat_its_own() -> None:
+    """ADR-0056: a fetch is citable only by the Mignon that made it, so the cache does not deny
+    another Mignon's fetch of the same page; a Mignon's own repeat is denied."""
+    from wheelta_robinhood_agent.agent.hooks import REPEAT_FETCH_DENIAL
+
+    s = session(web_precheck=lambda tool, args: "identical fetch recorded")
+    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
+    s.post("WebFetch", {"url": URL, "code": 200, "result": "page"}, use_id="toolu_f")
+    out = s.pre("WebFetch", {"url": URL, "prompt": "again"}, use_id="toolu_g", **COMPANY)
+    assert denied_reason(out) == REPEAT_FETCH_DENIAL
+    other = {"agent_id": "a-company-2", "agent_type": COMPANY_T}
+    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_h", **other))
+
+
+def test_review_and_delivery_agree_on_refs_handed_over_in_the_task(tmp_path: Path) -> None:
+    """ADR-0056: a run ref this Mignon's task did not name is flagged by the review (so it can
+    be patched), not only dropped at delivery."""
+    s = session()
+    research(s, COMPANY, use_id="toolu_c")  # EVIDENCE delivered to another Mignon only
+    assert_ok(s.pre("Agent", SPAWN, use_id="toolu_agent"))
+    original = report(finding("Bid is 1.20.", [EVIDENCE]))
+    out = stop_hook(s, transcript(tmp_path, original))
+    assert out["decision"] == "block" and "findings.0.refs" in out["reason"]
+
+
+def test_a_patch_cannot_keep_a_stray_field_on_a_finding(tmp_path: Path) -> None:
+    """ADR-0056: a patched finding keeps only claim, refs, and web_urls."""
+    s = session()
+    spawn_and_research(s)
+    bad = {**finding("The put bid is 1.20.", [EVIDENCE]), "note": "x"}
+    original = json.dumps({"task": "t", "findings": [bad], "gaps": [], "follow_up_questions": []})
+    out = stop_hook(s, transcript(tmp_path, original))
+    assert out["decision"] == "block" and "findings.0" in out["reason"]
+    patch = json.dumps({"patches": [{"finding": "0", "refs": [EVIDENCE]}]})
+    assert stop_hook(s, transcript(tmp_path, original, patch)) == {}
+    envelope = delivered_envelope(s.post("Agent", agent_response(patch), use_id="toolu_agent"))
+    assert envelope["kind"] == "validated" and envelope["data"]["dropped_findings"] == []
+    assert envelope["data"]["report"]["findings"][0]["claim"] == "The put bid is 1.20."
+
+
+def test_dropped_reasons_never_echo_the_mignons_text() -> None:
+    """ADR-0056: refs, URLs, and duplicate values are summarized, not repeated."""
+    s = session()
+    spawn_and_research(s)
+    text = report(
+        finding("Kept.", [EVIDENCE]),
+        finding("X.", ["evidence:Brazil_votes_Oct_4"]),
+        finding("Y.", urls=["https://news.example.com/secret-slug"]),
+        finding("Z.", [EVIDENCE, EVIDENCE]),
+    )
+    envelope = delivered_envelope(s.post("Agent", agent_response(text), use_id="toolu_agent"))
+    dumped = json.dumps(envelope["data"]["dropped_findings"])
+    assert [d["index"] for d in envelope["data"]["dropped_findings"]] == [1, 2, 3]
+    for echoed in ("Brazil_votes", "secret-slug", EVIDENCE):
+        assert echoed not in dumped
 
 
 def test_fetched_url_is_citable_by_the_mignon_that_fetched_it() -> None:
@@ -471,7 +607,7 @@ def test_patch_indexes_stay_those_of_the_original_report(tmp_path: Path) -> None
     assert envelope["data"]["repair"]["finding_origins"] == [1]
 
 
-def test_repairs_stop_after_the_limit_and_the_report_stays_invalid(tmp_path: Path) -> None:
+def test_repairs_stop_after_the_limit_and_the_finding_is_dropped(tmp_path: Path) -> None:
     s = session()
     spawn_and_research(s)
     original = report(finding("No source."))
@@ -480,8 +616,10 @@ def test_repairs_stop_after_the_limit_and_the_report_stays_invalid(tmp_path: Pat
     assert stop_hook(s, transcript(tmp_path, useless))["decision"] == "block"
     assert stop_hook(s, transcript(tmp_path, useless)) == {}  # MAX_MIGNON_REPAIRS reached
     envelope = delivered_envelope(s.post("Agent", agent_response(useless), use_id="toolu_agent"))
-    assert envelope["kind"] == "missing"
-    assert any("at least one ref" in g for g in envelope["gaps"])
+    # ADR-0056: the unsourced finding is dropped; an empty report is still a report.
+    assert envelope["kind"] == "validated" and envelope["data"]["report"]["findings"] == []
+    (dropped,) = envelope["data"]["dropped_findings"]
+    assert dropped["index"] == 0 and "at least one ref" in dropped["reasons"][0]
 
 
 def test_a_bad_patch_is_named_in_the_next_feedback(tmp_path: Path) -> None:

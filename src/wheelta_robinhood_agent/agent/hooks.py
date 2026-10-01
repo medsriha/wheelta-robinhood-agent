@@ -109,14 +109,15 @@ from wheelta_robinhood_agent.domain.enums import (
 from wheelta_robinhood_agent.domain.gating import check_venue, executes_orders, order_venue
 from wheelta_robinhood_agent.domain.mignon_report import (
     REF_PREFIXES,
+    DroppedFinding,
     PatchedReport,
     apply_report_patch,
-    check_report_sources,
     extract_report_object,
     original_report,
-    parse_mignon_report,
     parse_report_patch,
     report_issues,
+    salvage_report,
+    web_sourced_indices,
 )
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry, ToolSpec
@@ -547,6 +548,37 @@ def _refs_in(value: object, out: set[str]) -> None:
             _refs_in(item, out)
 
 
+WEB_FETCH_TOOL: Final = "WebFetch"
+REFUSED_FETCH_DENIAL: Final = (
+    "this URL was refused (HTTP error) or timed out earlier in this run; it is not fetched "
+    "again. Look for the same facts from the company, a regulator, or another tier-1 or "
+    "tier-2 source"
+)
+REPEAT_FETCH_DENIAL: Final = (
+    "you already fetched this URL in this task; use that result and cite the URL as fetched"
+)
+
+
+def _fetch_url(tool_input: Mapping[str, Any]) -> str | None:
+    url = tool_input.get("url")
+    return url if isinstance(url, str) and url else None
+
+
+def _fetch_http_error(tool: str, response: object) -> str | None:
+    """Why a WebFetch result holds no page, or None (ADR-0056).
+
+    The pinned CLI's WebFetch result carries the HTTP status as `code` (a 403 comes back as a
+    normal result with `bytes` 0). A status outside 2xx, or a `code` that is not an integer, is
+    a failed fetch. A result without `code` is judged as before (it has no status to check).
+    """
+    if tool != WEB_FETCH_TOOL or not isinstance(response, Mapping) or "code" not in response:
+        return None
+    code = response.get("code")
+    if isinstance(code, int) and not isinstance(code, bool) and 200 <= code < 300:
+        return None
+    return f"WebFetch returned HTTP {code}: no page was retrieved"
+
+
 def _mentions(text: str, ref: str) -> bool:
     """Whether `ref` appears in `text` as a whole token (not as a prefix of a longer ref)."""
     return re.search(re.escape(ref) + r"(?![A-Za-z0-9_\-])", text) is not None
@@ -618,8 +650,9 @@ def repair_feedback(issues: list[str], attempt: int) -> str:
         "original report, as a digit string:\n"
         '{"patches": [{"finding": "1", "refs": ["evidence:..."]}, {"finding": "3", "drop": true}]}'
         "\nA patch replaces only the fields it gives (claim, refs, web_urls). Cite only refs "
-        "delivered to you and URLs you fetched; a claim with a digit needs a code-issued ref. "
-        "Drop a finding you cannot source."
+        "delivered to you and URLs you fetched (a page that returned an HTTP error was not "
+        "fetched). Drop a finding you cannot source, or move it to gaps; a finding still "
+        "unsourced after the repairs is dropped by code."
     )
 
 
@@ -672,6 +705,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     mignon_refs: dict[str, set[str]] = {}
     mignon_urls: dict[str, set[str]] = {}
     run_refs: set[str] = set()
+    # ADR-0056: URLs a WebFetch was refused (non-2xx) or failed on (timeout) this session.
+    refused_urls: set[str] = set()
     # ADR-0047: reports under repair, by Mignon `agent_id`.
     drafts: dict[str, _MignonDraft] = {}
     ws = deps.rules.workspace
@@ -793,7 +828,21 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             raise _Denied(f"{resolved.qualified} is not available to the {role.value}")
         if tier is ToolTier.D:
             check_spawn(tool_input)
-        if resolved.tool in ALLOWED_BUILTINS and deps.web_precheck is not None:
+        if resolved.tool == WEB_FETCH_TOOL:
+            # ADR-0056: a fetch is citable only by the Mignon that made it, so a page fetched
+            # elsewhere is fetched again (no cache denial); a repeat by the same Mignon, or a
+            # URL already refused or timed out this run, is denied.
+            url = _fetch_url(tool_input)
+            caller = data.get("agent_id")
+            if url is not None and url in refused_urls:
+                raise _Denied(REFUSED_FETCH_DENIAL)
+            if (
+                url is not None
+                and isinstance(caller, str)
+                and url in mignon_urls.get(caller, set())
+            ):
+                raise _Denied(REPEAT_FETCH_DENIAL)
+        elif resolved.tool in ALLOWED_BUILTINS and deps.web_precheck is not None:
             web_reason = deps.web_precheck(resolved.tool, tool_input)
             if web_reason is not None:
                 raise _Denied(web_reason)
@@ -1032,10 +1081,27 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 )
             payload = envelope.model_dump(mode="json")
             valid = envelope.kind is EnvelopeKind.VALIDATED
+            # ADR-0056: a fetch the server refused (HTTP 403, 404, 5xx...) delivered no page.
+            # It is still shown to the model (a built-in result cannot be replaced) but is
+            # recorded as failed, never cached, and never counts as a fetched URL.
+            http_error = _fetch_http_error(call.tool, data.get("tool_response")) if valid else None
+            usable = valid and http_error is None
             ref = deps.recorder.store_result(
-                call.tool_call_id, ResultKind.VALIDATED if valid else ResultKind.ERROR, payload
+                call.tool_call_id, ResultKind.VALIDATED if usable else ResultKind.ERROR, payload
             )
-            if valid:
+            if http_error is not None:
+                url = _fetch_url(call.effective_input)
+                if url is not None:
+                    refused_urls.add(url)
+                deps.recorder.outcome(
+                    call.tool_call_id,
+                    ToolCallStatus.FAILED,
+                    observed_at=now,
+                    dedup_key=_RESULT_DEDUP_KEY,
+                    reason=http_error,
+                    error_ref=ref,
+                )
+            elif valid:
                 deps.recorder.outcome(
                     call.tool_call_id,
                     ToolCallStatus.SUCCEEDED,
@@ -1052,7 +1118,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                     reason=f"result {envelope.kind.value}",
                     error_ref=ref,
                 )
-            if valid and call.builtin and deps.web_capture is not None:
+            if usable and call.builtin and deps.web_capture is not None:
                 try:
                     deps.web_capture(call.tool_call_id, call.tool, call.effective_input, payload)
                 except Exception as exc:
@@ -1086,7 +1152,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             deps.recorder.delivered(
                 call.tool_call_id, delivered_result_ref=delivered_ref, observed_at=now
             )
-            note_delivered(call, view)
+            if usable:
+                note_delivered(call, view)
         except Exception as exc:
             stop(now)
             reason = f"result validation or recording failed ({type(exc).__name__})"
@@ -1211,30 +1278,40 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 issues.append("agent type differs from the requested Mignon type")
             draft = drafts.pop(agent_id, None)
             repaired = draft is not None and draft.attempts > 0
+            report_obj: dict[str, object] | None = None
+            origins: tuple[int, ...] | None = None
             if draft is not None and repaired:
                 # ADR-0047: the merged report replaces the last reply (a patch).
-                parsed = parse_mignon_report(json.dumps(draft.report.data))
+                report_obj, origins = draft.report.data, draft.report.origins
             else:
-                parsed = parse_mignon_report(text)
+                loaded = load_strict_json(extract_report_object(text))
+                if isinstance(loaded, ParseIssue):
+                    issues.append(f"report is not one JSON object: {loaded.message}")
+                elif not isinstance(loaded[1], dict):
+                    issues.append("report is not one JSON object: top level must be an object")
+                else:
+                    report_obj = cast(dict[str, object], loaded[1])
             report_data: JsonValue = None
-            if parsed.ok:
+            dropped: tuple[DroppedFinding, ...] = ()
+            web_sourced: tuple[int, ...] = ()
+            kept: tuple[int, ...] = ()
+            if report_obj is not None:
                 prompt = call.effective_input.get("prompt")
-                handed = {
-                    r
-                    for r in parsed.report.cited_refs() & run_refs
-                    if isinstance(prompt, str) and _mentions(prompt, r)
-                }
+                handed = handed_refs(report_obj, [prompt] if isinstance(prompt, str) else [])
                 known = mignon_refs.get(agent_id, set()) | handed
-                found = check_report_sources(parsed.report, known, mignon_urls.get(agent_id, set()))
-                issues.extend(f"{i.loc}: {i.message}" if i.loc else i.message for i in found)
-                report_data = deps.redactor.redact(parsed.report.model_dump(mode="json"))
-            else:
-                issues.extend(
-                    f"{i.loc}: {i.message}"
-                    if i.loc
-                    else f"report is not one JSON object: {i.message}"
-                    for i in parsed.issues
+                # ADR-0056: invalid findings are dropped; only a problem outside the findings
+                # rejects the whole report.
+                salvaged = salvage_report(
+                    report_obj, known, mignon_urls.get(agent_id, set()), origins
                 )
+                if salvaged.report is None:
+                    issues.extend(
+                        f"{i.loc}: {i.message}" if i.loc else i.message for i in salvaged.fatal
+                    )
+                else:
+                    report_data = deps.redactor.redact(salvaged.report.model_dump(mode="json"))
+                    dropped, kept = salvaged.dropped, salvaged.origins
+                    web_sourced = web_sourced_indices(salvaged.report)
             valid = not issues
             if draft is not None and repaired:
                 # The original report and every patch stay on record (restricted evidence).
@@ -1247,7 +1324,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                         "patches": [deps.redactor.redact_text(t) for t in draft.texts[1:]],
                     },
                 )
-            elif not valid:
+            elif not valid or dropped:
                 deps.recorder.store_result(
                     call.tool_call_id,
                     ResultKind.RAW_INVALID,
@@ -1257,10 +1334,17 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 "mignon_type": agent_type,
                 "agent_id": agent_id,
                 "report": report_data,
+                # ADR-0056: findings code removed (original index and reasons, never the
+                # claim) and kept findings whose number rests only on fetched web pages.
+                "dropped_findings": [
+                    {"index": d.index, "reasons": [deps.redactor.redact_text(r) for r in d.reasons]}
+                    for d in dropped
+                ],
+                "web_sourced_findings": list(web_sourced),
             }
             if draft is not None and repaired:
                 data["repair"] = {
-                    "finding_origins": list(draft.report.origins),
+                    "finding_origins": list(kept),
                     "patched": list(draft.report.patched),
                     "dropped": list(draft.report.dropped),
                 }
@@ -1341,6 +1425,22 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         )
 
+    def active_prompts() -> list[str]:
+        """Task prompts of the Mignons now running (their Agent calls are still open)."""
+        prompts = [calls[u].effective_input.get("prompt") for u in active if u in calls]
+        return [p for p in prompts if isinstance(p, str)]
+
+    def handed_refs(report: Mapping[str, object] | None, prompts: list[str]) -> set[str]:
+        """Run refs a report cites that a spawn prompt handed over (ADR-0025).
+
+        PostToolUse(Agent) knows the exact spawn prompt; SubagentStop knows only the agent_id,
+        so it uses every running Mignon's prompt. Both apply the same rule (ADR-0056), so a
+        finding the review accepts is dropped later only if another concurrent Mignon's task,
+        not this one's, named the ref."""
+        cited: set[str] = set()
+        _refs_in(report.get("findings") if report is not None else None, cited)
+        return {r for r in cited & run_refs if any(_mentions(p, r) for p in prompts)}
+
     def review_draft(agent_id: str, text: str) -> str | None:
         """Check a Mignon's latest reply; the block reason if it should patch findings."""
         draft = drafts.get(agent_id)
@@ -1362,7 +1462,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 draft.report = applied
         found = report_issues(
             draft.report.data,
-            mignon_refs.get(agent_id, set()) | run_refs,
+            mignon_refs.get(agent_id, set()) | handed_refs(draft.report.data, active_prompts()),
             mignon_urls.get(agent_id, set()),
         )
         if not found and not extra:
@@ -1426,6 +1526,11 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         if call.tier is ToolTier.D:
             active.discard(cast(str, use_id))
+        if call.builtin and call.tool == WEB_FETCH_TOOL:
+            # ADR-0056: a timed-out or refused fetch is not retried this run.
+            failed_url = _fetch_url(call.effective_input)
+            if failed_url is not None:
+                refused_urls.add(failed_url)
         status = unresolved_status(call.tier)
         error_text = deps.redactor.redact_text(str(data.get("error", "")))
         interrupted = data.get("is_interrupt") is True

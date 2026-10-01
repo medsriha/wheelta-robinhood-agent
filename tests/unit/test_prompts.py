@@ -32,10 +32,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v16_with_expected_placeholders() -> None:
+def test_active_prompt_is_v17_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 16
+    assert template.version == 17
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -158,13 +158,37 @@ def test_v13_finishes_with_no_order_working() -> None:
     assert "open day orders" not in text
 
 
+def test_v17_and_mignon_prompts_explain_dropped_and_web_sourced_findings() -> None:
+    """ADR-0056: the orchestrator reads dropped/web-sourced findings; every Mignon type may
+    rest a number on a fetched page, reports absences as gaps, and loses only a bad finding."""
+    text = load_prompt().text
+    assert "`dropped_findings`" in text and "`web_sourced_findings`" in text
+    assert "never as a price, strike, premium, Greek, position, or buying power" in text
+    prompts = load_mignon_prompts()
+    assert {m: p.version for m, p in prompts.items()} == {
+        MignonType.MARKET: 5,
+        MignonType.COMPANY: 3,
+        MignonType.MACRO: 3,
+    }
+    for prompt in prompts.values():
+        assert "web pages alone never support a number" not in prompt.text
+        assert "is a gap, not a\n  finding" in prompt.text
+        assert "the\n  rest of your report is kept" in prompt.text
+    for web in (MignonType.COMPANY, MignonType.MACRO):
+        assert (
+            "do not retry a URL that timed out or was\n  refused: code denies both"
+            in prompts[web].text
+        )
+        assert "it does not hold fetched pages" in prompts[web].text
+
+
 def test_v15_searches_in_discovery_rounds_before_a_work_deadline() -> None:
     """ADR-0053: rounds that search differently, cheap checks first, and the deadline shown."""
     text = load_prompt().text
     assert "Find new trades in discovery rounds\n(`selection.discovery`)" in text
     assert "- Work deadline: {{work_deadline}}." in text
     market = load_mignon_prompts()[MignonType.MARKET]
-    assert market.version == 4
+    assert market.version == 5
     assert "Only when the current board carries no relevant contract" not in market.text
     assert "Honor the task's exclusions" in market.text
 

@@ -36,3 +36,34 @@ def test_loads_accepted_reports_but_not_rejected_or_raw_reports(
     assert not candidates
     assert len(reports) == 1
     assert reports[0].findings[0].claim == "Earnings risk"
+
+
+def test_dropped_findings_become_gaps_and_web_sourced_claims_are_labelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADR-0056: the email shows what code dropped (index and reason, no claim) and marks a
+    number that rests only on fetched pages."""
+    from wheelta_robinhood_agent.observability import run_summary
+
+    report = {
+        "task": "Brazil election",
+        "findings": [
+            {"claim": "First round on October 4.", "refs": [], "web_urls": ["https://n.ex/a"]}
+        ],
+        "gaps": [],
+        "follow_up_questions": [],
+    }
+    data = {
+        "report": report,
+        "dropped_findings": [{"index": 2, "reasons": ["a cited ref was not delivered"]}],
+        "web_sourced_findings": [0],
+    }
+    envelopes = [{"kind": "validated", "tool": "Agent", "data": data}]
+    monkeypatch.setattr(summary_loader, "_delivered_envelopes", lambda *a: envelopes)
+    monkeypatch.setattr(summary_loader.evidence, "decision_facts_for_run", lambda *a: ())
+    _, (loaded,) = summary_loader.load_summary_research(None, uuid4())  # type: ignore[arg-type]
+    assert loaded.gaps == ("finding 2 dropped by code: a cited ref was not delivered",)
+    summary = run_summary.RunSummaryInput.model_construct(research_reports=(loaded,))
+    lines = run_summary._research_lines(summary)
+    assert "- First round on October 4. (web-sourced) [https://n.ex/a]" in lines
+    assert any("finding 2 dropped by code" in line for line in lines)

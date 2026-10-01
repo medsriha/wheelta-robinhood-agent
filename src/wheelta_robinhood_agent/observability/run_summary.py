@@ -365,7 +365,9 @@ def _research_lines(summary: RunSummaryInput) -> list[str]:
     for report in summary.research_reports:
         tasks[report.task] = None
         for finding in report.findings:
-            refs = findings.setdefault(finding.claim, [])
+            # ADR-0056: a number resting only on fetched pages is labelled as such.
+            claim = f"{finding.claim} (web-sourced)" if finding.web_sourced else finding.claim
+            refs = findings.setdefault(claim, [])
             refs.extend(ref for ref in (*finding.refs, *finding.web_urls) if ref not in refs)
         for gap in report.gaps:
             issues[f"- Research gap ({report.task}): {gap}"] = None

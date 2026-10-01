@@ -40,5 +40,16 @@ def load_summary_research(
             and isinstance(data, dict)
             and isinstance(data.get("report"), dict)
         ):
-            reports.append(MignonReport.model_validate(data["report"]))
+            report = MignonReport.model_validate(data["report"])
+            # ADR-0056: findings code dropped are reported as research gaps (index and
+            # reason only; their claims were unsupported and are not shown).
+            dropped = [
+                f"finding {d.get('index')} dropped by code: "
+                + "; ".join(str(r) for r in d.get("reasons", []))
+                for d in data.get("dropped_findings", [])
+                if isinstance(d, dict)
+            ]
+            if dropped:
+                report = report.model_copy(update={"gaps": (*report.gaps, *dropped)})
+            reports.append(report)
     return tuple(candidates.values()), tuple(reports)

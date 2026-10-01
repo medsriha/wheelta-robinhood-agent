@@ -1087,7 +1087,9 @@ def test_web_precheck_denies_after_request_is_recorded() -> None:
     assert_allowed(s2, s2.pre("WebFetch", {"url": "https://example.com"}, **COMPANY))
     s3 = session(web_precheck=precheck)
     assert_allowed(s3, s3.pre(RH + "get_option_quotes"))
-    assert len(seen) == 2  # never consulted for MCP tools
+    # ADR-0056: never consulted for WebFetch (a page is citable only by the Mignon that
+    # fetched it) or for MCP tools.
+    assert len(seen) == 1
 
 
 def test_web_capture_receives_validated_envelope_and_its_failure_is_tolerated() -> None:
