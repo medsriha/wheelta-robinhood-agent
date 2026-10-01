@@ -34,6 +34,14 @@ Two parts:
   could cite unclaimed, gets up to `MAX_REFERENCE_REPAIRS` such turns listing those issues
   (ADR-0052, `SessionDeps.reference_check`).
 
+ADR-0063: with `SessionDeps.loopback_server` (a loopback listener from `integrations/`), the
+orchestrator's in-process proxies list only the orchestrator's tools of each source (a source
+with none is not configured in the session at all) and each Mignon role reaches its own tools
+through an inline loopback server (`proxy.LoopbackProxyApp`), so Mignon-only tool schemas
+never enter the orchestrator's context. Without it (the default, and any custom transport
+that cannot reach a loopback server) every proxy lists every allowed tool, as before; the
+PreToolUse hook enforces each role's tools either way.
+
 `assert_no_order_tools` re-checks the plan before any session is built: without an order
 venue no Tier X tool is allowed; with one only the three option-order tools are. The venue
 (ADR-0038) is `broker` in armed live (ADR-0034); in a dry run it is `simulated` when
@@ -64,7 +72,7 @@ from claude_agent_sdk import (
     SystemMessage,
     Transport,
 )
-from claude_agent_sdk.types import McpSdkServerConfig
+from claude_agent_sdk.types import McpHttpServerConfig, McpSdkServerConfig
 
 from wheelta_robinhood_agent.agent.account_scope import (
     ROBINHOOD_ACCOUNT_SCOPE,
@@ -106,8 +114,12 @@ from wheelta_robinhood_agent.agent.order_cleanup import (
 )
 from wheelta_robinhood_agent.agent.pretrade_gate import PlacementState, PretradeGate
 from wheelta_robinhood_agent.agent.proxy import (
+    LOOPBACK_HOST,
+    LoopbackProxyApp,
     ValidatingProxy,
     build_proxy_server,
+    build_role_proxy_servers,
+    role_path,
     upstream_timeout_seconds,
 )
 from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyDispatch
@@ -202,6 +214,19 @@ from wheelta_robinhood_agent.observability.redaction import Redactor
 
 Conn = psycopg.Connection[tuple[object, ...]]
 TransportFactory = Callable[[ClaudeAgentOptions], Transport]
+# ADR-0063: serves the app on 127.0.0.1 for the session and yields its base URL
+# (`http://127.0.0.1:<port>`). The listener lives in `integrations/` (CLAUDE.md §3).
+LoopbackServer = Callable[[LoopbackProxyApp], AbstractAsyncContextManager[str]]
+
+
+@dataclass(frozen=True)
+class LoopbackEndpoint:
+    """A started loopback listener (ADR-0063): the app it serves and its base URL."""
+
+    app: LoopbackProxyApp
+    base_url: str
+
+
 # ADR-0052: a parsed output -> the reference issues to send back (empty: none).
 ReferenceCheck = Callable[[DecisionOutputParsed], tuple[str, ...]]
 UpstreamFactory = Callable[[McpHttpServer, float], AbstractAsyncContextManager[McpUpstream]]
@@ -482,6 +507,8 @@ class SessionDeps:
     session_budget_seconds: Callable[[], float]
     deadline_check: Callable[[], None] = lambda: None
     transport_factory: TransportFactory | None = None
+    # ADR-0063: the Mignons' loopback listener. None: every proxy lists every allowed tool.
+    loopback_server: LoopbackServer | None = None
     # Opens one proxied server's upstream (test seam; default: streamable HTTP).
     upstream_factory: UpstreamFactory | None = None
     mappers: Mapping[tuple[str, str], EvidenceMapper] = field(
@@ -584,11 +611,14 @@ def build_session_options(
     upstreams: Mapping[str, McpUpstream] | None = None,
     account_eligible: bool = False,
     output_gate: OutputRepairGate | None = None,
+    loopback: LoopbackEndpoint | None = None,
 ) -> ClaudeAgentOptions:
     """Hooks, local server, validating proxies (one per open upstream), and options (no I/O).
 
     `account_eligible` is the result of the session's trusted `get_accounts` check;
-    `output_gate` is closed by the session during final-output repair turns (ADR-0044)."""
+    `output_gate` is closed by the session during final-output repair turns (ADR-0044).
+    With `loopback` (ADR-0063, module docstring) the Mignon roles' servers are mounted on its
+    app and the in-process proxies list only the orchestrator's tools."""
     precheck, capture, lookup_tool = _web_cache_parts(deps)
     limits = mignon_limits(deps.rules.rules)
     recorder = LedgerToolEventRecorder(
@@ -650,6 +680,14 @@ def build_session_options(
     registry_by_name = {r.server: r for r in deps.plan.registries}
     timeout = upstream_timeout_seconds(settings.MCP_TOOL_TIMEOUT)
     venue = deps.plan.order_venue
+    allowed = deps.plan.tool_access.allowed_tools
+    split = loopback is not None and DELEGATION_TOOL in allowed and limits is not None
+    main_allowed = (
+        tuple(t for t in allowed if t in role_tools(Role.ORCHESTRATOR, deps.plan.agent))
+        if split
+        else allowed
+    )
+    proxies: dict[str, tuple[ValidatingProxy, ToolRegistry]] = {}
     for name, upstream in upstreams.items():
         if venue is OrderVenue.SIMULATED and name == ROBINHOOD:
             # ADR-0038: order tools are answered in-process; none reaches Robinhood.
@@ -681,13 +719,18 @@ def build_session_options(
                 else None
             ),
         )
+        proxies[name] = (proxy, registry_by_name[name])
+        main_tools = [t for t in main_allowed if t.startswith(f"mcp__{name}__")]
+        if split and not main_tools:
+            continue  # ADR-0063: a Mignon-only source is not in the orchestrator's session
         sdk_servers[name] = McpSdkServerConfig(
             type="sdk",
             name=name,
-            instance=build_proxy_server(
-                proxy, registry_by_name[name], deps.plan.tool_access.allowed_tools
-            ),
+            instance=build_proxy_server(proxy, registry_by_name[name], main_allowed),
         )
+    mignon_servers = (
+        _mount_mignon_servers(loopback, proxies, allowed) if split and loopback else None
+    )
     return build_agent_options(
         tool_access=deps.plan.tool_access,
         mcp_servers=deps.plan.servers,
@@ -703,7 +746,31 @@ def build_session_options(
         mignon_prompts=deps.mignon_prompts or None,
         mignon_limits=limits,
         mignon_models=settings.mignon_models,
+        mignon_mcp_servers=mignon_servers,
     )
+
+
+def _mount_mignon_servers(
+    loopback: LoopbackEndpoint,
+    proxies: Mapping[str, tuple[ValidatingProxy, ToolRegistry]],
+    allowed: Sequence[str],
+) -> dict[Role, dict[str, McpHttpServerConfig]]:
+    """Mount each Mignon role's proxy servers on the loopback app; their inline configs."""
+    if not loopback.base_url.startswith(f"http://{LOOPBACK_HOST}:"):
+        raise SessionPlanError(f"the loopback listener is not on {LOOPBACK_HOST}")
+    roles = [r for r in Role if r is not Role.ORCHESTRATOR]
+    servers = build_role_proxy_servers(proxies, allowed, roles)
+    loopback.app.mount(servers)
+    header = {"Authorization": loopback.app.authorization}
+    return {
+        role: {
+            name: McpHttpServerConfig(
+                type="http", url=f"{loopback.base_url}{role_path(role, name)}", headers=header
+            )
+            for name in by_name
+        }
+        for role, by_name in servers.items()
+    }
 
 
 def _tool_names(server: str, entry: Mapping[str, Any]) -> list[str] | None:
@@ -1301,13 +1368,49 @@ async def _run_client(
     upstreams: Mapping[str, McpUpstream],
     result: SessionResult,
 ) -> None:
+    async with AsyncExitStack() as stack:
+        try:
+            loopback = await _start_loopback(stack, deps, upstreams)
+        except Exception as exc:  # noqa: BLE001 - no listener, no session; recorded, not retried
+            result.status = SessionStatus.FAILED
+            result.error = f"Mignon loopback server failed ({type(exc).__name__})"
+            result.error_details = (deps.redactor.redact_text(f"{type(exc).__name__}: {exc}"),)
+            return
+        await _run_client_with(stack, deps, withholding, upstreams, result, loopback)
+
+
+async def _start_loopback(
+    stack: AsyncExitStack, deps: SessionDeps, upstreams: Mapping[str, McpUpstream]
+) -> LoopbackEndpoint | None:
+    """ADR-0063: start the Mignons' loopback listener when there are Mignons and proxies."""
+    if deps.loopback_server is None or not upstreams or not deps.mignon_prompts:
+        return None
+    if DELEGATION_TOOL not in deps.plan.tool_access.allowed_tools:
+        return None
+    app = LoopbackProxyApp()
+    base_url = await stack.enter_async_context(deps.loopback_server(app))
+    return LoopbackEndpoint(app=app, base_url=base_url)
+
+
+async def _run_client_with(
+    stack: AsyncExitStack,
+    deps: SessionDeps,
+    withholding: ServerWithholding,
+    upstreams: Mapping[str, McpUpstream],
+    result: SessionResult,
+    loopback: LoopbackEndpoint | None,
+) -> None:
     direct = [s.name for s in deps.plan.servers]
-    configured = [*direct, *upstreams, LOCAL_SERVER_NAME]
     eligible = result.eligibility is not None and result.eligibility.eligible
     gate = OutputRepairGate()
     options = build_session_options(
-        deps, withholding, upstreams, account_eligible=eligible, output_gate=gate
+        deps, withholding, upstreams, account_eligible=eligible, output_gate=gate, loopback=loopback
     )
+    if loopback is not None:
+        await stack.enter_async_context(loopback.app.running())
+    # ADR-0063: a Mignon-only source is not in the session, so the init check skips it.
+    in_session = options.mcp_servers if isinstance(options.mcp_servers, dict) else {}
+    configured = [*direct, *(n for n in upstreams if n in in_session), LOCAL_SERVER_NAME]
     transport = deps.transport_factory(options) if deps.transport_factory else None
     client = ClaudeSDKClient(options, transport=transport)
     try:

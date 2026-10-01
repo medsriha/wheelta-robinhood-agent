@@ -445,3 +445,157 @@ def test_session_refuses_a_plan_made_for_another_agent() -> None:
         SessionDeps.__post_init__(mismatched)  # type: ignore[arg-type]
     matched = SimpleNamespace(role=AgentRole.CLOSE, plan=SimpleNamespace(agent=AgentRole.CLOSE))
     SessionDeps.__post_init__(matched)  # type: ignore[arg-type]
+
+
+# ---- ADR-0063: the orchestrator's session lists only its tools ---------------------------------
+
+
+class _ListOnlyUpstream:
+    """An opened upstream that lists every registered tool and is never called here."""
+
+    def __init__(self, registry: Any) -> None:
+        self.registry = registry
+
+    @property
+    def server(self) -> str:
+        return str(self.registry.server)
+
+    @property
+    def tools(self) -> Any:
+        from wheelta_robinhood_agent.integrations.mcp_upstream import UpstreamTool
+
+        return tuple(
+            UpstreamTool(t.name, f"d {t.name}", {"type": "object"}) for t in self.registry.tools
+        )
+
+    async def call_tool(self, name: str, arguments: Any, *, timeout_seconds: float) -> Any:
+        raise AssertionError("not called while building options")
+
+
+def _session_deps(plan: Any) -> Any:
+    from wheelta_robinhood_agent.agent.run_control import RunControl
+    from wheelta_robinhood_agent.agent.session import SessionDeps
+    from wheelta_robinhood_agent.config.rules import load_rules
+    from wheelta_robinhood_agent.config.settings import Settings
+    from wheelta_robinhood_agent.observability.metrics import RunMetrics
+    from wheelta_robinhood_agent.observability.redaction import Redactor
+
+    settings = Settings.model_validate(
+        {
+            "ANTHROPIC_API_KEY": "sk-test",
+            "AGENT_MODEL": "claude-test-model",
+            "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER": "5RA123456789",
+            "WHEELTA_MCP_TOKEN": "wt-token",
+            "DATABASE_URL": "postgresql://u:p@localhost/db",
+        }
+    )
+    return SessionDeps(
+        conn=None,  # type: ignore[arg-type]  # building options issues no query
+        run_id=__import__("uuid").uuid4(),
+        account_scope_id="scope",
+        settings=settings,
+        rules=load_rules(),
+        plan=plan,
+        system_prompt="rendered prompt",
+        run_control=RunControl(),
+        clock=lambda: NOW,
+        redactor=Redactor(account_number=SecretStr("5RA123456789")),
+        metrics=RunMetrics("r"),
+        scratch_dir=Path("/private/tmp/wra-scratch"),
+        connect_budget_seconds=1.0,
+        session_budget_seconds=lambda: 60.0,
+        mignon_prompts={m: f"rendered {m.value}" for m in MignonType},
+        role=AgentRole.SELL,
+    )
+
+
+def _upstreams() -> Any:
+    return {
+        r.server: _ListOnlyUpstream(r)
+        for r in (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, TAVILY_REGISTRY)
+    }
+
+
+def _build_session_options(
+    loopback: Any, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, dict[str, Any]]:
+    from wheelta_robinhood_agent.agent import session as session_module
+
+    listed: dict[str, Any] = {}
+    real = session_module.build_proxy_server
+
+    def spy(proxy: Any, registry: Any, allowed: Any) -> Any:
+        listed[registry.server] = frozenset(allowed)
+        return real(proxy, registry, allowed)
+
+    monkeypatch.setattr(session_module, "build_proxy_server", spy)
+    plan = plan_session(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=True,
+        sources=(
+            RemoteSource(RH_VERIFIED, RH, required=True),
+            RemoteSource(WHEELTA_REGISTRY, WT),
+            RemoteSource(TAVILY_REGISTRY, TV),
+        ),
+        observed_at=NOW,
+        agent=AgentRole.SELL,
+    )
+    options = session_module.build_session_options(
+        _session_deps(plan), ServerWithholding(), _upstreams(), loopback=loopback
+    )
+    return options, listed
+
+
+def test_without_a_loopback_every_proxy_lists_every_allowed_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options, listed = _build_session_options(None, monkeypatch)
+    assert set(options.mcp_servers) == {"robinhood", "wheelta", "tavily", LOCAL_SERVER_NAME}
+    assert listed["wheelta"] and listed["tavily"]
+    assert all(d.mcpServers is None for d in options.agents.values())
+
+
+def test_with_a_loopback_the_orchestrator_session_holds_only_its_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wheelta_robinhood_agent.agent.mignons import role_tools
+    from wheelta_robinhood_agent.agent.proxy import LoopbackProxyApp, role_path
+    from wheelta_robinhood_agent.agent.session import LoopbackEndpoint
+
+    app = LoopbackProxyApp()
+    endpoint = LoopbackEndpoint(app=app, base_url="http://127.0.0.1:41234")
+    options, listed = _build_session_options(endpoint, monkeypatch)
+    orchestrator = role_tools(Role.ORCHESTRATOR, AgentRole.SELL)
+    # Wheelta and Tavily are Mignon-only: not in the orchestrator's session at all.
+    assert set(options.mcp_servers) == {"robinhood", LOCAL_SERVER_NAME}
+    main = set(options.allowed_tools) & orchestrator
+    assert {t for t in main if t.startswith("mcp__robinhood__")} <= listed["robinhood"]
+    assert listed["robinhood"] <= orchestrator | {"Agent"}  # never a Mignon-only tool
+    # The session allowlist still names the Mignons' tools (dontAsk), and the hook scopes them.
+    assert "mcp__wheelta__wheelta_board_query" in options.allowed_tools
+    servers = {
+        name.split("--")[0]: sorted(next(iter(e)) for e in d.mcpServers)
+        for name, d in options.agents.items()
+    }
+    assert servers == {
+        "mignon-market": ["robinhood", "wheelta"],
+        "mignon-company": ["robinhood", "tavily", "wheelta"],
+        "mignon-macro": ["robinhood", "tavily", "wheelta"],
+    }
+    entry = options.agents[next(iter(options.agents))].mcpServers[0]
+    config = next(iter(entry.values()))
+    assert config["headers"] == {"Authorization": app.authorization}
+    assert app.paths == {
+        role_path(Role(kind), source) for kind, sources in servers.items() for source in sources
+    }
+
+
+def test_a_loopback_listener_off_the_loopback_address_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wheelta_robinhood_agent.agent.proxy import LoopbackProxyApp
+    from wheelta_robinhood_agent.agent.session import LoopbackEndpoint
+
+    endpoint = LoopbackEndpoint(app=LoopbackProxyApp(), base_url="http://0.0.0.0:41234")
+    with pytest.raises(SessionPlanError, match="not on 127.0.0.1"):
+        _build_session_options(endpoint, monkeypatch)

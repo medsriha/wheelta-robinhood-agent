@@ -47,7 +47,11 @@ LIMITS = MignonLimits(max_per_run=8, max_concurrent=4, max_turns_per_mignon=10)
 MARKET_T = f"mignon-market--{MODEL}"  # the harness allowlist is the session model
 SPAWN = ToolUse(
     "Agent",
-    {"description": "screen", "prompt": "Screen AAPL puts.", "subagent_type": MARKET_T},
+    {
+        "description": "screen",
+        "prompt": json.dumps({"objective": "Screen AAPL puts.", "subjects": ["AAPL"]}),
+        "subagent_type": MARKET_T,
+    },
 )
 POSITIONS_TOOL = ROBINHOOD_REGISTRY.qualified("get_option_positions")
 EVIDENCE_RE = re.compile(r"evidence:[0-9a-f-]{36}")

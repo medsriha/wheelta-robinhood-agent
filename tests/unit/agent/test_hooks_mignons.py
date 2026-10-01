@@ -50,7 +50,8 @@ MARKET_T, COMPANY_T = f"mignon-market--{TEST_MODEL}", f"mignon-company--{TEST_MO
 MACRO_T = f"mignon-macro--{TEST_MODEL}"
 MARKET = {"agent_id": MARKET_ID, "agent_type": MARKET_T}
 COMPANY = {"agent_id": COMPANY_ID, "agent_type": COMPANY_T}
-SPAWN = {"description": "screen", "prompt": "Screen AAPL puts.", "subagent_type": MARKET_T}
+BRIEF = {"objective": "Screen AAPL puts.", "subjects": ["AAPL"], "criteria": ["filters"]}
+SPAWN = {"description": "screen", "prompt": json.dumps(BRIEF), "subagent_type": MARKET_T}
 EVIDENCE, CANDIDATE = "evidence:e-1", "candidate:c-1"
 URL = "https://investor.example.com/q3"
 SEARCH, EXTRACT = "mcp__tavily__tavily_search", "mcp__tavily__tavily_extract"
@@ -234,6 +235,12 @@ def test_spawn_denied_when_mignons_disabled() -> None:
         ({"subagent_type": "mignon-market--claude-other"}, "on an allowed model"),
         ({"subagent_type": "mignon-market--opus"}, "on an allowed model"),
         ({"prompt": ""}, "'prompt' missing"),
+        ({"prompt": "Screen AAPL puts."}, "one MignonBrief JSON object"),
+        (
+            {"prompt": json.dumps({"objective": "x", "criteria": ["filters.min_delta"]})},
+            "no rule 'filters.min_delta'",
+        ),
+        ({"prompt": json.dumps({"objective": "x", "max_results": 5})}, "MignonBrief"),
         ({"description": 3}, "'description' missing"),
     ],
 )
@@ -368,7 +375,8 @@ def test_ref_delivered_to_another_mignon_is_not_citable() -> None:
 def test_ref_handed_over_in_the_task_is_citable() -> None:
     s = session()
     research(s, {}, use_id="toolu_o")  # the orchestrator received EVIDENCE
-    spawn = {**SPAWN, "prompt": f"Follow up on {EVIDENCE}: is the spread acceptable?"}
+    brief = {"objective": "Is the spread acceptable?", "subjects": [EVIDENCE]}
+    spawn = {**SPAWN, "prompt": json.dumps(brief)}
     assert_ok(s.pre("Agent", spawn, use_id="toolu_agent"))
     text = report(finding("Spread of 0.10 per the quote.", [EVIDENCE]))
     envelope = delivered_envelope(s.post("Agent", agent_response(text), use_id="toolu_agent"))
@@ -762,3 +770,31 @@ def test_last_assistant_text_reads_the_final_message(tmp_path: Path) -> None:
     assert last_assistant_text(str(path)) == "ab"
     assert last_assistant_text(str(tmp_path / "none.jsonl")) is None
     assert last_assistant_text(5) is None
+
+
+def test_a_report_lists_what_it_did_not_cover_of_the_brief() -> None:
+    """ADR-0061: brief subjects without a finding and `want` values a finding lacks."""
+    s = session()
+    research(s, {}, use_id="toolu_o")
+    brief = {
+        "objective": "Re-quote.",
+        "subjects": ["AAPL", "MSFT"],
+        "want": ["bid", "delta"],
+        "notes": f"Prior quote: {EVIDENCE}",
+    }
+    assert_ok(s.pre("Agent", {**SPAWN, "prompt": json.dumps(brief)}, use_id="toolu_agent"))
+    covered = {
+        "claim": "AAPL put quoted.",
+        "refs": [EVIDENCE],
+        "web_urls": [],
+        "subject": "AAPL",
+        "values": {"bid": "1.20"},
+    }
+    text = json.dumps({"task": "t", "findings": [covered], "gaps": [], "follow_up_questions": []})
+    envelope = delivered_envelope(s.post("Agent", agent_response(text), use_id="toolu_agent"))
+    assert envelope["kind"] == "validated"
+    assert envelope["data"]["coverage_gaps"] == [
+        "subject MSFT: not reported",
+        "subject AAPL: no value for 'delta'",
+    ]
+    assert envelope["data"]["report"]["findings"][0]["values"] == {"bid": "1.20"}

@@ -24,18 +24,19 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # HOLD); wheel_sell opens new CSPs and CCs. wheel_agent v17 stays on disk for earlier runs.
 ACTIVE_PROMPTS: Mapping[AgentRole, tuple[str, int]] = MappingProxyType(
     {
-        AgentRole.CLOSE: ("wheel_close", 1),
-        AgentRole.SELL: ("wheel_sell", 1),
+        # ADR-0061: typed Mignon briefs; ADR-0062: board status in the run context.
+        AgentRole.CLOSE: ("wheel_close", 2),
+        AgentRole.SELL: ("wheel_sell", 2),
     }
 )
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {
         # ADR-0056: web-sourced numbers, absences as gaps, dropped findings, fetch hygiene.
-        MignonType.MARKET: ("mignon_market", 5),  # v4, ADR-0053: scanner beside the board
-        # ADR-0058: Tavily tavily_search/tavily_extract replace WebSearch/WebFetch.
-        MignonType.COMPANY: ("mignon_company", 4),
-        MignonType.MACRO: ("mignon_macro", 4),
+        # ADR-0061: typed briefs, subject findings with requested values, tool know-how.
+        MignonType.MARKET: ("mignon_market", 6),
+        MignonType.COMPANY: ("mignon_company", 5),
+        MignonType.MACRO: ("mignon_macro", 5),
     }
 )
 

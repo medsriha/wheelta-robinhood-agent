@@ -18,6 +18,7 @@ ACTIVE_PLACEHOLDERS = {
     "account_ref",
     "as_of",
     "available_tools",
+    "board_status",
     "execution_mode",
     "owned_orders",
     "policy_version",
@@ -54,8 +55,8 @@ def test_active_prompts_per_role_with_expected_placeholders() -> None:
     templates = load_agent_prompts()
     assert set(templates) == {AgentRole.CLOSE, AgentRole.SELL}
     assert ACTIVE_PROMPTS == {
-        AgentRole.CLOSE: ("wheel_close", 1),
-        AgentRole.SELL: ("wheel_sell", 1),
+        AgentRole.CLOSE: ("wheel_close", 2),
+        AgentRole.SELL: ("wheel_sell", 2),
     }
     for role, template in templates.items():
         assert (template.prompt_id, template.version) == ACTIVE_PROMPTS[role]
@@ -163,7 +164,8 @@ def test_every_mignon_type_has_a_loadable_prompt() -> None:
         assert (template.prompt_id, template.version) == MIGNON_PROMPTS[mignon]
         assert template.placeholders == {"as_of", "policy_version", "policy", "available_tools"}
         rendered = render_prompt(template, _values(set(template.placeholders)))
-        assert "MignonReport v1" in rendered.text and "{{" not in rendered.text
+        assert "MignonReport v2" in rendered.text and "{{" not in rendered.text
+        assert "## Your task" in rendered.text and "MignonBrief" in rendered.text
 
 
 def test_orchestrator_prompts_delegate_research() -> None:
@@ -213,9 +215,9 @@ def test_v17_and_mignon_prompts_explain_dropped_and_web_sourced_findings() -> No
         assert "never as a price, strike, premium, Greek, position, or buying power" in text
     prompts = load_mignon_prompts()
     assert {m: p.version for m, p in prompts.items()} == {
-        MignonType.MARKET: 5,
-        MignonType.COMPANY: 4,
-        MignonType.MACRO: 4,
+        MignonType.MARKET: 6,
+        MignonType.COMPANY: 5,
+        MignonType.MACRO: 5,
     }
     for prompt in prompts.values():
         assert "web pages alone never support a number" not in prompt.text
@@ -249,9 +251,9 @@ def test_v15_searches_in_discovery_rounds_before_a_work_deadline() -> None:
     for template in _both():
         assert "- Work deadline: {{work_deadline}}." in template.text
     market = load_mignon_prompts()[MignonType.MARKET]
-    assert market.version == 5
+    assert market.version == 6
     assert "Only when the current board carries no relevant contract" not in market.text
-    assert "Honor the task's exclusions" in market.text
+    assert "Honor the brief's `exclude` and `notes`" in market.text
 
 
 def test_v14_cites_order_call_refs() -> None:
@@ -276,3 +278,31 @@ def test_v16_weighs_the_entry_note_before_managing() -> None:
     text = _close().text
     assert "7. Each position book entry carries `entry_note`" in text
     assert "compare current\n   evidence with why you opened it" in text
+
+
+def test_the_example_brief_in_each_orchestrator_prompt_is_valid() -> None:
+    """ADR-0061: the prompt's own example passes the hook's brief check."""
+    import re
+
+    from wheelta_robinhood_agent.config.rules import load_rules, rule_keys
+    from wheelta_robinhood_agent.domain.mignon_brief import MignonBriefParsed, parse_mignon_brief
+
+    keys = rule_keys(load_rules().rules)
+    for template in _both():
+        match = re.search(r"```\n(\{\n  \"objective\".*?\n\})\n```", template.body, re.S)
+        assert match is not None
+        assert isinstance(parse_mignon_brief(match.group(1), keys), MignonBriefParsed)
+        assert "Never restate a rule's value" in template.body
+
+
+def test_market_mignon_carries_scanner_and_board_know_how() -> None:
+    """ADR-0061: the 2026-10-01 scanner traps are in the Mignon's prompt, not the brief."""
+    body = load_mignon_prompts()[MignonType.MARKET].body
+    for fragment in (
+        "get_scanner_filter_specs` once before the first scan",
+        '`["0.30", "0.70"]`',
+        "supported_intervals",
+        "FILTER_TYPE_AVERAGE_OPTIONS_VOLUME",
+        "`contract.greeks.delta`",
+    ):
+        assert fragment in body

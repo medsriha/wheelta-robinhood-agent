@@ -61,8 +61,15 @@ from wheelta_robinhood_agent.agent.account_scope import (
     account_scope_id,
 )
 from wheelta_robinhood_agent.agent.audit.runner import AuditResult, run_audit
+from wheelta_robinhood_agent.agent.board_probe import (
+    BoardStatusContext,
+    read_board_status,
+    skip_reason,
+    unavailable,
+)
 from wheelta_robinhood_agent.agent.mignons import DELEGATION_TOOL, Role, mignon_limits
 from wheelta_robinhood_agent.agent.order_cleanup import ORDER_WIND_DOWN_SECONDS
+from wheelta_robinhood_agent.agent.proxy import upstream_timeout_seconds
 from wheelta_robinhood_agent.agent.result_boundary import VERIFIED_MAPPERS, EvidenceMapper
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
 from wheelta_robinhood_agent.agent.run_loader import (
@@ -76,6 +83,7 @@ from wheelta_robinhood_agent.agent.session import (
     INTERRUPT_GRACE_SECONDS,
     REMOTE_RESULT_BOUNDARY_ACCEPTED,
     STATUS_POLL_INTERVAL_SECONDS,
+    LoopbackServer,
     RemoteSource,
     SessionDeps,
     SessionPlan,
@@ -131,6 +139,7 @@ from wheelta_robinhood_agent.domain.run import AuditStatus
 from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
 from wheelta_robinhood_agent.domain.run_record import RunRecord
 from wheelta_robinhood_agent.domain.start_conditions import StartCondition, StartOutcome
+from wheelta_robinhood_agent.integrations.loopback_http import serve_loopback
 from wheelta_robinhood_agent.integrations.notifications.delivery import (
     DeliveryOutcome,
     DeliveryResult,
@@ -151,6 +160,7 @@ from wheelta_robinhood_agent.integrations.robinhood.token_vault import TokenVaul
 from wheelta_robinhood_agent.integrations.status import SourceObservation
 from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
 from wheelta_robinhood_agent.integrations.websearch.server import build_tavily_server
+from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.server import build_wheelta_server
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
@@ -338,6 +348,9 @@ class OrchestratorDeps:
     # Test seams (module docstring): production always uses the defaults.
     remote_boundary_accepted: bool = REMOTE_RESULT_BOUNDARY_ACCEPTED
     upstream_factory: UpstreamFactory | None = None
+    # ADR-0063: serves each Mignon role's tools on loopback so the orchestrator never lists
+    # them. Used only with the real CLI: a fake transport cannot reach inline servers.
+    loopback_server: LoopbackServer | None = serve_loopback
     registries: tuple[ToolRegistry, ToolRegistry] = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
     # ADR-0058: Tavily web search (optional source; without a key it is disabled).
     tavily_registry: ToolRegistry = TAVILY_REGISTRY
@@ -1203,6 +1216,9 @@ class _Run:
         if self.role is AgentRole.SELL:
             # ADR-0057: what the Buy-to-Close agent did this tick (context, from the ledger).
             values["close_agent_outcome"] = self.close_agent_outcome or "null"
+        if "board_status" in self.template.placeholders:
+            # ADR-0062: the board status, read by trusted code (the orchestrator may not).
+            values["board_status"] = self._board_status(plan).prompt_value()
         rendered = render_prompt(self.template, values)
         self.mignon_prompts = self._render_mignons(plan, now)
         self.event(
@@ -1230,6 +1246,46 @@ class _Run:
             key="metadata:prompt",
         )
         return rendered
+
+    def _board_status(self, plan: SessionPlan) -> BoardStatusContext:
+        """ADR-0062: the Wheelta board status through the run's proxied Wheelta server and
+        the session's upstream factory, bounded by what is left of the session budget, and
+        recorded as run metadata. Never raises: a failure renders as unavailable."""
+        wheelta = next((s for s in plan.proxied if s.name == WHEELTA), None)
+        registry = next((r for r in plan.registries if r.server == WHEELTA), None)
+        reason = skip_reason(
+            allowed_tools=frozenset(plan.tool_access.allowed_tools),
+            wheelta_proxied=wheelta is not None and registry is not None,
+            wheelta_withheld=plan.withheld.get(WHEELTA),
+        )
+        if reason is None and self.control.stop_requested:
+            reason = "the run is stopping"
+        if reason is not None or wheelta is None or registry is None:
+            context = unavailable(reason or "Wheelta is not proxied this run", self.deps.clock())
+        else:
+            budget = self._session_budget() - ORDER_WIND_DOWN_SECONDS
+            connect = self.deps.connect_budget_seconds or self.settings.MCP_TIMEOUT / 1000
+            try:
+                tool_timeout = upstream_timeout_seconds(self.settings.MCP_TOOL_TIMEOUT)
+            except ValueError:
+                tool_timeout = 0.0
+            context = read_board_status(
+                wheelta,
+                registry,
+                opener=self.deps.upstream_factory,
+                connect_timeout_seconds=min(connect, budget),
+                tool_timeout_seconds=min(tool_timeout, budget),
+                clock=self.deps.clock,
+            )
+        self.event(
+            RunEventType.METADATA,
+            {"board_status": context.event_payload()},
+            key="metadata:board_status",
+        )
+        self.log.bind(stage="board_status").info(
+            "board status read", extra={"board_status": context.status.value}
+        )
+        return context
 
     def _render_mignons(self, plan: SessionPlan, now: datetime) -> dict[MignonType, RenderedPrompt]:
         """Each Mignon type's prompt with its own tool table (ADR-0025); none when `Agent` is
@@ -1325,6 +1381,9 @@ class _Run:
             deadline_check=self._deadline_check,
             transport_factory=self.deps.transport_factory,
             upstream_factory=self.deps.upstream_factory,
+            loopback_server=(
+                self.deps.loopback_server if self.deps.transport_factory is None else None
+            ),
             mappers=self.deps.mappers,
             account_scope_table=self.deps.account_scope_table,
             interrupt_grace_seconds=self.deps.interrupt_grace_seconds or INTERRUPT_GRACE_SECONDS,

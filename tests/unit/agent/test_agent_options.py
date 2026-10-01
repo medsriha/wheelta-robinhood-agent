@@ -247,7 +247,7 @@ def _with_agent(o: Any, name: str, **changes: Any) -> Any:
         (MK, {"background": None}, "background"),
         (MK, {"maxTurns": None}, "turn cap"),
         (MK, {"permissionMode": "bypassPermissions"}, "overrides"),
-        (MK, {"mcpServers": ["other"]}, "overrides"),
+        (MK, {"mcpServers": ["other"]}, "inline loopback servers"),
         (MK, {"skills": ["x"]}, "overrides"),
     ],
 )
@@ -288,3 +288,138 @@ def test_each_mignon_type_is_offered_once_per_allowed_model() -> None:
     haiku = o.agents["mignon-company--claude-haiku-4-5"]
     assert haiku.tools == o.agents["mignon-company--claude-opus-4-8"].tools
     assert haiku.description.startswith("mignon-company on claude-haiku-4-5")
+
+
+# ---- ADR-0063: Mignon-only tools on inline loopback servers -----------------------------------
+
+BEARER = {"Authorization": "Bearer " + "t" * 43}
+
+
+def _inline(role: Role, source: str, **changes: Any) -> Any:
+    config: dict[str, Any] = {
+        "type": "http",
+        "url": f"http://127.0.0.1:41234/{role.value}/{source}/mcp",
+        "headers": BEARER,
+    }
+    config.update(changes)
+    return config
+
+
+def _mignon_servers() -> Any:
+    return {
+        Role.MARKET: {"robinhood": _inline(Role.MARKET, "robinhood")},
+        Role.COMPANY: {
+            "tavily": _inline(Role.COMPANY, "tavily"),
+            "robinhood": _inline(Role.COMPANY, "robinhood"),
+        },
+    }
+
+
+def test_each_mignon_carries_its_roles_inline_servers_sorted() -> None:
+    o = _build(mignon_mcp_servers=_mignon_servers())
+    company = o.agents["mignon-company--claude-test-model"].mcpServers
+    assert company == [
+        {"robinhood": _inline(Role.COMPANY, "robinhood")},
+        {"tavily": _inline(Role.COMPANY, "tavily")},
+    ]
+    assert o.agents[MK].mcpServers == [{"robinhood": _inline(Role.MARKET, "robinhood")}]
+    assert o.agents["mignon-macro--claude-test-model"].mcpServers is None
+    # Inline servers never enter the session's own server list.
+    assert set(o.mcp_servers) == {"robinhood", "wheelta"}
+
+
+def test_mignon_servers_without_mignons_are_rejected() -> None:
+    with pytest.raises(AgentOptionsError, match="no Mignons are configured"):
+        _build(mignon_mcp_servers=_mignon_servers(), mignon_limits=None, mignon_prompts=None)
+
+
+@pytest.mark.parametrize(
+    ("servers", "fragment"),
+    [
+        ([], "empty MCP server list"),
+        (["robinhood"], "inline loopback servers"),
+        ([{"robinhood": _inline(Role.MARKET, "robinhood"), "x": {}}], "inline loopback"),
+        ([{"wra_local": _inline(Role.MARKET, "wra_local")}], "not a proxied source"),
+        ([{"other": _inline(Role.MARKET, "other")}], "not a proxied source"),
+        (
+            [
+                {"robinhood": _inline(Role.MARKET, "robinhood")},
+                {"robinhood": _inline(Role.MARKET, "robinhood")},
+            ],
+            "not a proxied source",
+        ),
+        ([{"robinhood": {"type": "sdk", "name": "robinhood"}}], "malformed"),
+        ([{"robinhood": {"type": "stdio", "command": "x", "url": "", "headers": {}}}], "mal"),
+        ([{"robinhood": _inline(Role.MARKET, "robinhood", type="sse")}], "loopback URL"),
+        (
+            [{"robinhood": _inline(Role.MARKET, "robinhood", url="https://rh.example/mcp")}],
+            "loopback URL",
+        ),
+        (
+            [
+                {
+                    "robinhood": _inline(
+                        Role.MARKET, "robinhood", url="http://localhost:1/market/robinhood/mcp"
+                    )
+                }
+            ],
+            "loopback URL",
+        ),
+        (
+            [
+                {
+                    "robinhood": _inline(
+                        Role.MARKET, "robinhood", url="http://127.0.0.1/market/robinhood/mcp"
+                    )
+                }
+            ],
+            "loopback URL",
+        ),
+        ([{"robinhood": _inline(Role.COMPANY, "robinhood")}], "loopback URL"),  # another role
+        ([{"robinhood": _inline(Role.MARKET, "wheelta")}], "loopback URL"),  # another source
+        (
+            [
+                {
+                    "robinhood": _inline(
+                        Role.MARKET,
+                        "robinhood",
+                        url="http://127.0.0.1:1/market/robinhood/mcp?x=1",
+                    )
+                }
+            ],
+            "loopback URL",
+        ),
+        (
+            [
+                {
+                    "robinhood": _inline(
+                        Role.MARKET,
+                        "robinhood",
+                        url="http://u@127.0.0.1:1/market/robinhood/mcp",
+                    )
+                }
+            ],
+            "loopback URL",
+        ),
+        ([{"robinhood": _inline(Role.MARKET, "robinhood", headers={})}], "bearer header"),
+        (
+            [{"robinhood": _inline(Role.MARKET, "robinhood", headers={"Authorization": "x"})}],
+            "bearer header",
+        ),
+        (
+            [{"robinhood": _inline(Role.MARKET, "robinhood", headers={**BEARER, "X-A": "1"})}],
+            "bearer header",
+        ),
+    ],
+)
+def test_assert_safe_options_accepts_only_the_roles_loopback_servers(
+    servers: Any, fragment: str
+) -> None:
+    with pytest.raises(AgentOptionsError, match=fragment):
+        assert_safe_options(_with_agent(_build(), MK, mcpServers=servers))
+
+
+def test_the_roles_loopback_server_passes_the_check() -> None:
+    assert_safe_options(
+        _with_agent(_build(), MK, mcpServers=[{"robinhood": _inline(Role.MARKET, "robinhood")}])
+    )

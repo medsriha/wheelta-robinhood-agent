@@ -38,17 +38,41 @@ ADR-0052: every envelope a Tier X call (the three option-order tools) produces h
 failed upstream, or not forwarded. The stored envelope and the delivered view both hold it,
 so `run_loader` can confirm the model received the ref it cites in `execution_refs`. The
 static fallback envelope carries none: its delivery stops the session.
+
+ADR-0063: the orchestrator sees only its own tools. The session's in-process server lists the
+orchestrator's tools of a source (`build_proxy_server` with that allowlist). Each Mignon role
+reaches the same `ValidatingProxy` through a loopback streamable-HTTP server inlined in its
+`AgentDefinition.mcpServers`, the only mechanism the real CLI 2.1.283 offers for tools a
+subagent sees and its parent does not (tests/e2e/test_e2e_orchestrator_tool_visibility_cli.py):
+
+- `build_role_proxy_servers`: one `Server` per (Mignon role, source) listing the role's
+  allowed tools of that source, under the path `role_path(role, source)`. The CLI offers a
+  Mignon every tool of an inline server whatever its `AgentDefinition.tools`, so the listing
+  is the role's set and never holds a Tier X tool.
+- `LoopbackProxyApp`: the ASGI app serving them (stateless JSON responses), refusing a
+  request without the session's bearer token or with a non-loopback Host/Origin (DNS
+  rebinding). It opens no socket: the listener belongs in `integrations/` (CLAUDE.md §3) and
+  is injected into the session (`session.SessionDeps.loopback_server`).
+
+Calls through it carry the same `_meta["claudecode/toolUseId"]` and pass the same parent
+PreToolUse hook (with the Mignon's `agent_id`/`agent_type`), so correlation, recording, and
+validation are unchanged.
 """
 
+import hmac
 import json
+import secrets
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, MutableMapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 
 import mcp_types as types
 from mcp.server.lowlevel import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from mcp.server.transport_security import TransportSecuritySettings
 
 from wheelta_robinhood_agent.agent.hooks import (
     EnvelopeKind,
@@ -57,6 +81,7 @@ from wheelta_robinhood_agent.agent.hooks import (
     ValidationRequest,
     mcp_tool_output,
 )
+from wheelta_robinhood_agent.agent.mignons import Role, role_allowed
 from wheelta_robinhood_agent.agent.model_view import ORDER_CALL_REF_KEY, model_view
 from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyCall, ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import ResultKind, ToolEventRecorder
@@ -64,6 +89,7 @@ from wheelta_robinhood_agent.agent.run_control import RunControl
 from wheelta_robinhood_agent.domain.assembly_context import order_call_ref_for
 from wheelta_robinhood_agent.domain.enums import ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
+from wheelta_robinhood_agent.integrations.loopback_http import LOOPBACK_HOST
 from wheelta_robinhood_agent.integrations.mcp_upstream import McpUpstream, UpstreamError
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 
@@ -78,14 +104,20 @@ PROXY_DEDUP_KEY: Final = "proxy"
 # 102 KB and 57 KB scan envelopes: JSON full of UUIDs and long decimals runs near 2 characters
 # per token, so this stays under the limit at that density.
 MAX_DELIVERED_CHARS: Final = 30_000
+# ADR-0063: the Mignons' loopback servers. Only this host is ever bound or accepted.
+MCP_PATH: Final = "mcp"
 
 __all__ = [
+    "LOOPBACK_HOST",
     "MAX_DELIVERED_CHARS",
     "PROXY_DEDUP_KEY",
     "PROXY_TIMEOUT_MARGIN_SECONDS",
     "TOOL_USE_ID_META",
+    "LoopbackProxyApp",
     "ValidatingProxy",
     "build_proxy_server",
+    "build_role_proxy_servers",
+    "role_path",
     "upstream_timeout_seconds",
 ]
 
@@ -370,3 +402,114 @@ def build_proxy_server(
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
     )
+
+
+def role_path(role: Role, server: str) -> str:
+    """The loopback URL path of one Mignon role's server for one source (ADR-0063)."""
+    return f"/{role.value}/{server}/{MCP_PATH}"
+
+
+def build_role_proxy_servers(
+    proxies: Mapping[str, tuple[ValidatingProxy, ToolRegistry]],
+    allowed_tools: Iterable[str],
+    roles: Iterable[Role],
+) -> dict[Role, dict[str, Server[Any]]]:
+    """For each Mignon role, one server per source (`proxies`: name -> proxy, registry) that
+    lists the role's allowed tools of that source; a source with none is left out.
+
+    The CLI offers a Mignon every tool an inline server lists (real CLI 2.1.283), so a
+    listing never holds the orchestrator's role or a Tier X tool."""
+    allowed = tuple(allowed_tools)
+    out: dict[Role, dict[str, Server[Any]]] = {}
+    for role in roles:
+        if role is Role.ORCHESTRATOR:
+            raise ValueError("the orchestrator is served in-process, never over loopback")
+        tools = role_allowed(role, allowed)
+        servers: dict[str, Server[Any]] = {}
+        for name, (proxy, registry) in proxies.items():
+            names = [t for t in tools if t.startswith(f"mcp__{name}__")]
+            for qualified in names:
+                spec = registry.get(qualified.removeprefix(f"mcp__{name}__"))
+                if spec is None or spec.tier is ToolTier.X:
+                    raise ValueError(f"{qualified} must never be served to a Mignon")
+            if names and _listed_tools(registry, proxy.upstream, names):
+                servers[name] = build_proxy_server(proxy, registry, names)
+        if servers:
+            out[role] = servers
+    return out
+
+
+Scope = MutableMapping[str, Any]
+Receive = Callable[[], Awaitable[MutableMapping[str, Any]]]
+Send = Callable[[MutableMapping[str, Any]], Awaitable[None]]
+
+
+class LoopbackProxyApp:
+    """ASGI app serving `build_role_proxy_servers` at `role_path` (ADR-0063).
+
+    The listener can start before the servers exist (the Mignons' inline configs need its
+    port, and the proxies are built with the options): `mount` adds them once, then
+    `running()` must be entered before any Mignon starts. Every request needs
+    `authorization` (the bearer header, compared in constant time); the MCP transport also
+    refuses a Host or Origin that is not this loopback address (DNS rebinding). Stateless JSON
+    responses: each `tools/call` is one POST."""
+
+    def __init__(self, token: str | None = None) -> None:
+        token = token if token is not None else secrets.token_urlsafe(32)
+        if len(token) < 32:
+            raise ValueError("the loopback token must be at least 32 characters")
+        self.authorization: Final = f"Bearer {token}"
+        self._managers: dict[str, StreamableHTTPSessionManager] | None = None
+
+    def mount(self, servers: Mapping[Role, Mapping[str, Server[Any]]]) -> None:
+        if self._managers is not None:
+            raise ValueError("the loopback servers are mounted once")
+        security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=[f"{LOOPBACK_HOST}:*"],
+            allowed_origins=[f"http://{LOOPBACK_HOST}:*"],
+        )
+        self._managers = {
+            role_path(role, name): StreamableHTTPSessionManager(
+                app=server, json_response=True, stateless=True, security_settings=security
+            )
+            for role, by_name in servers.items()
+            for name, server in by_name.items()
+        }
+
+    @property
+    def paths(self) -> frozenset[str]:
+        return frozenset(self._managers or {})
+
+    @asynccontextmanager
+    async def running(self) -> AsyncIterator[None]:
+        async with AsyncExitStack() as stack:
+            for manager in (self._managers or {}).values():
+                await stack.enter_async_context(manager.run())
+            yield
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            return
+        headers = dict(scope.get("headers") or [])
+        presented = headers.get(b"authorization", b"")
+        if not hmac.compare_digest(presented, self.authorization.encode()):
+            await _refuse(send, 401, "unauthorized")
+            return
+        manager = (self._managers or {}).get(str(scope.get("path", "")))
+        if manager is None:
+            await _refuse(send, 404, "not found")
+            return
+        await manager.handle_request(scope, receive, send)
+
+
+async def _refuse(send: Send, status: int, text: str) -> None:
+    body = json.dumps({"error": text}).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json")],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})

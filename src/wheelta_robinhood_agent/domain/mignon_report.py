@@ -1,4 +1,4 @@
-"""MignonReport v1: the typed hand-back of one research Mignon (ADR-0025, INTERFACES.md).
+"""MignonReport v2: the typed hand-back of one research Mignon (ADR-0025, INTERFACES.md).
 
 A Mignon's final response must contain one JSON object of this shape; prose or a code fence
 around it is dropped (ADR-0043). It carries claims, the code-issued references that support
@@ -17,7 +17,10 @@ Rules (each checked here, in pure code):
   a web page to supply prices, strikes, premiums, Greeks, positions, or buying power
   (CLAUDE.md §11), and orders use only the orchestrator's own quotes and decision facts;
 - references are `evidence:` or `candidate:` strings issued by code; a cited reference or
-  URL that was not delivered to this Mignon is an issue.
+  URL that was not delivered to this Mignon is an issue;
+- ADR-0061 (v2): a finding may name the brief `subject` it answers and carry `values`, the
+  brief's `want` fields as text (a value with a digit makes a web-only finding web-sourced,
+  like its claim). `coverage_gaps` (domain/mignon_brief.py) lists what the report left out.
 
 ADR-0056: `salvage_report` drops only the findings that break these rules (each recorded with
 its reasons, never its claim text) and keeps the rest; a problem outside the findings still
@@ -38,8 +41,10 @@ from wheelta_robinhood_agent.domain.decision_output import (
     load_strict_json,
     validation_issues,
 )
+from wheelta_robinhood_agent.domain.mignon_brief import FieldName, Subject
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
+MAX_VALUES: Final = 20
 REF_PREFIXES: Final = ("evidence:", "candidate:")
 
 Text = Annotated[StrictStr, StringConstraints(min_length=1, max_length=2000)]
@@ -48,6 +53,7 @@ SourceRef = Annotated[
     StrictStr, StringConstraints(pattern=r"^(evidence|candidate):\S+$", max_length=200)
 ]
 WebUrl = Annotated[StrictStr, StringConstraints(pattern=r"^https://\S+$", max_length=2000)]
+ValueText = Annotated[StrictStr, StringConstraints(min_length=1, max_length=300)]
 
 
 class Finding(DomainModel):
@@ -56,6 +62,11 @@ class Finding(DomainModel):
     claim: Text
     refs: tuple[SourceRef, ...]
     web_urls: tuple[WebUrl, ...]
+    # ADR-0061: the brief subject this finding answers, and its requested values.
+    subject: Subject | None = None
+    values: Annotated[dict[FieldName, ValueText], Field(max_length=MAX_VALUES)] = Field(
+        default_factory=dict
+    )
 
     @model_validator(mode="after")
     def _check_sources(self) -> Self:
@@ -67,12 +78,14 @@ class Finding(DomainModel):
 
     @property
     def web_sourced(self) -> bool:
-        """A claim with a number whose only sources are fetched web pages (ADR-0056)."""
-        return not self.refs and any(ch.isdigit() for ch in self.claim)
+        """A claim or value with a number whose only sources are fetched web pages
+        (ADR-0056, ADR-0061)."""
+        texts = (self.claim, *self.values.values())
+        return not self.refs and any(ch.isdigit() for t in texts for ch in t)
 
 
 class MignonReport(DomainModel):
-    """Top-level MignonReport v1."""
+    """Top-level MignonReport v2."""
 
     task: Text
     findings: tuple[Finding, ...]
@@ -84,6 +97,10 @@ class MignonReport(DomainModel):
 
     def cited_urls(self) -> frozenset[str]:
         return frozenset(u for f in self.findings for u in f.web_urls)
+
+    def reported_values(self) -> tuple[tuple[str | None, tuple[str, ...]], ...]:
+        """(subject, value names) per finding, for `mignon_brief.coverage_gaps`."""
+        return tuple((f.subject, tuple(f.values)) for f in self.findings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +127,7 @@ def extract_report_object(raw: str | bytes) -> str | bytes:
 
 
 def parse_mignon_report(raw: str | bytes) -> MignonReportParseResult:
-    """Parse a Mignon's final text into MignonReport v1. Never raises.
+    """Parse a Mignon's final text into MignonReport v2. Never raises.
 
     ADR-0043: the report object is located with `extract_report_object`, so prose or a code
     fence around it is allowed. The object itself is parsed under the same strict JSON rules as
@@ -187,15 +204,17 @@ class FindingPatch(DomainModel):
     claim: Text | None = None
     refs: tuple[SourceRef, ...] | None = None
     web_urls: tuple[WebUrl, ...] | None = None
+    subject: Subject | None = None
+    values: Annotated[dict[FieldName, ValueText], Field(max_length=MAX_VALUES)] | None = None
     drop: bool = False
 
     @model_validator(mode="after")
     def _check_change(self) -> Self:
-        edits = (self.claim, self.refs, self.web_urls)
+        edits = (self.claim, self.refs, self.web_urls, self.subject, self.values)
         if self.drop and any(e is not None for e in edits):
             raise ValueError("a dropped finding takes no other field")
         if not self.drop and all(e is None for e in edits):
-            raise ValueError("a patch must change claim, refs, or web_urls, or drop")
+            raise ValueError("a patch must change a finding field or drop the finding")
         return self
 
 
@@ -289,6 +308,10 @@ def apply_report_patch(
             updated["refs"] = list(p.refs)
         if p.web_urls is not None:
             updated["web_urls"] = list(p.web_urls)
+        if p.subject is not None:
+            updated["subject"] = p.subject
+        if p.values is not None:
+            updated["values"] = dict(p.values)
         merged[i] = updated
         patched.add(p.finding)
     keep = [i for i, origin in enumerate(base.origins) if origin not in dropped]
@@ -354,11 +377,13 @@ def report_issues(
 _FINDING_AT: Final = re.compile(r"^findings\.(\d+)(?:\.|$)")
 
 
-_FINDING_FIELDS: Final = ("claim", "refs", "web_urls")
+_FINDING_FIELDS: Final = ("claim", "refs", "web_urls", "subject", "values")
 _SAFE_REASONS: Final = {
     "unknown_ref": "a cited ref was not delivered to this Mignon",
     "unknown_url": "a cited URL was not fetched by this Mignon (or returned an HTTP error)",
-    "extra_forbidden": "the finding has a field other than claim, refs, and web_urls",
+    "extra_forbidden": (
+        "the finding has a field other than claim, refs, web_urls, subject, and values"
+    ),
 }
 _ECHO: Final = re.compile(r"^(.*?\bduplicate [a-z_ ]+?): .*$", re.DOTALL)
 MAX_REASON_CHARS: Final = 200

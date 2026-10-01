@@ -103,7 +103,7 @@ from wheelta_robinhood_agent.agent.proxy_dispatch import (
 from wheelta_robinhood_agent.agent.recorder import ResultKind, ToolEventRecorder
 from wheelta_robinhood_agent.agent.run_control import RunControl
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
-from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules
+from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules, rule_keys
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.decision_output import ParseIssue, load_strict_json
 from wheelta_robinhood_agent.domain.enums import (
@@ -114,6 +114,12 @@ from wheelta_robinhood_agent.domain.enums import (
     ToolTier,
 )
 from wheelta_robinhood_agent.domain.gating import check_venue, executes_orders, order_venue
+from wheelta_robinhood_agent.domain.mignon_brief import (
+    MignonBrief,
+    MignonBriefParsed,
+    coverage_gaps,
+    parse_mignon_brief,
+)
 from wheelta_robinhood_agent.domain.mignon_report import (
     REF_PREFIXES,
     DroppedFinding,
@@ -727,6 +733,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     # ADR-0047: reports under repair, by Mignon `agent_id`.
     drafts: dict[str, _MignonDraft] = {}
     ws = deps.rules.workspace
+    # ADR-0061: the rule keys a Mignon brief may name in `criteria`.
+    brief_rule_keys = rule_keys(deps.rules)
     prefix = deps.workspace_prefix
     owned_caps = {
         WorkspaceKind.WATCHLIST: ("workspace.max_owned_watchlists", ws.max_owned_watchlists),
@@ -804,6 +812,13 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             raise _Denied("subagent_type must be a Mignon type on an allowed model")
         for arg in ("description", "prompt"):
             _required_str(tool_input, arg)
+        parsed = parse_mignon_brief(cast(str, tool_input["prompt"]), brief_rule_keys)
+        if not isinstance(parsed, MignonBriefParsed):
+            # ADR-0061: the issues are the feedback; the orchestrator fixes and spawns again.
+            issues = "; ".join(
+                f"{i.loc}: {i.message}" if i.loc else i.message for i in parsed.issues[:8]
+            )
+            raise _Denied(f"prompt must be one MignonBrief JSON object (ADR-0061): {issues}")
         if spawned >= limits.max_per_run:
             raise _Denied(f"mignons.max_per_run={limits.max_per_run} reached")
         if len(active) >= limits.max_concurrent:
@@ -1331,6 +1346,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 else:
                     report_obj = cast(dict[str, object], loaded[1])
             report_data: JsonValue = None
+            coverage: tuple[str, ...] = ()
             dropped: tuple[DroppedFinding, ...] = ()
             web_sourced: tuple[int, ...] = ()
             kept: tuple[int, ...] = ()
@@ -1351,6 +1367,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                     report_data = deps.redactor.redact(salvaged.report.model_dump(mode="json"))
                     dropped, kept = salvaged.dropped, salvaged.origins
                     web_sourced = web_sourced_indices(salvaged.report)
+                    brief = spawn_brief(call)
+                    if brief is not None:
+                        coverage = coverage_gaps(brief, salvaged.report.reported_values())
             valid = not issues
             if draft is not None and repaired:
                 # The original report and every patch stay on record (restricted evidence).
@@ -1380,6 +1399,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                     for d in dropped
                 ],
                 "web_sourced_findings": list(web_sourced),
+                # ADR-0061: brief subjects and `want` values the report did not cover.
+                "coverage_gaps": [deps.redactor.redact_text(g) for g in coverage],
             }
             if draft is not None and repaired:
                 data["repair"] = {
@@ -1463,6 +1484,14 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 ),
             )
         )
+
+    def spawn_brief(call: _Call) -> MignonBrief | None:
+        """The brief the spawn was allowed with (PreToolUse checked it)."""
+        prompt = call.effective_input.get("prompt")
+        if not isinstance(prompt, str):
+            return None
+        parsed = parse_mignon_brief(prompt, brief_rule_keys)
+        return parsed.brief if isinstance(parsed, MignonBriefParsed) else None
 
     def active_prompts() -> list[str]:
         """Task prompts of the Mignons now running (their Agent calls are still open)."""

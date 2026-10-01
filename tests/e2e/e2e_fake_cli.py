@@ -141,10 +141,12 @@ class FakeModel:
         **extra: Any,
     ) -> ToolTurn:
         """An `Agent` call whose Mignon runs `mignon`; `extra` adds tool inputs. `repair`
-        answers a SubagentStop block (ADR-0047); without it the Mignon repeats its text."""
+        answers a SubagentStop block (ADR-0047); without it the Mignon repeats its text.
+        `prompt` is the brief's objective unless it is already a JSON brief (ADR-0061)."""
+        brief = prompt if prompt.lstrip().startswith("{") else json.dumps({"objective": prompt})
         tool_input = {
             "description": description,
-            "prompt": prompt,
+            "prompt": brief,
             "subagent_type": subagent_type,
             **extra,
         }

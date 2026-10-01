@@ -176,7 +176,23 @@ def add_fake_wheelta(world: FakeWorld) -> FakeWorld:
     world.handlers["wheelta"] = {
         t.name: (lambda args: _text({"ok": True})) for t in WHEELTA_REGISTRY.tools
     }
+    # ADR-0062: the trusted pre-render read gets the captured board status.
+    world.handlers["wheelta"]["wheelta_board_status"] = lambda args: dict(BOARD_STATUS_RESULT)
     return world
+
+
+BOARD_STATUS_RESULT: dict[str, Any] = {
+    "structuredContent": json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "fixtures"
+            / "wheelta"
+            / "results"
+            / "board_status.json"
+        ).read_text()
+    )["structuredContent"],
+    "content": [],
+}
 
 
 def add_fake_tavily(world: FakeWorld) -> FakeWorld:

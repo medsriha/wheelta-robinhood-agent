@@ -555,6 +555,59 @@ def test_production_defaults_proxy_both_verified_sources(
     assert statuses["tavily"] == "connected"
 
 
+def test_board_status_is_read_by_trusted_code_and_rendered(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0062: the board status reaches the orchestrator's prompt from a trusted read
+    through the Wheelta upstream, recorded as run metadata, never as a tool call."""
+    h = harness()
+    assert h.run() == 0
+    (cli,) = h.clis
+    prompt = cli.options.system_prompt or ""
+    expected = (
+        '{"status":"ready","build_id":"df52f70ac584","as_of":"2026-09-28T20:58:23+00:00",'
+        '"next_refresh_at":"2026-09-29T11:45:00+00:00"}'
+    )
+    assert f"- Wheelta board, read by code before this session: {expected}" in prompt
+    (event,) = [
+        e["board_status"] for e in h.events(RunEventType.METADATA, h.run_id) if "board_status" in e
+    ]
+    assert event["status"] == "ready" and event["build_id"] == "df52f70ac584"
+    assert ("wheelta", "wheelta_board_status", {}) in h.world.upstream_calls
+    with h.conn() as c:
+        tools = {r.identity.tool for r in tool_call_records(c, h.run_id)}
+    assert "wheelta_board_status" not in tools
+
+
+def test_board_status_renders_building_and_unavailable(harness: Callable[..., Harness]) -> None:
+    """ADR-0062: `board_building` is a normal state; a failed Wheelta connect is unavailable.
+    Neither stops the session."""
+    h = harness()
+    h.world.handlers["wheelta"]["wheelta_board_status"] = lambda args: {
+        "isError": True,
+        "content": [
+            {
+                "type": "text",
+                "text": "The screener board is being rebuilt. Retry after 120s. (requestId: req-1)",
+            }
+        ],
+    }
+    assert h.run() == 0
+    prompt = h.clis[0].options.system_prompt or ""
+    assert 'read by code before this session: {"status":"building"}' in prompt
+    (event,) = [
+        e["board_status"] for e in h.events(RunEventType.METADATA, h.run_id) if "board_status" in e
+    ]
+    assert event["retry_after_seconds"] == 120 and event["request_id"] == "req-1"
+
+    _tick(h, h.clock.now + timedelta(minutes=5))
+    h.world.statuses["wheelta"] = "failed"
+    assert h.run() == 0
+    prompt = h.clis[-1].options.system_prompt or ""
+    assert 'read by code before this session: {"status":"unavailable","reason":' in prompt
+    assert "build_id" not in prompt.split("read by code before this session: ", 1)[1][:200]
+
+
 def test_an_unverified_registry_is_still_withheld(harness: Callable[..., Harness]) -> None:
     h = harness()
     unverified = WHEELTA_REGISTRY.model_copy(update={"verified": False})

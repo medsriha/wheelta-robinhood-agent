@@ -453,3 +453,25 @@ def _scalar(value: object) -> str:
 def _cell(value: object) -> str:
     text = " → ".join(_scalar(v) for v in value) if isinstance(value, list) else _scalar(value)
     return text.replace("|", "\\|")
+
+
+def rule_keys(rules: TradingRules) -> frozenset[str]:
+    """Every dotted path a Mignon brief may name in `criteria` (ADR-0061): each section
+    (`meta` excluded) and each field of a section, recursing into nested sections
+    (`data_quality.freshness.quote_max_age_seconds`). Table arrays are named as a whole."""
+    keys: set[str] = set()
+
+    def walk(prefix: str, model: BaseModel) -> None:
+        keys.add(prefix)
+        for name in type(model).model_fields:
+            value = getattr(model, name)
+            path = f"{prefix}.{name}"
+            if isinstance(value, BaseModel):
+                walk(path, value)
+            else:
+                keys.add(path)
+
+    for name in type(rules).model_fields:
+        if name != "meta":
+            walk(name, getattr(rules, name))
+    return frozenset(keys)

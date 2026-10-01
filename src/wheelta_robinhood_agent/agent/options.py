@@ -14,16 +14,23 @@ Pure: builds configuration only, no I/O. The session:
   web_cache_lookup and get_decision_facts) or `PROXY_SDK_SERVER_NAMES` (the validating proxy
   for `robinhood`, `wheelta`, and `tavily`, ADR-0023, ADR-0058). No other server type
   (stdio, SSE) is ever configured;
+- ADR-0063: with `mignon_mcp_servers`, each Mignon definition carries inline loopback HTTP
+  servers (`agent/proxy.py` `LoopbackProxyApp`) under the proxied source names, so its own
+  tools reach it while the orchestrator's in-process servers list only the orchestrator's.
+  `_check_agents` accepts only `http://127.0.0.1:<port>/<role>/<source>/mcp` with a bearer
+  header, for a proxied source and the definition's own role;
 - runs in an explicit scratch directory;
 - uses the pinned model (`Settings.AGENT_MODEL`) and the given hooks (layer 3).
 
 Field names verified against claude-agent-sdk 0.2.160 `types.py` `ClaudeAgentOptions`.
 """
 
+import dataclasses
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
-from typing import Final, Literal, cast
+from typing import Any, Final, Literal, cast
+from urllib.parse import urlsplit
 
 from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import (
@@ -43,6 +50,7 @@ from wheelta_robinhood_agent.agent.mignons import (
     parse_agent_name,
     role_allowed,
 )
+from wheelta_robinhood_agent.agent.proxy import LOOPBACK_HOST, role_path
 from wheelta_robinhood_agent.agent.tool_access import (
     DISALLOWED_BUILTINS,
     SESSION_BUILTINS,
@@ -95,6 +103,7 @@ def build_agent_options(
     mignon_prompts: Mapping[MignonType, str] | None = None,
     mignon_limits: MignonLimits | None = None,
     mignon_models: Sequence[str] | None = None,
+    mignon_mcp_servers: Mapping[Role, Mapping[str, McpHttpServerConfig]] | None = None,
 ) -> ClaudeAgentOptions:
     """Assemble the session options. Raises `AgentOptionsError` on any unsafe input.
 
@@ -104,6 +113,8 @@ def build_agent_options(
     may share it. Mignons are configured only with both `mignon_prompts` (one rendered prompt
     per type) and `mignon_limits`, and only when `Agent` is allowed. `mignon_models` are the
     exact IDs the orchestrator may assign (`Settings.mignon_models`); None means `model`.
+    `mignon_mcp_servers` maps a Mignon role to its inline loopback servers by source name
+    (ADR-0063); every definition of that role carries them.
     """
     if not model.strip():
         raise AgentOptionsError("model must be pinned")
@@ -141,6 +152,10 @@ def build_agent_options(
             models=tuple(mignon_models) if mignon_models else (model,),
             limits=mignon_limits,
         )
+        if mignon_mcp_servers:
+            agents = _with_inline_servers(agents, mignon_mcp_servers)
+    elif mignon_mcp_servers:
+        raise AgentOptionsError("Mignon servers are given but no Mignons are configured")
     if not set(DISALLOWED_BUILTINS) <= set(tool_access.disallowed_tools):
         raise AgentOptionsError("not every unneeded built-in is disallowed")
     names = [s.name for s in mcp_servers]
@@ -177,6 +192,26 @@ def build_agent_options(
     return options
 
 
+def _with_inline_servers(
+    agents: dict[str, AgentDefinition],
+    servers: Mapping[Role, Mapping[str, McpHttpServerConfig]],
+) -> dict[str, AgentDefinition]:
+    """Each Mignon definition with its role's inline servers, sorted by source name."""
+    out: dict[str, AgentDefinition] = {}
+    for name, definition in agents.items():
+        parsed = parse_agent_name(name)
+        if parsed is None:
+            raise AgentOptionsError(f"sub-agent {name!r} is not a Mignon type and model")
+        role_servers = servers.get(Role(parsed[0].value)) or {}
+        inline: list[str | dict[str, Any]] | None = (
+            [{source: dict(role_servers[source])} for source in sorted(role_servers)]
+            if role_servers
+            else None
+        )
+        out[name] = dataclasses.replace(definition, mcpServers=inline)
+    return out
+
+
 def assert_safe_options(options: ClaudeAgentOptions) -> None:
     """Re-check the built options: dontAsk, no bypass, isolated settings, restricted tools."""
     if options.permission_mode == "bypassPermissions":
@@ -202,7 +237,8 @@ def assert_safe_options(options: ClaudeAgentOptions) -> None:
 def _check_agents(options: ClaudeAgentOptions) -> None:
     """Sub-agents are only the Mignons: `<type>--<model>` names, their role's allowed tools,
     exactly the model the name pins (never an alias such as `inherit`), no
-    permission/MCP/skill/memory overrides, never in background."""
+    permission/skill/memory overrides, no MCP servers but the role's loopback ones (ADR-0063),
+    never in background."""
     agents = options.agents or {}
     if agents and DELEGATION_TOOL not in options.allowed_tools:
         raise AgentOptionsError("sub-agents are defined but Agent is not allowed")
@@ -222,9 +258,10 @@ def _check_agents(options: ClaudeAgentOptions) -> None:
             raise AgentOptionsError(f"Mignon {name} must not run in the background")
         if not isinstance(definition.maxTurns, int) or definition.maxTurns < 1:
             raise AgentOptionsError(f"Mignon {name} needs a positive turn cap")
+        if definition.mcpServers is not None:
+            _check_inline_servers(name, role, definition.mcpServers)
         overrides = (
             definition.disallowedTools,
-            definition.mcpServers,
             definition.skills,
             definition.memory,
             definition.permissionMode,
@@ -232,6 +269,47 @@ def _check_agents(options: ClaudeAgentOptions) -> None:
         )
         if any(o is not None for o in overrides):
             raise AgentOptionsError(f"Mignon {name} overrides a session setting")
+
+
+def _check_inline_servers(name: str, role: Role, entries: Sequence[object]) -> None:
+    """A Mignon's inline servers: one `{source: config}` per proxied source, each an HTTP
+    server at `http://127.0.0.1:<port>/<role>/<source>/mcp` with a bearer header. Nothing
+    else: no server reference by name, stdio, SDK, or remote URL."""
+    if not entries:
+        raise AgentOptionsError(f"Mignon {name} has an empty MCP server list")
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or len(entry) != 1:
+            raise AgentOptionsError(f"Mignon {name} MCP servers must be inline loopback servers")
+        ((source, config),) = entry.items()
+        if source not in PROXY_SDK_SERVER_NAMES or source in seen:
+            raise AgentOptionsError(f"Mignon {name} MCP server {source!r} is not a proxied source")
+        seen.add(source)
+        if not isinstance(config, dict) or set(config) != {"type", "url", "headers"}:
+            raise AgentOptionsError(f"Mignon {name} MCP server {source!r} is malformed")
+        url = config.get("url")
+        headers = config.get("headers")
+        parts = urlsplit(url) if isinstance(url, str) else None
+        if (
+            config.get("type") != "http"
+            or parts is None
+            or parts.scheme != "http"
+            or parts.hostname != LOOPBACK_HOST
+            or parts.port is None
+            or parts.path != role_path(role, source)
+            or parts.query
+            or parts.fragment
+            or parts.username is not None
+        ):
+            raise AgentOptionsError(f"Mignon {name} MCP server {source!r} is not its loopback URL")
+        auth = headers.get("Authorization") if isinstance(headers, dict) else None
+        if (
+            not isinstance(headers, dict)
+            or set(headers) != {"Authorization"}
+            or not isinstance(auth, str)
+            or not auth.startswith("Bearer ")
+        ):
+            raise AgentOptionsError(f"Mignon {name} MCP server {source!r} needs a bearer header")
 
 
 def _check_server(name: str, config: McpServerConfig) -> None:
