@@ -171,6 +171,7 @@ def test_filled_order_is_not_working_and_carries_executions() -> None:
 @pytest.mark.parametrize(
     ("state", "status"),
     [
+        ("unconfirmed", AttemptStatus.PLACED),
         ("queued", AttemptStatus.PLACED),
         ("pending_cancelled", AttemptStatus.PLACED),
         ("partially_filled", AttemptStatus.PARTIALLY_FILLED),
@@ -232,6 +233,17 @@ def test_place_result_maps_to_broker_order() -> None:
     _check_provenance(out, CALL)
     (obs,) = out.broker_orders
     assert obs.broker_order_id == ORDER_ID and out.open_orders == ()
+
+
+def test_unconfirmed_place_result_is_a_working_order() -> None:
+    """A just-created order reported `unconfirmed` keeps its identity (2026-10-01 HIMS)."""
+    order = _order(state="unconfirmed")
+    out = map_order_placement(_request("place_option_order", {"order": order}), _ids())
+    (obs,) = out.broker_orders
+    assert obs.broker_order_id == ORDER_ID and obs.status is AttemptStatus.PLACED
+    read = map_option_orders(_request("get_option_orders", {"orders": [order]}), _ids())
+    (working,) = read.open_orders[0].orders
+    assert working.broker_order_ref == ORDER_ID and working.unfilled_quantity == 2
 
 
 def test_place_result_without_order_raises() -> None:

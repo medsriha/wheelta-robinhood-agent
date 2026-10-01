@@ -73,7 +73,7 @@ POSITIONS_TOOL: Final = "get_option_positions"
 SIMULATED_SCOPE_PREFIX: Final = "simulated:"
 # Names that act on orders; never forwarded whatever their registry tier.
 _ORDER_ACTION: Final = re.compile(r"^(review|place|replace|cancel|exercise)_")
-_WORKING: Final = frozenset({"queued", "confirmed", "partially_filled"})
+_WORKING: Final = frozenset({"unconfirmed", "queued", "confirmed", "partially_filled"})
 # get_option_orders arguments a simulated order can be matched against.
 _MATCHABLE: Final = frozenset({"account_number", "order_id", "state", "placed_agent"})
 _CREATED_GTE: Final = "created_at_gte"

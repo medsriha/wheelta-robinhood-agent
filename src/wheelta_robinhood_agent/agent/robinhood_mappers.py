@@ -527,9 +527,14 @@ def map_portfolio(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> M
 # --------------------------------------------------------------------------------------------
 
 # Broker order `state` -> AttemptStatus. `pending_cancelled` is still working until a read
-# shows a terminal state; `failed` and `voided` never filled on their own.
+# shows a terminal state; `failed` and `voided` never filled on their own. `unconfirmed` is
+# not in the server's published state list but is Robinhood's state for a just-created order
+# (unverified for this server): a live HIMS place on 2026-10-01 was accepted while its result
+# failed validation, so the order went unlinked and was cancelled. Treating it as working is
+# the safe reading: it is counted, gated, and cleaned up like any working order.
 _ORDER_STATUS: Final[Mapping[str, AttemptStatus]] = MappingProxyType(
     {
+        "unconfirmed": AttemptStatus.PLACED,
         "queued": AttemptStatus.PLACED,
         "confirmed": AttemptStatus.PLACED,
         "pending_cancelled": AttemptStatus.PLACED,
@@ -541,7 +546,9 @@ _ORDER_STATUS: Final[Mapping[str, AttemptStatus]] = MappingProxyType(
         "failed": AttemptStatus.REJECTED,
     }
 )
-_WORKING_STATES: Final = frozenset({"queued", "confirmed", "partially_filled", "pending_cancelled"})
+_WORKING_STATES: Final = frozenset(
+    {"unconfirmed", "queued", "confirmed", "partially_filled", "pending_cancelled"}
+)
 # Arguments that narrow a list read; any of them makes it incomplete.
 _ORDER_FILTERS: Final = frozenset(
     {
