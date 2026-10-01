@@ -83,9 +83,11 @@ from wheelta_robinhood_agent.integrations.robinhood.registry import (
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
 from wheelta_robinhood_agent.ledger.db import connect
+from wheelta_robinhood_agent.ledger.errors import IdentityConflict
 from wheelta_robinhood_agent.ledger.lock import RUN_LOCK_OBJID, try_advisory_lock
 from wheelta_robinhood_agent.ledger.runs import open_run_slot, run_projection
 from wheelta_robinhood_agent.ledger.tool_calls import tool_call_records
+from wheelta_robinhood_agent.orchestrator import main as main_module
 from wheelta_robinhood_agent.orchestrator.main import OrchestratorDeps, run_once
 from wheelta_robinhood_agent.orchestrator.market_session import (
     CalendarOutOfRange,
@@ -729,6 +731,22 @@ def test_dry_run_records_an_unsubmitted_proposal_and_audits_it(
     assert h.events(RunEventType.AUDIT_STATUS)[0]["status"] == "completed"
     # Wheelta is verified (ADR-0041): not withheld, so the model is not told it is.
     assert "wheelta" not in h.clis[0].user_messages[0]
+
+
+def test_unpersistable_audit_findings_fail_the_audit_not_the_finalization(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A finding the ledger refuses (e.g. citing another run's tool call) is a failed audit
+    # (R16): the run still records its audit status, alerts, and finalizes.
+    def refuse(conn: Any, finding: Any) -> Any:
+        raise IdentityConflict("tool call belongs to another run")
+
+    monkeypatch.setattr(main_module.ledger_evidence, "insert_audit_finding", refuse)
+    h = harness()
+    assert h.run() == 1
+    assert h.status() is RunStatus.FAILED
+    assert h.events(RunEventType.AUDIT_STATUS)[0]["status"] == "failed"
+    assert "audit_failure" in h.notifier.alert_kinds()
 
 
 def test_invalid_agent_output_still_assembles_from_events(harness: Callable[..., Harness]) -> None:

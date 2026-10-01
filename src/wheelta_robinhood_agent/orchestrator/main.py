@@ -811,12 +811,9 @@ class _Run:
         except Exception as exc:  # noqa: BLE001 - preserve the email if context loading fails
             candidates, reports = (), ()
             research_unavailable = type(exc).__name__
+        # ADR-0064: only what needs the owner; passing and unverifiable checks are not news.
         audit_details = (
-            tuple(
-                f"{f.check_id.value} {f.outcome.value}: {f.detail}"
-                for f in audit.findings
-                if f.outcome is not AuditOutcome.PASS
-            )
+            tuple(f"{f.check_id.value}: {f.detail}" for f in audit.violations)
             + tuple(f"{e.check_id.value}: {e.error_type}: {e.message}" for e in audit.errors)
             if audit is not None
             else ()
@@ -843,7 +840,6 @@ class _Run:
                 else None
             ),
             audit_violations=len(audit.violations) if audit is not None else 0,
-            audit_unverifiable=len(audit.unverifiable_checks) if audit is not None else 0,
             alerts=tuple(k.value for k in self.alerts_sent),
             next_run_at=self.next_run.not_before if self.next_run else None,
             next_run_source=self.next_run.source.value if self.next_run else None,
@@ -1660,8 +1656,18 @@ class _Run:
         self.audit_ran = True
         self.audit_result = result
         if result is not None:
-            for finding in result.findings:
-                ledger_evidence.insert_audit_finding(self.conn, finding)
+            try:
+                for finding in result.findings:
+                    ledger_evidence.insert_audit_finding(self.conn, finding)
+            except Exception as exc:  # noqa: BLE001 - findings not persisted: a failed audit (R16)
+                self.log.exception(
+                    "audit findings not persisted", extra={"error_type": type(exc).__name__}
+                )
+                self.summary_diagnostics.append(
+                    self.redactor.redact_text(f"Audit: {type(exc).__name__}: {exc}")
+                )
+                result = None
+                self.audit_result = None
         status = result.status if result is not None else AuditStatus.FAILED
         self.event(
             RunEventType.AUDIT_STATUS,

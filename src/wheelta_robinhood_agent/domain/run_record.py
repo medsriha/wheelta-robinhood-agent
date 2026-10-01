@@ -180,6 +180,9 @@ class DecisionRecord(DomainModel):
     replacement_ref: Ref | None
     underlying: NonEmptyStr | None
     position_id: UUID | None
+    # The target's contract from its code-issued ref (a held position or a candidate); None
+    # when the target did not resolve or carries no instrument. Shown for HOLD (ADR-0064).
+    target_occ_symbol: OccSymbol | None = None
     depends_on_decision_refs: tuple[Ref, ...] = ()
     rationale: NonEmptyStr
     thesis: NonEmptyStr | None

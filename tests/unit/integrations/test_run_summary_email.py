@@ -30,8 +30,8 @@ from wheelta_robinhood_agent.integrations.notifications.summarizer import (
 from wheelta_robinhood_agent.observability.logging import configure_logging
 from wheelta_robinhood_agent.observability.redaction import Redactor
 from wheelta_robinhood_agent.observability.run_summary import (
+    FACTS_HEADING,
     PROSE_UNAVAILABLE,
-    ConsideredOption,
     RunSummaryInput,
     SlotSummaryInput,
 )
@@ -129,8 +129,8 @@ def test_sends_prose_and_facts_with_an_idempotency_key() -> None:
     body = json.loads(llm.content)
     assert body["model"] == "claude-test-model"
     facts = json.loads(body["messages"][0]["content"])
-    assert facts["agents"][0]["run"]["run_id"] == "run-1"
     assert facts["agents"][0]["agent"] == "Buy-to-Close agent"
+    assert "run-1" not in json.dumps(facts)  # ADR-0064: no identifiers reach the writer
     assert "tools" not in body
     (mail,) = router.requests["api.resend.com"]
     assert mail.headers["authorization"] == f"Bearer {RESEND_KEY}"
@@ -139,7 +139,8 @@ def test_sends_prose_and_facts_with_an_idempotency_key() -> None:
     assert sent["to"] == [RECIPIENT] and sent["from"] == "Wheelta Agent <agent@wheelta.com>"
     assert sent["subject"].startswith("[Wheelta agent] dry run · close: completed, no trades")
     assert sent["text"].startswith("Nothing traded; the agent held.")
-    assert "Recorded facts (authoritative)" in sent["text"] and "<pre" in sent["html"]
+    assert FACTS_HEADING in sent["text"] and FACTS_HEADING in sent["html"]
+    assert "run-1" not in sent["text"]
 
 
 @pytest.mark.parametrize(
@@ -167,13 +168,6 @@ def test_failure_context_reaches_writer_and_delivered_fallback_without_secrets()
             "status": RunStatus.FAILED,
             "reason": "session_failed",
             "diagnostic_details": (f"PermissionError: invalid credential {ANTHROPIC_KEY}",),
-            "candidates": (
-                ConsideredOption(
-                    candidate_ref="candidate:aapl",
-                    underlying="AAPL",
-                    occ_symbol="AAPL  261016P00190000",
-                ),
-            ),
         }
     )
     router = Router(anthropic=[httpx.Response(529)])
@@ -181,11 +175,12 @@ def test_failure_context_reaches_writer_and_delivered_fallback_without_secrets()
     assert result.status is EmailDeliveryStatus.SENT and not result.prose_written
     request_body = json.loads(router.requests["api.anthropic.com"][0].content)
     facts = json.loads(request_body["messages"][0]["content"])
-    assert "PermissionError" in facts["agents"][0]["diagnostic_details"][0]
-    assert facts["agents"][0]["candidates"][0]["selection"] == "unknown"
+    attention = facts["agents"][0]["needs_attention"]
+    assert any("PermissionError" in item for item in attention)
+    assert facts["agents"][0]["decisions_known"] is False
     sent = json.loads(router.requests["api.resend.com"][0].content)
     assert "PermissionError" in sent["text"] and "PermissionError" in sent["html"]
-    assert "AAPL  261016P00190000" in sent["text"]
+    assert "Decisions unknown" in sent["text"]
     assert ANTHROPIC_KEY not in repr(facts) and ANTHROPIC_KEY not in repr(sent)
 
 
@@ -211,18 +206,18 @@ def test_one_email_covers_both_agents_in_order() -> None:
         json.loads(router.requests["api.anthropic.com"][0].content)["messages"][0]["content"]
     )
     assert [a["agent"] for a in facts["agents"]] == ["Buy-to-Close agent", "Sell Options agent"]
-    assert facts["agents"][0]["run"]["session_started"] is False
-    assert facts["agents"][1]["run"]["session_started"] is True
-    assert facts["tick"]["next_run_source"] == "agent"
+    assert facts["agents"][0]["session_started"] is False
+    assert facts["agents"][1]["session_started"] is True
+    assert facts["next_run"] == "Next run: 2026-09-28 15:05 UTC"
     sent = json.loads(router.requests["api.resend.com"][0].content)
     assert sent["subject"].startswith(
         "[Wheelta agent] dry run · close: skipped_no_open_shorts · sell: completed, no trades"
     )
     text = sent["text"]
-    assert text.index("== Buy-to-Close agent ==") < text.index("== Sell Options agent ==")
-    assert "Status: skipped_no_open_shorts (no open short option positions)" in text
-    assert "No session started." in text
-    assert "Next run of both agents not before: 2026-09-28T15:05:00+00:00 (agent)" in text
+    assert text.index("Buy-to-Close agent:") < text.index("Sell Options agent:")
+    assert "Buy-to-Close agent: did not run (no open short option positions)" in text
+    assert "Sell Options agent: completed" in text
+    assert "Next run: 2026-09-28 15:05 UTC" in text
 
 
 def test_a_tick_summary_needs_one_slot() -> None:

@@ -1,5 +1,7 @@
 """V6 No retry, stop on unknown: pass / violation / unverifiable, live and dry run."""
 
+from uuid import uuid4
+
 from test_audit_builders import (
     BTC,
     NEW_PUT,
@@ -270,6 +272,22 @@ def test_missing_place_event_and_denied_place() -> None:
     f = check_v6(s.ctx())
     assert reasons(f, "4") == ["missing_evidence"]
     assert outcomes(f, "3") == [P]
+
+
+def test_order_observed_from_another_run_is_not_missing_evidence() -> None:
+    # A sell run observes the close run's order (ADR-0057): its intent and place call belong
+    # to that run, so V6.4 must not cite them (the ledger refuses cross-run citations).
+    s = Scenario()
+    place, _ = live_csp(s)
+    ours = s.order_record(place.identity.tool_call_id)
+    assert ours.intent is not None
+    other_intent = ours.intent.model_copy(
+        update={"intent_id": uuid4(), "run_id": uuid4(), "place_tool_call_id": uuid4()}
+    )
+    s.extra_orders.append(OrderRecord(intent=other_intent, broker_order=None))
+    f = check_v6(s.ctx())
+    assert reasons(f, "4") == []
+    assert all(other_intent.place_tool_call_id not in x.tool_call_ids for x in f)
 
 
 def test_unknown_instrument() -> None:

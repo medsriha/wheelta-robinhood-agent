@@ -946,6 +946,7 @@ class _Assembler:
             replacement_ref=plan.decision.replacement_ref,
             underlying=target.underlying if target else None,
             position_id=target.position_id if target else None,
+            target_occ_symbol=target.occ_symbol if target else None,
             depends_on_decision_refs=tuple(plan.funding),
             rationale=plan.decision.rationale,
             thesis=plan.decision.thesis,

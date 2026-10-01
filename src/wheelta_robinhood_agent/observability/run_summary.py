@@ -1,19 +1,24 @@
-"""Run-summary email content (ADR-0029). Pure: no HTTP, no clock, no LLM.
+"""Run-summary email content (ADR-0029, ADR-0064). Pure: no HTTP, no clock, no LLM.
 
 ADR-0057: one summary is sent per tick in which an agent session started. A tick runs the
 Buy-to-Close agent, then the Sell Options agent, each its own run; the email
 (`SlotSummaryInput`) has one section per agent run, in that order, a skipped agent included with
 its reason, then the tick's next run. Each section comes from one `RunSummaryInput`, built from
 what the run recorded (the assembled RunRecord, the audit status, alerts, the next run), never
-from the agent's free text alone. `summary_facts` is the redacted JSON handed to the prose
-writer and `render_facts_text` is the deterministic facts block every email carries, so a figure
-in the prose can always be checked against the recorded one. Delivery is in
-``integrations/notifications``.
+from the agent's free text alone.
+
+ADR-0064: the email says what each agent did and why. Each decision is written in plain words
+with its order outcomes and the agent's rationale; anything that needs the owner follows under
+"Needs attention" only when present. Identifiers, refs, reason codes, metrics, fact gaps and
+research stay in the ledger (`scripts/trace_run.py`). `slot_summary_facts` is the redacted JSON
+handed to the prose writer and `render_slot_facts_text` the deterministic block every email
+carries; both come from the same view, so a figure in the prose can be checked against it.
+Delivery is in ``integrations/notifications``.
 """
 
 import html
-from datetime import datetime
-from decimal import Decimal
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -22,30 +27,39 @@ from wheelta_robinhood_agent.domain.enums import (
     AgentRole,
     AppEnv,
     AttemptStatus,
+    DecisionAction,
     ExecutionMode,
+    OrderSide,
     OrderVenue,
     RunStatus,
 )
 from wheelta_robinhood_agent.domain.gating import executes_orders, with_default_venue
 from wheelta_robinhood_agent.domain.mignon_report import MignonReport
+from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.orders import Attempt, ReasonCode
-from wheelta_robinhood_agent.domain.run_record import LegRecord, RunRecord, UnassociatedAction
+from wheelta_robinhood_agent.domain.run_record import (
+    DecisionOutputStatus,
+    DecisionRecord,
+    LegRecord,
+    RunRecord,
+    UnassociatedAction,
+)
+from wheelta_robinhood_agent.observability.alerts import AlertKind
 from wheelta_robinhood_agent.observability.redaction import Redactor
 
 SUBJECT_PREFIX = "[Wheelta agent]"
-FACTS_HEADING = "Recorded facts (authoritative)"
-PROSE_UNAVAILABLE = "The written summary is unavailable for this run; the recorded facts follow."
+FACTS_HEADING = "What the agents did"
+PROSE_UNAVAILABLE = "The written overview is unavailable for this tick."
 
 
 class ConsideredOption(BaseModel):
-    """A candidate delivered during research, with recorded limitations, not inferred motives."""
+    """A candidate delivered during research. Meeting one is not proof it was evaluated."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     candidate_ref: str
     underlying: str
     occ_symbol: str
-    gaps: tuple[str, ...] = ()
 
 
 class RunSummaryInput(BaseModel):
@@ -71,15 +85,16 @@ class RunSummaryInput(BaseModel):
     # None when the audit did not run in this invocation.
     audit_status: str | None = None
     audit_violations: int = Field(default=0, ge=0)
-    audit_unverifiable: int = Field(default=0, ge=0)
     alerts: tuple[str, ...] = ()
     next_run_at: AwareDatetime | None = None
     next_run_source: str | None = None
     next_run_rationale: str | None = None
+    diagnostic_details: tuple[str, ...] = ()
+    # Audit violations and check errors only; passing and unverifiable checks are not news.
+    audit_details: tuple[str, ...] = ()
     candidates: tuple[ConsideredOption, ...] = ()
     research_reports: tuple[MignonReport, ...] = ()
-    diagnostic_details: tuple[str, ...] = ()
-    audit_details: tuple[str, ...] = ()
+    # The loader's error type when research could not be read for the email.
     research_unavailable: str | None = None
 
     @model_validator(mode="before")
@@ -142,350 +157,328 @@ def build_subject(summary: RunSummaryInput) -> str:
     )
 
 
-def _num(value: Decimal | None) -> str | None:
-    return None if value is None else str(value)
+# The plain-words view (ADR-0064) ----------------------------------------------------------
+
+_ACTION_LABELS = {
+    DecisionAction.OPEN_CSP: "Sell a cash-secured put",
+    DecisionAction.OPEN_CC: "Sell a covered call",
+    DecisionAction.CLOSE: "Close",
+    DecisionAction.ROLL: "Roll",
+    DecisionAction.HOLD: "Hold",
+}
+_SIDE_LABELS = {OrderSide.SELL_TO_OPEN: "Sell to open", OrderSide.BUY_TO_CLOSE: "Buy to close"}
+_STOP_EXPLANATIONS = {
+    "invalid_agent_output": "The agent's final decision output was missing or invalid.",
+    "audit_failed": "The post-run audit could not complete.",
+    "deadline": "The run exhausted its time budget and the session was stopped.",
+    "sigterm": "The session was stopped by SIGTERM.",
+    "sigint": "The session was stopped by SIGINT.",
+    "infrastructure_failure": "An infrastructure failure stopped the session.",
+}
+_STOPPED = (RunStatus.FAILED, RunStatus.TIMED_OUT, RunStatus.STOPPED)
+# Every order already appears with its decision; the order-activity alert repeats it.
+_ROUTINE_ALERTS = frozenset({AlertKind.ORDER_ACTIVITY.value})
 
 
-def _attempt_facts(attempt: Attempt) -> dict[str, JsonValue]:
-    return {
-        "kind": "dry_run_proposal" if _is_proposal(attempt) else "place_call",
-        "status": attempt.status.value,
-        "requested_quantity": attempt.requested_quantity,
-        "limit_price": _num(attempt.limit_price),
-        "filled_quantity": attempt.filled_quantity,
-        "reason_codes": [c.value for c in attempt.reason_codes],
-    }
+def _when(value: datetime) -> str:
+    return f"{value.astimezone(UTC):%Y-%m-%d %H:%M} UTC"
 
 
-def _leg_facts(leg: LegRecord) -> dict[str, JsonValue]:
-    return {
-        "side": leg.side.value,
-        "occ_symbol": str(leg.occ_symbol) if leg.occ_symbol is not None else None,
-        "right": leg.right.value if leg.right is not None else None,
-        "strike": _num(leg.strike),
-        "expiration": leg.expiration.isoformat() if leg.expiration is not None else None,
-        "target_quantity": leg.target_quantity,
-        "conditional": leg.conditional,
-        "reason_codes": [c.value for c in leg.reason_codes],
-        "gaps": [f"{g.field}: {g.detail}" for g in leg.gaps],
-        "attempts": [_attempt_facts(a) for a in leg.attempts],
-    }
+def _contract_text(occ: OccSymbol, underlying: str | None) -> str:
+    """`AAPL 2026-10-16 190 put`."""
+    return f"{underlying or occ.root} {occ.expiration.isoformat()} {occ.strike} {occ.right.value}"
 
 
-def _record_facts(record: RunRecord) -> dict[str, JsonValue]:
-    return {
-        "decision_output_status": record.decision_output_status.value,
-        "model_id": record.model_id,
-        "rules_version": record.rules_version,
-        "prompt_id": record.prompt_id,
-        "assembly_summary": record.summary,
-        "decisions": [
-            {
-                "decision_ref": d.decision_ref,
-                "action": d.action.value,
-                "underlying": d.underlying,
-                "target_ref": d.target_ref,
-                "replacement_ref": d.replacement_ref,
-                "rationale": d.rationale,
-                "thesis": d.thesis,
-                "invalidation_conditions": list(d.invalidation_conditions),
-                "gaps": [f"{g.field}: {g.detail}" for g in d.gaps],
-                "metrics": [
-                    {"name": m.name, "value": _num(m.value.value), "unit": m.unit}
-                    for m in d.metrics
-                ],
-                "legs": [_leg_facts(leg) for leg in d.legs],
-            }
-            for d in record.decisions
-        ],
-        "cancellations": [
-            {"status": c.status.value, "dispatch_status": _enum(c.dispatch_status)}
-            for c in record.cancellations
-        ],
-        "cancellation_rationales": [c.rationale for c in record.cancellation_rationales],
-        "unresolved_questions": [q.question for q in record.unresolved_questions],
-        "unassociated_actions": [
-            {
-                "kind": u.kind.value,
-                "occ_symbol": str(u.occ_symbol) if u.occ_symbol is not None else None,
-                "status": _unassociated(u)[0],
-                "broker_order_id": _unassociated(u)[1],
-            }
-            for u in record.unassociated_actions
-        ],
-        "gaps": [f"{g.field}: {g.detail}" for g in record.gaps],
-        "metrics": [
-            {"name": m.name, "value": _num(m.value.value), "unit": m.unit} for m in record.metrics
-        ],
-        "assembly_findings": [f"{f.code}: {f.detail}" for f in record.findings],
-    }
+def _leg_text(leg: LegRecord, underlying: str | None) -> str:
+    """`Sell to open 2 × AAPL 2026-10-16 190 put`, or the OCC symbol when a term is unknown."""
+    if leg.strike is None or leg.expiration is None or leg.right is None:
+        contract = str(leg.occ_symbol) if leg.occ_symbol is not None else "contract unknown"
+    else:
+        terms = (underlying, leg.expiration.isoformat(), str(leg.strike), leg.right.value)
+        contract = " ".join(t for t in terms if t)
+    quantity = f"{leg.target_quantity} × " if leg.target_quantity is not None else ""
+    return f"{_SIDE_LABELS[leg.side]} {quantity}{contract}"
 
 
-def _candidate_facts(summary: RunSummaryInput) -> list[dict[str, JsonValue]]:
-    decisions = summary.record.decisions if summary.record is not None else ()
-    complete = (
-        summary.record is not None and summary.record.decision_output_status.value == "parsed"
-    )
-    candidates: list[dict[str, JsonValue]] = []
-    for candidate in summary.candidates:
-        selected = [
-            d
-            for d in decisions
-            if candidate.candidate_ref in (d.target_ref, d.replacement_ref)
-            or any(str(leg.occ_symbol) == candidate.occ_symbol for leg in d.legs)
-        ]
-        candidates.append(
-            {
-                "candidate_ref": candidate.candidate_ref,
-                "underlying": candidate.underlying,
-                "occ_symbol": candidate.occ_symbol,
-                "selection": "selected" if selected else "not selected" if complete else "unknown",
-                "rationales": [d.rationale for d in selected],
-                "gaps": list(candidate.gaps),
-                "research_findings": [
-                    finding.claim
-                    for report in summary.research_reports
-                    for finding in report.findings
-                    if candidate.candidate_ref in finding.refs
-                ],
-            }
-        )
-    return candidates
-
-
-def _unassociated(action: UnassociatedAction) -> tuple[str | None, str | None]:
-    """(status, broker order ID) of an action no decision selected: the attempt's, else the
-    cancellation's."""
-    if action.attempt is not None:
-        return action.attempt.status.value, action.attempt.broker_order_id
-    if action.cancellation is not None:
-        return action.cancellation.status.value, action.cancellation.broker_order_id
-    return None, None
-
-
-def _enum(value: object) -> str | None:
-    return None if value is None else str(getattr(value, "value", value))
-
-
-def _iso(value: datetime | None) -> str | None:
-    return None if value is None else value.isoformat()
-
-
-def summary_facts(summary: RunSummaryInput, redactor: Redactor) -> dict[str, JsonValue]:
-    """The redacted JSON the prose writer summarizes. Numbers are strings, copied verbatim."""
-    facts: dict[str, JsonValue] = {
-        "run": {
-            "run_id": summary.run_id,
-            "environment": summary.environment.value,
-            "slot": summary.slot.isoformat(),
-            "status": summary.status.value,
-            "reason": summary.reason,
-            "requested_execution_mode": summary.requested_execution_mode.value,
-            "effective_execution_mode": summary.effective_execution_mode.value,
-            "order_venue": summary.order_venue.value,
-            "orders_sent_to_broker": summary.order_venue is OrderVenue.BROKER,
-            "session_started": summary.session_started,
-        },
-        "record": _record_facts(summary.record) if summary.record is not None else None,
-        "candidates": [c for c in _candidate_facts(summary)],
-        "research_reports": [r.model_dump(mode="json") for r in summary.research_reports],
-        "research_unavailable": summary.research_unavailable,
-        "diagnostic_details": list(summary.diagnostic_details),
-        "audit": {
-            "status": summary.audit_status,
-            "violations": summary.audit_violations,
-            "unverifiable": summary.audit_unverifiable,
-            "details": list(summary.audit_details),
-        },
-        "alerts": list(summary.alerts),
-        "next_run": {
-            "not_before": _iso(summary.next_run_at),
-            "source": summary.next_run_source,
-            "agent_rationale": summary.next_run_rationale,
-        },
-    }
-    redacted = redactor.redact(facts)
-    if not isinstance(redacted, dict):  # redact() preserves mappings; narrowed for typing
-        raise TypeError("redacted facts must stay a mapping")
-    return redacted
-
-
-def _leg_line(leg: LegRecord) -> str:
-    contract = str(leg.occ_symbol) if leg.occ_symbol is not None else "contract unknown"
-    parts = [leg.side.value, contract]
-    if leg.strike is not None:
-        parts.append(f"strike {leg.strike}")
-    if leg.expiration is not None:
-        parts.append(f"exp {leg.expiration.isoformat()}")
-    if leg.target_quantity is not None:
-        parts.append(f"qty {leg.target_quantity}")
-    return " · ".join(parts)
-
-
-def _attempt_line(attempt: Attempt) -> str:
-    kind = "proposal (not sent)" if _is_proposal(attempt) else "order"
-    parts = [f"{kind}: {attempt.status.value}"]
+def _attempt_text(attempt: Attempt, venue: OrderVenue) -> str:
+    """`Order filled: 2 at limit 1.30`; a proposal is never called an order."""
+    if _is_proposal(attempt):
+        head = "Proposed, not sent"
+    else:
+        kind = "Simulated order" if venue is OrderVenue.SIMULATED else "Order"
+        head = f"{kind} {attempt.status.value.replace('_', ' ')}"
+    details: list[str] = []
     if attempt.requested_quantity is not None:
-        parts.append(f"qty {attempt.requested_quantity}")
+        filled = attempt.filled_quantity
+        partial = filled is not None and filled != attempt.requested_quantity
+        details.append(
+            f"{filled} of {attempt.requested_quantity}"
+            if partial
+            else str(attempt.requested_quantity)
+        )
     if attempt.limit_price is not None:
-        parts.append(f"limit {attempt.limit_price}")
-    if attempt.filled_quantity:
-        parts.append(f"filled {attempt.filled_quantity}")
-    if attempt.reason_codes:
-        parts.append("codes " + ",".join(c.value for c in attempt.reason_codes))
-    return " · ".join(parts)
+        details.append(f"at limit {attempt.limit_price}")
+    return f"{head}: {' '.join(details)}" if details else head
 
 
-def _candidate_lines(summary: RunSummaryInput) -> list[str]:
-    """One row per contract/status; selected contracts already appear with their decisions."""
-    groups: dict[tuple[str, str, str], tuple[list[str], list[str]]] = {}
-    for model, candidate in zip(summary.candidates, _candidate_facts(summary), strict=True):
-        selection = str(candidate["selection"])
-        key = (model.underlying, model.occ_symbol, selection)
-        refs, gaps = groups.setdefault(key, ([], []))
-        if model.candidate_ref not in refs:
-            refs.append(model.candidate_ref)
-        gaps.extend(gap for gap in model.gaps if gap not in gaps)
-    lines: list[str] = []
-    statuses: set[str] = set()
-    for (underlying, contract, selection), (refs, gaps) in groups.items():
-        if selection == "selected" and not gaps:
-            continue
-        statuses.add(selection)
-        lines.append(f"- {underlying} {contract} [{', '.join(refs)}]: {selection}")
-        lines.extend(f"    Data gap: {gap}" for gap in gaps)
-    if lines:
-        lines.insert(0, "Other candidates / candidate gaps (selection is not execution):")
-        if "not selected" in statuses:
-            lines.append("Not selected does not establish a rejection reason; research follows.")
-        if "unknown" in statuses:
-            lines.append("Selection unknown because valid final decisions are unavailable.")
-    elif not summary.candidates:
-        lines.append("No candidate list recorded; this does not establish none were considered.")
-    return lines
+@dataclass(frozen=True, slots=True)
+class _LegView:
+    contract: str
+    orders: tuple[str, ...]
 
 
-def _research_lines(summary: RunSummaryInput) -> list[str]:
-    """Print each exact claim once, retaining all sources and task-scoped gaps/questions."""
-    if not summary.research_reports:
+@dataclass(frozen=True, slots=True)
+class _ActionView:
+    action: str
+    legs: tuple[_LegView, ...]
+    why: str | None
+
+
+def _decision_view(decision: DecisionRecord, venue: OrderVenue) -> _ActionView:
+    target = decision.underlying
+    if not decision.legs and decision.target_occ_symbol is not None:
+        # A HOLD has no legs: name the held contract, not only the stock.
+        target = _contract_text(decision.target_occ_symbol, decision.underlying)
+    return _ActionView(
+        action=_ACTION_LABELS[decision.action] + (f" {target}" if target else ""),
+        legs=tuple(
+            _LegView(
+                contract=_leg_text(leg, decision.underlying),
+                orders=tuple(_attempt_text(a, venue) for a in leg.attempts),
+            )
+            for leg in decision.legs
+        ),
+        why=decision.rationale,
+    )
+
+
+def _cancel_views(record: RunRecord) -> list[_ActionView]:
+    """Each cancel the agent made, with its rationale when it cited the cancel call."""
+    rationales = {
+        r.cancel_tool_call_id: r.rationale
+        for r in record.cancellation_rationales
+        if r.cancel_tool_call_id is not None
+    }
+    views = [
+        _ActionView(
+            action=f"Cancel a working order ({c.status.value})",
+            legs=(),
+            why=rationales.get(c.cancel_tool_call_id),
+        )
+        for c in record.cancellations
+    ]
+    cited = {c.cancel_tool_call_id for c in record.cancellations}
+    views.extend(
+        _ActionView(action="Cancel a working order", legs=(), why=r.rationale)
+        for r in record.cancellation_rationales
+        if r.cancel_tool_call_id not in cited
+    )
+    return views
+
+
+def _selected(candidate: ConsideredOption, decisions: tuple[DecisionRecord, ...]) -> bool:
+    return any(
+        candidate.candidate_ref in (d.target_ref, d.replacement_ref)
+        or str(d.target_occ_symbol) == candidate.occ_symbol
+        or any(str(leg.occ_symbol) == candidate.occ_symbol for leg in d.legs)
+        for d in decisions
+    )
+
+
+def _passed_over(summary: RunSummaryInput) -> list[tuple[str, str]]:
+    """(contract, research notes) for each candidate the agent did not select that research
+    commented on. Only with parsed decisions: otherwise selection is unknown. The notes are
+    the research's claims, not the agent's reason."""
+    record = summary.record
+    if record is None or record.decision_output_status is not DecisionOutputStatus.PARSED:
         return []
-    findings: dict[str, list[str]] = {}
-    tasks: dict[str, None] = {}
-    issues: dict[str, None] = {}
+    notes: dict[str, list[str]] = {}
     for report in summary.research_reports:
-        tasks[report.task] = None
         for finding in report.findings:
             # ADR-0056: a number resting only on fetched pages is labelled as such.
             claim = f"{finding.claim} (web-sourced)" if finding.web_sourced else finding.claim
-            refs = findings.setdefault(claim, [])
-            refs.extend(ref for ref in (*finding.refs, *finding.web_urls) if ref not in refs)
-        for gap in report.gaps:
-            issues[f"- Research gap ({report.task}): {gap}"] = None
-        for question in report.follow_up_questions:
-            issues[f"- Research question ({report.task}): {question}"] = None
-    return [
-        "Research (supporting claims, not final decisions): " + "; ".join(tasks),
-        *(f"- {claim} [{', '.join(refs)}]" for claim, refs in findings.items()),
-        *issues,
-    ]
+            for ref in finding.refs:
+                claims = notes.setdefault(ref, [])
+                if claim not in claims:
+                    claims.append(claim)
+    rows: dict[str, list[str]] = {}
+    for candidate in summary.candidates:
+        if _selected(candidate, record.decisions) or candidate.candidate_ref not in notes:
+            continue
+        try:
+            contract = _contract_text(OccSymbol.parse(candidate.occ_symbol), candidate.underlying)
+        except ValueError:
+            contract = f"{candidate.underlying} {candidate.occ_symbol}"
+        claims = rows.setdefault(contract, [])
+        claims.extend(c for c in notes[candidate.candidate_ref] if c not in claims)
+    return [(contract, " ".join(claims)) for contract, claims in rows.items()]
 
 
-def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
-    """The deterministic facts block, from recorded values only."""
-    lines = [
-        f"Run {summary.run_id} ({summary.environment.value})",
-        f"Slot: {summary.slot.isoformat()}",
-        f"Status: {summary.status.value}" + (f" ({summary.reason})" if summary.reason else ""),
-        f"Mode: {_mode_label(summary.effective_execution_mode, summary.order_venue)} "
-        f"(requested {summary.requested_execution_mode.value})",
-    ]
+def _unlinked_text(action: UnassociatedAction, venue: OrderVenue) -> str:
+    if action.attempt is not None:
+        what = " ".join(
+            p for p in (action.side_raw, str(action.occ_symbol) if action.occ_symbol else None) if p
+        )
+        return (
+            "An order no decision accounts for"
+            + (f" ({what})" if what else "")
+            + f": {_attempt_text(action.attempt, venue)}"
+        )
+    status = action.cancellation.status.value if action.cancellation is not None else "unknown"
+    return f"A cancel no decision accounts for: {status}"
+
+
+def _attention(summary: RunSummaryInput) -> list[str]:
+    """What the owner should look at; empty for a clean run."""
+    items: list[str] = []
+    if summary.status in _STOPPED:
+        reason = summary.reason or ""
+        items.append(_STOP_EXPLANATIONS.get(reason, reason or "No failure reason was recorded."))
+    items.extend(summary.diagnostic_details)
     record = summary.record
-    if summary.status in (RunStatus.FAILED, RunStatus.TIMED_OUT, RunStatus.STOPPED):
-        explanations = {
-            "invalid_agent_output": "The agent's final decision output was missing or invalid.",
-            "audit_failed": "The post-run audit could not complete.",
-            "deadline": "The run exhausted its time budget and the session was stopped.",
-            "sigterm": "The session was stopped by SIGTERM.",
-            "sigint": "The session was stopped by SIGINT.",
-            "infrastructure_failure": "An infrastructure failure stopped the session.",
-        }
-        lines.append(
-            "Failure / stop reason: "
-            + explanations.get(
-                summary.reason or "", summary.reason or "No failure reason was recorded."
-            )
-        )
-    lines.extend(f"Diagnostic: {detail}" for detail in dict.fromkeys(summary.diagnostic_details))
-    if record is None:
-        lines.append("Run record: not assembled (see the ledger for recorded events)")
-    else:
-        lines.append(f"Agent output: {record.decision_output_status.value}")
-        lines.append(f"Summary: {record.summary}")
-        if not record.decisions:
-            lines.append("Decisions: none")
-        for d in record.decisions:
-            underlying = f" {d.underlying}" if d.underlying else ""
-            lines.append(f"- {d.action.value}{underlying} [{d.decision_ref}]")
-            lines.append(f"    Why: {d.rationale}")
-            if d.thesis and d.thesis.strip() != d.rationale.strip():
-                lines.append(f"    Thesis: {d.thesis}")
-            lines.extend(
-                f"    Reconsider if: {c}" for c in dict.fromkeys(d.invalidation_conditions)
-            )
-            lines.extend(f"    Data gap: {g.field}: {g.detail}" for g in d.gaps)
-            lines.extend(
-                f"    {m.name}: {_num(m.value.value) or 'unknown'} {m.unit}" for m in d.metrics
-            )
-            for leg in d.legs:
-                lines.append(f"    {_leg_line(leg)}")
-                lines.extend(f"      Data gap: {g.field}: {g.detail}" for g in leg.gaps)
-                if leg.reason_codes:
-                    lines.append("      Reasons: " + ", ".join(c.value for c in leg.reason_codes))
-                for attempt in leg.attempts:
-                    lines.append(f"      {_attempt_line(attempt)}")
-        for c in record.cancellations:
-            lines.append(f"- cancel: {c.status.value}")
-        lines.extend(
-            f"- cancellation rationale: {c.rationale}" for c in record.cancellation_rationales
-        )
-        for u in record.unassociated_actions:
-            status, order_id = _unassociated(u)
-            what = " · ".join(
-                p for p in (str(u.occ_symbol) if u.occ_symbol else None, u.side_raw) if p
-            )
-            order = f" (order {order_id})" if order_id else ""
-            lines.append(
-                f"- unassociated {u.kind.value}{': ' + what if what else ''}{order}: "
-                f"{status or 'unknown'}"
-            )
-        for q in record.unresolved_questions:
-            lines.append(f"- open question: {q.question}")
-        lines.extend(f"Data gap: {g.field}: {g.detail}" for g in record.gaps)
-        lines.extend(
-            f"{m.name}: {_num(m.value.value) or 'unknown'} {m.unit}" for m in record.metrics
-        )
-        lines.extend(f"Assembly finding: {f.code}: {f.detail}" for f in record.findings)
-    lines.extend(_candidate_lines(summary))
+    if summary.session_started and record is None:
+        items.append("The run record could not be assembled; the ledger has the recorded events.")
+    if record is not None:
+        items.extend(_unlinked_text(u, summary.order_venue) for u in record.unassociated_actions)
+    if summary.audit_status == "failed" and summary.reason != "audit_failed":
+        items.append("The post-run audit could not complete.")
+    if summary.audit_violations:
+        plural = "s" if summary.audit_violations != 1 else ""
+        items.append(f"The post-run audit found {summary.audit_violations} violation{plural}.")
+    items.extend(summary.audit_details)
     if summary.research_unavailable:
-        lines.append(f"Research context unavailable: {summary.research_unavailable}")
-    lines.extend(_research_lines(summary))
-    audit = summary.audit_status or "not run"
-    lines.append(
-        f"Audit: {audit} · {summary.audit_violations} violation(s) · "
-        f"{summary.audit_unverifiable} unverifiable check(s)"
+        items.append(f"Research notes could not be loaded ({summary.research_unavailable}).")
+    alerts = [a.replace("_", " ") for a in summary.alerts if a not in _ROUTINE_ALERTS]
+    if alerts:
+        items.append("Alerts sent: " + ", ".join(dict.fromkeys(alerts)))
+    return list(dict.fromkeys(items))
+
+
+AGENT_TITLES = {
+    AgentRole.CLOSE: "Buy-to-Close agent",
+    AgentRole.SELL: "Sell Options agent",
+    AgentRole.WHEEL: "Wheel agent",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class AgentView:
+    """One agent's section: its outcome, its actions with their reasons, what needs attention.
+
+    `decisions_known` is false when the agent returned no valid final output, so an empty
+    action list must not be read as "did nothing"."""
+
+    agent: str
+    status: str
+    reason: str | None
+    session_started: bool
+    mode: str
+    orders_sent_to_broker: bool
+    decisions_known: bool
+    actions: tuple[_ActionView, ...]
+    # (contract, research notes) for candidates the agent did not select.
+    passed_over: tuple[tuple[str, str], ...]
+    open_questions: tuple[str, ...]
+    needs_attention: tuple[str, ...]
+    # (when, why) of the agent's own next-run request; None when it made none.
+    requested_next_run: tuple[str, str | None] | None
+
+    def facts(self) -> dict[str, JsonValue]:
+        """The JSON form the prose writer reads."""
+        return {
+            "agent": self.agent,
+            "status": self.status,
+            "reason": self.reason,
+            "session_started": self.session_started,
+            "mode": self.mode,
+            "orders_sent_to_broker": self.orders_sent_to_broker,
+            "decisions_known": self.decisions_known,
+            "actions": [
+                {
+                    "action": a.action,
+                    "legs": [
+                        {"contract": leg.contract, "orders": list(leg.orders)} for leg in a.legs
+                    ],
+                    "why": a.why,
+                }
+                for a in self.actions
+            ],
+            "passed_over_research_notes": [
+                {"contract": contract, "notes": notes} for contract, notes in self.passed_over
+            ],
+            "open_questions": list(self.open_questions),
+            "needs_attention": list(self.needs_attention),
+            "requested_next_run": (
+                None
+                if self.requested_next_run is None
+                else {"at": self.requested_next_run[0], "why": self.requested_next_run[1]}
+            ),
+        }
+
+    def lines(self) -> list[str]:
+        """The plain-text form printed in every email."""
+        if not self.session_started:
+            return [f"{self.agent}: did not run ({self.reason or self.status})"]
+        lines = [f"{self.agent}: {self.status}"]
+        for action in self.actions:
+            lines.append(f"- {action.action}")
+            for leg in action.legs:
+                lines.append(f"  {leg.contract}")
+                lines.extend(f"  {order}" for order in leg.orders)
+            if action.why:
+                lines.append(f"  Why: {action.why}")
+        if not self.actions:
+            lines.append(
+                "- No decisions."
+                if self.decisions_known
+                else "- Decisions unknown: no valid final output."
+            )
+        if self.passed_over:
+            lines.append("Not selected (research notes, not the agent's stated reasons):")
+            lines.extend(f"- {contract}: {notes}" for contract, notes in self.passed_over)
+        if self.open_questions:
+            lines.append("Open questions:")
+            lines.extend(f"- {question}" for question in self.open_questions)
+        if self.needs_attention:
+            lines.append("Needs attention:")
+            lines.extend(f"- {item}" for item in self.needs_attention)
+        if self.requested_next_run is not None:
+            at, why = self.requested_next_run
+            lines.append(f"Asked to run next at {at}" + (f": {why}" if why else ""))
+        return lines
+
+
+def agent_view(summary: RunSummaryInput) -> AgentView:
+    """The plain-words view of one agent run (ADR-0064)."""
+    record = summary.record
+    actions: list[_ActionView] = []
+    if record is not None:
+        actions.extend(_decision_view(d, summary.order_venue) for d in record.decisions)
+        actions.extend(_cancel_views(record))
+    requested = None
+    if summary.next_run_source == "agent" and summary.next_run_at is not None:
+        requested = (_when(summary.next_run_at), summary.next_run_rationale)
+    return AgentView(
+        agent=AGENT_TITLES[summary.agent],
+        status=summary.status.value,
+        reason=summary.reason,
+        session_started=summary.session_started,
+        mode=_mode_label(summary.effective_execution_mode, summary.order_venue),
+        orders_sent_to_broker=summary.order_venue is OrderVenue.BROKER,
+        decisions_known=record is not None
+        and record.decision_output_status is DecisionOutputStatus.PARSED,
+        actions=tuple(actions),
+        passed_over=tuple(_passed_over(summary)),
+        open_questions=tuple(
+            dict.fromkeys(q.question for q in record.unresolved_questions) if record else ()
+        ),
+        needs_attention=tuple(_attention(summary)),
+        requested_next_run=requested,
     )
-    lines.append("Alerts: " + (", ".join(summary.alerts) if summary.alerts else "none"))
-    lines.extend(f"Audit detail: {detail}" for detail in dict.fromkeys(summary.audit_details))
-    if summary.next_run_at is not None:
-        source = f" ({summary.next_run_source})" if summary.next_run_source else ""
-        lines.append(f"Next run not before: {summary.next_run_at.isoformat()}{source}")
-        if summary.next_run_rationale:
-            lines.append(f"Next run rationale: {summary.next_run_rationale}")
-    return redactor.redact_text("\n".join(lines))
 
 
 def render_bodies(prose: str | None, facts_text: str, redactor: Redactor) -> tuple[str, str]:
-    """(text, html) bodies: the prose (or a fallback line), then the facts block."""
+    """(text, html) bodies: the prose (or a fallback line), then the actions block."""
     lead = redactor.redact_text(prose.strip()) if prose and prose.strip() else PROSE_UNAVAILABLE
     text = f"{lead}\n\n{FACTS_HEADING}\n\n{facts_text}\n"
     paragraphs = "".join(
@@ -496,20 +489,12 @@ def render_bodies(prose: str | None, facts_text: str, redactor: Redactor) -> tup
         'font-size:14px;line-height:1.5;color:#1a1a1a;max-width:680px">'
         f"{paragraphs}"
         f'<h3 style="margin:24px 0 8px;font-size:14px">{html.escape(FACTS_HEADING)}</h3>'
-        '<pre style="font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;'
-        'background:#f4f5f7;padding:12px;border-radius:6px;white-space:pre-wrap">'
-        f"{html.escape(facts_text)}</pre></div>"
+        f'<div style="white-space:pre-wrap">{html.escape(facts_text)}</div></div>'
     )
     return text, body
 
 
 # ADR-0057: one email per tick ------------------------------------------------------------
-
-AGENT_TITLES = {
-    AgentRole.CLOSE: "Buy-to-Close agent",
-    AgentRole.SELL: "Sell Options agent",
-    AgentRole.WHEEL: "Wheel agent",
-}
 
 
 class SlotSummaryInput(BaseModel):
@@ -549,33 +534,19 @@ def build_slot_subject(summary: SlotSummaryInput) -> str:
     return " · ".join(parts)
 
 
+def _tick_next_run(summary: SlotSummaryInput) -> str | None:
+    if summary.next_run_at is None:
+        return None
+    source = " (hourly fallback)" if summary.next_run_source == "fallback" else ""
+    return f"Next run: {_when(summary.next_run_at)}{source}"
+
+
 def slot_summary_facts(summary: SlotSummaryInput, redactor: Redactor) -> dict[str, JsonValue]:
     """The redacted JSON the prose writer summarizes: one entry per agent run, in order."""
-    agents: list[JsonValue] = []
-    for agent in summary.agents:
-        if agent.session_started:
-            facts: dict[str, JsonValue] = summary_facts(agent, redactor)
-        else:
-            facts = {
-                "run": {
-                    "run_id": agent.run_id,
-                    "status": agent.status.value,
-                    "reason": agent.reason,
-                    "session_started": False,
-                },
-                "diagnostic_details": list(agent.diagnostic_details),
-                "alerts": list(agent.alerts),
-            }
-        agents.append({"agent": AGENT_TITLES[agent.agent], **facts})
     redacted = redactor.redact(
         {
-            "tick": {
-                "environment": summary.environment.value,
-                "slot": summary.slot.isoformat(),
-                "next_run_not_before": _iso(summary.next_run_at),
-                "next_run_source": summary.next_run_source,
-            },
-            "agents": agents,
+            "agents": [agent_view(agent).facts() for agent in summary.agents],
+            "next_run": _tick_next_run(summary),
         }
     )
     if not isinstance(redacted, dict):  # redact() preserves mappings; narrowed for typing
@@ -584,25 +555,9 @@ def slot_summary_facts(summary: SlotSummaryInput, redactor: Redactor) -> dict[st
 
 
 def render_slot_facts_text(summary: SlotSummaryInput, redactor: Redactor) -> str:
-    """The deterministic facts block: one section per agent run, then the tick's next run."""
-    sections: list[str] = []
-    for agent in summary.agents:
-        title = f"== {AGENT_TITLES[agent.agent]} =="
-        if agent.session_started:
-            sections.append(f"{title}\n{render_facts_text(agent, redactor)}")
-            continue
-        lines = [
-            title,
-            f"Run {agent.run_id}",
-            f"Status: {agent.status.value}" + (f" ({agent.reason})" if agent.reason else ""),
-            "No session started.",
-            *(f"Diagnostic: {d}" for d in dict.fromkeys(agent.diagnostic_details)),
-        ]
-        if agent.alerts:
-            lines.append("Alerts: " + ", ".join(agent.alerts))
-        sections.append(redactor.redact_text("\n".join(lines)))
-    if summary.next_run_at is not None:
-        source = f" ({summary.next_run_source})" if summary.next_run_source else ""
-        at = summary.next_run_at.isoformat()
-        sections.append(f"Next run of both agents not before: {at}{source}")
-    return "\n\n".join(sections)
+    """The deterministic block: one section per agent run, then the tick's next run."""
+    sections = ["\n".join(agent_view(agent).lines()) for agent in summary.agents]
+    next_run = _tick_next_run(summary)
+    if next_run is not None:
+        sections.append(next_run)
+    return redactor.redact_text("\n\n".join(sections))

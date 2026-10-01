@@ -1,4 +1,4 @@
-"""Run-summary email content (ADR-0029): pure, deterministic, redacted."""
+"""Run-summary email content (ADR-0029, ADR-0064): pure, deterministic, redacted, short."""
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -8,8 +8,11 @@ from uuid import uuid4
 from pydantic import SecretStr
 
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AppEnv,
     AttemptStatus,
+    CancellationStatus,
+    DataQuality,
     DecisionAction,
     ExecutionMode,
     OptionRight,
@@ -19,15 +22,18 @@ from wheelta_robinhood_agent.domain.enums import (
 )
 from wheelta_robinhood_agent.domain.mignon_report import MignonReport
 from wheelta_robinhood_agent.domain.options import OccSymbol
-from wheelta_robinhood_agent.domain.orders import Attempt, ReasonCode
+from wheelta_robinhood_agent.domain.orders import Attempt, Cancellation, ReasonCode
 from wheelta_robinhood_agent.domain.run_record import (
     RUN_RECORD_SCHEMA_VERSION,
+    CancellationRationaleRecord,
     DecisionOutputStatus,
     DecisionRecord,
+    Gap,
     LegRecord,
     RunRecord,
     UnassociatedAction,
     UnassociatedActionKind,
+    UnresolvedQuestionRecord,
 )
 from wheelta_robinhood_agent.observability.redaction import Redactor
 from wheelta_robinhood_agent.observability.run_summary import (
@@ -35,12 +41,13 @@ from wheelta_robinhood_agent.observability.run_summary import (
     PROSE_UNAVAILABLE,
     ConsideredOption,
     RunSummaryInput,
+    SlotSummaryInput,
     build_subject,
     placed_count,
     proposal_count,
     render_bodies,
-    render_facts_text,
-    summary_facts,
+    render_slot_facts_text,
+    slot_summary_facts,
 )
 
 T0 = datetime(2026, 9, 28, 14, 5, tzinfo=UTC)
@@ -150,6 +157,16 @@ def _input(record: RunRecord | None, **kw: Any) -> RunSummaryInput:
     return RunSummaryInput.model_validate(base)
 
 
+def _text(*agents: RunSummaryInput, **kw: Any) -> str:
+    tick = SlotSummaryInput(environment=AppEnv.LOCAL, slot=T0, agents=agents, **kw)
+    return render_slot_facts_text(tick, REDACTOR)
+
+
+def _facts(*agents: RunSummaryInput) -> dict[str, Any]:
+    tick = SlotSummaryInput(environment=AppEnv.LOCAL, slot=T0, agents=agents)
+    return slot_summary_facts(tick, REDACTOR)  # type: ignore[return-value]
+
+
 def test_dry_run_subject_counts_proposals() -> None:
     summary = _input(_record(_decision(_proposal())))
     assert proposal_count(summary.record) == 1
@@ -162,9 +179,10 @@ def test_no_trade_run_says_so() -> None:
     hold = _decision(_proposal(), action=DecisionAction.HOLD, legs=())
     summary = _input(_record(hold))
     assert "no trades" in build_subject(summary)
+    assert "- Hold AAPL\n  Why: Cash covers it" in _text(summary)
     empty = _input(_record())
     assert "no trades" in build_subject(empty)
-    assert "Decisions: none" in render_facts_text(empty, REDACTOR)
+    assert "- No decisions." in _text(empty)
 
 
 def test_live_subject_counts_placed_orders_including_unassociated() -> None:
@@ -184,26 +202,69 @@ def test_live_subject_counts_placed_orders_including_unassociated() -> None:
     assert "· live · 2 orders placed ·" in build_subject(summary)
 
 
-def test_simulated_dry_run_subject_counts_simulated_orders() -> None:
+def test_simulated_dry_run_calls_orders_simulated() -> None:
     """ADR-0038: a dry run on the simulated venue reports its simulated placements."""
     venue = {"order_venue": OrderVenue.SIMULATED}
-    record = _record(_decision(_placed()), **venue)
-    summary = _input(record, **venue)
+    summary = _input(_record(_decision(_placed()), **venue), **venue)
     assert "· dry run (simulated orders) · 1 simulated order placed ·" in build_subject(summary)
-    assert "Mode: dry run (simulated orders) (requested off)" in render_facts_text(
-        summary, REDACTOR
-    )
-    run = summary_facts(summary, REDACTOR)["run"]
-    assert isinstance(run, dict)
-    assert run["order_venue"] == "simulated" and run["orders_sent_to_broker"] is False
+    assert "  Simulated order filled: 2 at limit 1.30" in _text(summary)
+    (agent,) = _facts(summary)["agents"]
+    assert agent["mode"] == "dry run (simulated orders)"
+    assert agent["orders_sent_to_broker"] is False
     idle = _input(_record(**venue), **venue)
     assert "no trades" in build_subject(idle)
 
 
-def test_unassociated_actions_show_status_and_order() -> None:
-    from wheelta_robinhood_agent.domain.enums import CancellationStatus
-    from wheelta_robinhood_agent.domain.orders import Cancellation
+def test_a_decision_reads_as_action_contract_outcome_and_why() -> None:
+    """ADR-0064: plain words; no refs, IDs, codes, thesis, metrics or gaps."""
+    decision = _decision(
+        _proposal(),
+        invalidation_conditions=("Thesis weakens.",),
+        gaps=(Gap(field="iv_rank", kind=DataQuality.MISSING, detail="not returned"),),
+    )
+    text = _text(_input(_record(decision)))
+    assert text == (
+        "Wheel agent: completed\n"
+        "- Sell a cash-secured put AAPL\n"
+        "  Sell to open 2 × AAPL 2026-10-16 190 put\n"
+        "  Proposed, not sent: 2 at limit 1.25\n"
+        "  Why: Cash covers it; account ****6789 has room."
+    )
+    for noise in ("decision:0", "candidate:1", "DRY_RUN", "Durable", "Thesis", "iv_rank", "run-1"):
+        assert noise not in text
 
+
+def test_partial_fills_and_unknown_outcomes_are_stated() -> None:
+    partial = _placed(AttemptStatus.PARTIALLY_FILLED).model_copy(update={"filled_quantity": 1})
+    text = _text(_input(_record(_decision(partial))))
+    assert "Order partially filled: 1 of 2 at limit 1.30" in text
+    assert "Order unknown: 2 at limit 1.30" in _text(
+        _input(_record(_decision(_placed(AttemptStatus.UNKNOWN))))
+    )
+
+
+def test_cancellations_carry_the_agents_reason() -> None:
+    call = uuid4()
+    cancel = Cancellation(
+        cancel_tool_call_id=call,
+        broker_order_id="order-9",
+        status=CancellationStatus.CONFIRMED,
+        confirmation_tool_call_ids=(uuid4(),),
+    )
+    record = _record(
+        cancellations=(cancel,),
+        cancellation_rationales=(
+            CancellationRationaleRecord(
+                cancel_call_ref="call:1", cancel_tool_call_id=call, rationale="Bid moved away."
+            ),
+        ),
+    )
+    text = _text(_input(record))
+    assert "- Cancel a working order (confirmed)\n  Why: Bid moved away." in text
+    assert "order-9" not in text and "No decisions" not in text
+
+
+def test_unlinked_actions_need_attention_without_broker_ids() -> None:
     cancel = UnassociatedAction(
         kind=UnassociatedActionKind.CANCEL,
         cancellation=Cancellation(
@@ -219,77 +280,117 @@ def test_unassociated_actions_show_status_and_order() -> None:
         side_raw="sell_to_open",
         attempt=_placed(),
     )
-    summary = _input(_record(unassociated_actions=(cancel, place)))
-    text = render_facts_text(summary, REDACTOR)
-    assert "- unassociated cancel (order order-9): confirmed" in text
-    assert "- unassociated place: AAPL  261016P00190000 · sell_to_open (order b-1): filled" in text
-    record = summary_facts(summary, REDACTOR)["record"]
-    assert isinstance(record, dict)
-    assert record["unassociated_actions"] == [
-        {"kind": "cancel", "occ_symbol": None, "status": "confirmed", "broker_order_id": "order-9"},
-        {
-            "kind": "place",
-            "occ_symbol": "AAPL  261016P00190000",
-            "status": "filled",
-            "broker_order_id": "b-1",
-        },
-    ]
+    text = _text(_input(_record(unassociated_actions=(cancel, place))))
+    assert "Needs attention:" in text
+    assert "- A cancel no decision accounts for: confirmed" in text
+    assert (
+        "- An order no decision accounts for (sell_to_open AAPL  261016P00190000): "
+        "Order filled: 2 at limit 1.30"
+    ) in text
+    assert "order-9" not in text and "b-1" not in text
 
 
-def test_facts_text_lists_every_decision_leg_and_attempt() -> None:
+def test_a_clean_run_has_no_attention_section_and_hides_routine_alerts() -> None:
+    summary = _input(_record(_decision(_placed())), alerts=("order_activity",))
+    text = _text(summary)
+    assert "Needs attention" not in text and "Alert" not in text
+    assert "Audit" not in text
+
+
+def test_failures_audit_and_alerts_are_listed_once_and_redacted() -> None:
     summary = _input(
-        _record(_decision(_proposal())),
-        alerts=("audit_violation",),
+        None,
+        status=RunStatus.FAILED,
+        reason="invalid_agent_output",
+        diagnostic_details=(f"Parse: <bad account {ACCOUNT}>", f"Parse: <bad account {ACCOUNT}>"),
         audit_violations=1,
+        audit_details=("V4: placed price differs from review",),
+        alerts=("invalid_agent_output", "order_activity", "audit_violation"),
+    )
+    text = _text(summary)
+    assert "Decisions unknown: no valid final output." in text
+    assert "- The agent's final decision output was missing or invalid." in text
+    assert text.count("Parse: <bad account") == 1
+    assert "- The run record could not be assembled" in text
+    assert "- The post-run audit found 1 violation." in text
+    assert "- V4: placed price differs from review" in text
+    assert "- Alerts sent: invalid agent output, audit violation" in text
+    assert ACCOUNT not in text and ACCOUNT not in repr(_facts(summary))
+    _, html = render_bodies(None, text, REDACTOR)
+    assert "<bad account" not in html and "&lt;bad account" in html
+
+
+def test_audit_failure_is_reported_once() -> None:
+    summary = _input(
+        _record(), status=RunStatus.FAILED, reason="audit_failed", audit_status="failed"
+    )
+    assert _text(summary).count("The post-run audit could not complete.") == 1
+    other = _input(_record(), audit_status="failed")
+    assert "- The post-run audit could not complete." in _text(other)
+
+
+def test_next_runs_are_short_and_the_agents_reason_is_kept() -> None:
+    summary = _input(
+        _record(),
         next_run_at=datetime(2026, 9, 28, 15, 0, tzinfo=UTC),
         next_run_source="agent",
+        next_run_rationale="Wait for refreshed quotes.",
     )
-    text = render_facts_text(summary, REDACTOR)
-    assert "- OPEN_CSP AAPL [decision:0]" in text
-    assert "sell_to_open · AAPL  261016P00190000 · strike 190 · exp 2026-10-16 · qty 2" in text
-    assert "proposal (not sent): not_placed · qty 2 · limit 1.25 · codes DRY_RUN" in text
-    assert "Audit: completed · 1 violation(s)" in text
-    assert "Alerts: audit_violation" in text
-    assert "Next run not before: 2026-09-28T15:00:00+00:00 (agent)" in text
+    text = _text(summary, next_run_at=datetime(2026, 9, 28, 15, 0, tzinfo=UTC))
+    assert "Asked to run next at 2026-09-28 15:00 UTC: Wait for refreshed quotes." in text
+    assert text.endswith("\n\nNext run: 2026-09-28 15:00 UTC")
+    fallback = _text(
+        _input(_record()),
+        next_run_at=datetime(2026, 9, 28, 15, 0, tzinfo=UTC),
+        next_run_source="fallback",
+    )
+    assert "Asked to run next" not in fallback
+    assert fallback.endswith("Next run: 2026-09-28 15:00 UTC (hourly fallback)")
 
 
-def test_missing_record_is_stated_not_invented() -> None:
-    summary = _input(None, status=RunStatus.FAILED, reason="error:RuntimeError", audit_status=None)
-    text = render_facts_text(summary, REDACTOR)
-    assert "Run record: not assembled" in text
-    assert "Audit: not run" in text
-    assert summary_facts(summary, REDACTOR)["record"] is None
+def test_skipped_agent_gets_one_line() -> None:
+    skipped = _input(
+        None,
+        agent=AgentRole.CLOSE,
+        status=RunStatus.SKIPPED_NO_OPEN_SHORTS,
+        reason="no open short option positions",
+        session_started=False,
+        audit_status=None,
+    )
+    sell = _input(_record(), agent=AgentRole.SELL)
+    assert _text(skipped, sell) == (
+        "Buy-to-Close agent: did not run (no open short option positions)\n\n"
+        "Sell Options agent: completed\n- No decisions."
+    )
 
 
-def test_facts_json_keeps_numbers_verbatim_and_redacts_the_account() -> None:
+def test_writer_facts_keep_numbers_verbatim_and_carry_no_identifiers() -> None:
     summary = _input(_record(_decision(_proposal())))
-    facts = summary_facts(summary, REDACTOR)
-    record = facts["record"]
-    assert isinstance(record, dict)
-    decisions = record["decisions"]
-    assert isinstance(decisions, list) and isinstance(decisions[0], dict)
-    legs = decisions[0]["legs"]
-    assert isinstance(legs, list) and isinstance(legs[0], dict)
-    assert legs[0]["strike"] == "190"
-    attempts = legs[0]["attempts"]
-    assert isinstance(attempts, list) and isinstance(attempts[0], dict)
-    assert attempts[0]["limit_price"] == "1.25"
-    assert attempts[0]["kind"] == "dry_run_proposal"
-    run = facts["run"]
-    assert isinstance(run, dict) and run["orders_sent_to_broker"] is False
-    assert ACCOUNT not in repr(facts)
-    assert ACCOUNT not in render_facts_text(summary, REDACTOR)
+    facts = _facts(summary)
+    (agent,) = facts["agents"]
+    (action,) = agent["actions"]
+    assert action["legs"] == [
+        {
+            "contract": "Sell to open 2 × AAPL 2026-10-16 190 put",
+            "orders": ["Proposed, not sent: 2 at limit 1.25"],
+        }
+    ]
+    assert agent["decisions_known"] is True and agent["needs_attention"] == []
+    dumped = repr(facts)
+    for noise in ("run-1", "decision:0", "candidate:1", "claude-x", "sha256", ACCOUNT):
+        assert noise not in dumped
 
 
-def test_bodies_carry_prose_then_facts_and_escape_html() -> None:
-    text, html = render_bodies("All quiet.\n\n<b>no</b> trades.", "Run run-1", REDACTOR)
-    assert text.index("All quiet.") < text.index(FACTS_HEADING) < text.index("Run run-1")
+def test_bodies_carry_prose_then_actions_and_escape_html() -> None:
+    text, html = render_bodies("All quiet.\n\n<b>no</b> trades.", "Wheel agent", REDACTOR)
+    assert text.index("All quiet.") < text.index(FACTS_HEADING) < text.index("Wheel agent")
     assert "&lt;b&gt;no&lt;/b&gt;" in html and "<b>no</b>" not in html
+    assert "<pre" not in html
 
 
 def test_bodies_fall_back_when_prose_is_missing() -> None:
     for prose in (None, "   "):
-        text, _ = render_bodies(prose, "Run run-1", REDACTOR)
+        text, _ = render_bodies(prose, "Wheel agent", REDACTOR)
         assert text.startswith(PROSE_UNAVAILABLE)
 
 
@@ -298,179 +399,78 @@ def test_prose_is_redacted() -> None:
     assert ACCOUNT not in text and ACCOUNT not in html
 
 
-def test_decision_context_survives_prose_failure() -> None:
+MSFT = "MSFT  261016P00400000"
+
+
+def _research(*findings: dict[str, Any]) -> MignonReport:
+    return MignonReport(task="Compare puts", findings=findings, gaps=(), follow_up_questions=())
+
+
+def test_hold_names_the_held_contract() -> None:
+    hold = _decision(_proposal(), action=DecisionAction.HOLD, legs=(), target_occ_symbol=OCC)
+    assert "- Hold AAPL 2026-10-16 190 put\n  Why:" in _text(_input(_record(hold)))
+
+
+def test_candidates_not_selected_show_research_notes_once_labelled() -> None:
     summary = _input(
-        _record(_decision(_proposal(), invalidation_conditions=("Thesis weakens.",))),
+        _record(_decision(_proposal())),
         candidates=(
             ConsideredOption(candidate_ref="candidate:1", underlying="AAPL", occ_symbol=str(OCC)),
+            ConsideredOption(candidate_ref="candidate:2", underlying="MSFT", occ_symbol=MSFT),
+            ConsideredOption(candidate_ref="candidate:3", underlying="MSFT", occ_symbol=MSFT),
             ConsideredOption(
-                candidate_ref="candidate:2",
-                underlying="MSFT",
-                occ_symbol="MSFT  261016P00400000",
-                gaps=("quote: no fresh bid",),
+                candidate_ref="candidate:4",
+                underlying="NVDA",
+                occ_symbol="NVDA  261016P00100000",
             ),
         ),
         research_reports=(
-            MignonReport(
-                task="Compare put candidates",
-                findings=(
-                    {
-                        "claim": "MSFT was passed over because earnings are approaching.",
-                        "refs": ("candidate:2",),
-                        "web_urls": (),
-                    },
-                ),
-                gaps=(),
-                follow_up_questions=("Recheck after earnings?",),
+            _research(
+                {"claim": "AAPL looks fine.", "refs": ("candidate:1",), "web_urls": ()},
+                {"claim": "Earnings are close.", "refs": ("candidate:2",), "web_urls": ()},
+            ),
+            _research(
+                {"claim": "Earnings are close.", "refs": ("candidate:3",), "web_urls": ()},
             ),
         ),
-        next_run_at=T0,
-        next_run_rationale="Wait for refreshed quotes.",
     )
-    facts = summary_facts(summary, REDACTOR)
-    assert [c["selection"] for c in facts["candidates"]] == ["selected", "not selected"]
-    text, html = render_bodies(None, render_facts_text(summary, REDACTOR), REDACTOR)
-    for expected in (
-        "Why: Cash covers it",
-        "Thesis: Durable business",
-        "Reconsider if: Thesis weakens",
-        "MSFT was passed over because earnings are approaching.",
-        "quote: no fresh bid",
-        "Recheck after earnings?",
-        "Next run rationale: Wait for refreshed quotes.",
-    ):
-        assert expected in text and expected in html
-    assert ACCOUNT not in text and ACCOUNT not in html
+    text = _text(summary)
+    assert (
+        "Not selected (research notes, not the agent's stated reasons):\n"
+        "- MSFT 2026-10-16 400 put: Earnings are close."
+    ) in text
+    assert text.count("Earnings are close.") == 1
+    assert "AAPL looks fine." not in text  # selected: its decision already explains it
+    assert "NVDA" not in text  # no research note, nothing to say
+    assert "candidate:" not in text
+    (agent,) = _facts(summary)["agents"]
+    assert agent["passed_over_research_notes"] == [
+        {"contract": "MSFT 2026-10-16 400 put", "notes": "Earnings are close."}
+    ]
 
 
-def test_missing_decisions_do_not_turn_candidates_into_rejections() -> None:
+def test_no_passed_over_list_when_decisions_are_unknown() -> None:
     summary = _input(
         None,
         status=RunStatus.FAILED,
         reason="invalid_agent_output",
         candidates=(
-            ConsideredOption(candidate_ref="candidate:1", underlying="AAPL", occ_symbol=str(OCC)),
+            ConsideredOption(candidate_ref="candidate:2", underlying="MSFT", occ_symbol=MSFT),
+        ),
+        research_reports=(
+            _research({"claim": "Earnings are close.", "refs": ("candidate:2",), "web_urls": ()}),
         ),
     )
-    facts = summary_facts(summary, REDACTOR)
-    assert facts["candidates"][0]["selection"] == "unknown"
-    text = render_facts_text(summary, REDACTOR)
-    assert "final decision output was missing or invalid" in text
-    assert "Selection unknown" in text
-    assert "not selected" not in text
+    assert "Not selected" not in _text(summary)
 
 
-def test_failure_and_audit_diagnostics_are_redacted_and_html_escaped() -> None:
-    summary = _input(
-        None,
-        status=RunStatus.FAILED,
-        reason="audit_failed",
-        diagnostic_details=(f"Record assembly: ValueError: <bad account {ACCOUNT}>",),
-        audit_details=("V1: RuntimeError: cannot load rules",),
-    )
-    facts = summary_facts(summary, REDACTOR)
-    assert ACCOUNT not in repr(facts)
-    text, html = render_bodies(None, render_facts_text(summary, REDACTOR), REDACTOR)
-    assert "post-run audit could not complete" in text
-    assert "Record assembly: ValueError:" in text
-    assert "V1: RuntimeError: cannot load rules" in text
-    assert "<bad account" not in html and "&lt;bad account" in html
-    assert ACCOUNT not in text and ACCOUNT not in html
+def test_open_questions_are_listed_once() -> None:
+    question = UnresolvedQuestionRecord(target_ref=None, question="Recheck after earnings?")
+    text = _text(_input(_record(unresolved_questions=(question, question))))
+    assert "Open questions:\n- Recheck after earnings?" in text
+    assert text.count("Recheck after earnings?") == 1
 
 
-def test_repeated_candidates_and_research_keep_each_distinct_fact_and_source_once() -> None:
-    contract = "MSFT  261016P00400000"
-    claim = "Earnings are approaching."
-    report = MignonReport(
-        task="Compare candidates",
-        findings=({"claim": claim, "refs": ("candidate:2",), "web_urls": ()},),
-        gaps=("Dividend date unavailable.",),
-        follow_up_questions=("Recheck after earnings?",),
-    )
-    extra = MignonReport(
-        task="Compare candidates",
-        findings=(
-            {"claim": claim, "refs": ("candidate:3",), "web_urls": ("https://example.com/ir",)},
-            {"claim": "Liquidity improved.", "refs": ("candidate:3",), "web_urls": ()},
-        ),
-        gaps=report.gaps,
-        follow_up_questions=report.follow_up_questions,
-    )
-    summary = _input(
-        _record(_decision(_proposal())),
-        candidates=(
-            ConsideredOption(candidate_ref="candidate:1", underlying="AAPL", occ_symbol=str(OCC)),
-            ConsideredOption(
-                candidate_ref="candidate:2",
-                underlying="MSFT",
-                occ_symbol=contract,
-                gaps=("quote: stale",),
-            ),
-            ConsideredOption(
-                candidate_ref="candidate:3",
-                underlying="MSFT",
-                occ_symbol=contract,
-                gaps=("quote: stale", "delta: missing"),
-            ),
-        ),
-        research_reports=(report, extra, report),
-        diagnostic_details=("Unique diagnostic", "Unique diagnostic"),
-        audit_details=("Unique audit issue", "Unique audit issue"),
-    )
-    text, html = render_bodies(None, render_facts_text(summary, REDACTOR), REDACTOR)
-    for body in (text, html):
-        for distinct in (
-            str(OCC),
-            contract,
-            claim,
-            "Liquidity improved.",
-            "Dividend date unavailable.",
-            "Recheck after earnings?",
-            "quote: stale",
-            "delta: missing",
-            "Unique diagnostic",
-            "Unique audit issue",
-            "https://example.com/ir",
-        ):
-            assert body.count(distinct) == 1, distinct
-        assert "candidate:2, candidate:3" in body
-        assert "not_placed" in body and "limit 1.25" in body
-    # Presentation does not prune the authoritative input or the writer's evidence.
-    facts = summary_facts(summary, REDACTOR)
-    assert len(facts["candidates"]) == 3
-    assert len(facts["research_reports"]) == 3
-
-
-def test_selected_candidate_gaps_and_distinct_contracts_are_not_dropped() -> None:
-    summary = _input(
-        _record(_decision(_placed(AttemptStatus.UNKNOWN))),
-        candidates=(
-            ConsideredOption(
-                candidate_ref="candidate:1",
-                underlying="AAPL",
-                occ_symbol=str(OCC),
-                gaps=("quote: stale",),
-            ),
-            ConsideredOption(
-                candidate_ref="candidate:2",
-                underlying="AAPL",
-                occ_symbol="AAPL  261016P00180000",
-                gaps=("quote: stale",),
-            ),
-        ),
-    )
-    text = render_facts_text(summary, REDACTOR)
-    assert "[candidate:1]: selected" in text
-    assert "[candidate:2]: not selected" in text
-    assert text.count("quote: stale") == 2  # Each contract has its own gap.
-    assert "order: unknown" in text
-
-
-def test_research_gaps_keep_their_task_scope() -> None:
-    reports = tuple(
-        MignonReport(task=task, findings=(), gaps=("Calendar missing.",), follow_up_questions=())
-        for task in ("Check AAPL", "Check MSFT")
-    )
-    text = render_facts_text(_input(_record(), research_reports=reports), REDACTOR)
-    assert "Research gap (Check AAPL): Calendar missing." in text
-    assert "Research gap (Check MSFT): Calendar missing." in text
+def test_research_load_failure_needs_attention() -> None:
+    text = _text(_input(_record(), research_unavailable="RuntimeError"))
+    assert "- Research notes could not be loaded (RuntimeError)." in text

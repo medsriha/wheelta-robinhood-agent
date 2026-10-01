@@ -5,7 +5,6 @@ from uuid import UUID
 from wheelta_robinhood_agent.agent.result_boundary import mapped_evidence_of
 from wheelta_robinhood_agent.agent.run_loader import Conn, _delivered_envelopes
 from wheelta_robinhood_agent.domain.mignon_report import MignonReport
-from wheelta_robinhood_agent.ledger import evidence
 from wheelta_robinhood_agent.observability.run_summary import ConsideredOption
 
 
@@ -14,15 +13,11 @@ def load_summary_research(
 ) -> tuple[tuple[ConsideredOption, ...], tuple[MignonReport, ...]]:
     """Include delivered candidates and accepted reports, never raw or rejected model text.
 
-    Encountering a candidate is not proof that the agent evaluated or rejected it. Keep its
-    recorded fact gaps separate from the agent's rationale; the renderer makes that clear.
+    Encountering a candidate is not proof that the agent evaluated or rejected it; the
+    renderer labels research as research, never as the agent's reason (ADR-0064).
     """
     candidates: dict[str, ConsideredOption] = {}
     reports: list[MignonReport] = []
-    gaps: dict[str, list[str]] = {}
-    for stored in evidence.effective(evidence.decision_facts_for_run(conn, run_id)):
-        facts = stored.facts
-        gaps.setdefault(facts.subject_ref, []).extend(f"{g.field}: {g.detail}" for g in facts.gaps)
     for envelope in _delivered_envelopes(conn, run_id):
         mapped = mapped_evidence_of(envelope)
         if mapped is not None:
@@ -31,7 +26,6 @@ def load_summary_research(
                     candidate_ref=candidate.candidate_ref,
                     underlying=candidate.underlying,
                     occ_symbol=str(candidate.occ_symbol),
-                    gaps=tuple(dict.fromkeys(gaps.get(candidate.candidate_ref, []))),
                 )
         data = envelope.get("data")
         if (
@@ -40,16 +34,5 @@ def load_summary_research(
             and isinstance(data, dict)
             and isinstance(data.get("report"), dict)
         ):
-            report = MignonReport.model_validate(data["report"])
-            # ADR-0056: findings code dropped are reported as research gaps (index and
-            # reason only; their claims were unsupported and are not shown).
-            dropped = [
-                f"finding {d.get('index')} dropped by code: "
-                + "; ".join(str(r) for r in d.get("reasons", []))
-                for d in data.get("dropped_findings", [])
-                if isinstance(d, dict)
-            ]
-            if dropped:
-                report = report.model_copy(update={"gaps": (*report.gaps, *dropped)})
-            reports.append(report)
+            reports.append(MignonReport.model_validate(data["report"]))
     return tuple(candidates.values()), tuple(reports)

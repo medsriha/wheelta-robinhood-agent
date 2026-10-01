@@ -58,9 +58,15 @@ def check_v6(ctx: AuditContext) -> tuple[AuditFinding, ...]:
 
 
 def _missing_events(ctx: AuditContext, out: Findings) -> None:
+    """V6.4: an intent of this run without its place call. An order the run only observed
+    keeps the intent of the run that placed it; its place call is that run's evidence."""
     known = {c.identity.tool_call_id for c in ctx.tool_calls}
     for order in ctx.order_records:
-        if order.intent is not None and order.intent.place_tool_call_id not in known:
+        if (
+            order.intent is not None
+            and order.intent.run_id == ctx.run_id
+            and order.intent.place_tool_call_id not in known
+        ):
             out.unknown(
                 "4",
                 Reason.MISSING_EVIDENCE,
