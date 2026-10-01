@@ -13,7 +13,7 @@ from wheelta_robinhood_agent.domain.facts_rules import FactsRuleMarker, FactsRul
 def test_maps_the_committed_rules_file() -> None:
     loaded = load_rules()
     rules = facts_rules_from(loaded)
-    assert rules.rules_version == str(loaded.version) == "16"
+    assert rules.rules_version == str(loaded.version) == "17"
     assert rules.rules_hash == loaded.sha256
     assert rules.max_contracts_per_order == 10
     assert rules.max_collateral_per_underlying_usd is FactsRuleMarker.NONE

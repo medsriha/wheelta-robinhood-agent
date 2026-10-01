@@ -28,9 +28,9 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 16
+version = 17
 status = "signed_off"
-adr = "ADR-0065" # v16: scheduling.unfilled_order_next_run_minutes
+adr = "ADR-0066" # v17: orders.walk (code-run order walk)
 signed_off_by = "medsriha (account owner)"
 signed_off_on = "2026-10-01"
 
@@ -133,6 +133,17 @@ working = [
   "Do not leave an order working when you finish. Before returning your output, cancel every order of yours that is still working, confirm its terminal state with get_option_orders, and count the final fills. An order whose cancellation you already sent is only confirmed, never cancelled again.",
   "Only an order you could not resolve (its cancel was uncertain, or an error ended placement and reads cannot confirm it) may remain after you finish; code reports it. The next run cancels it (procedure step 1) and decides again.",
 ]
+
+[orders.walk]
+notes = [
+  "Code works each order for you (work_option_order): it re-quotes, checks, reviews, places, waits, cancels, and confirms, one price step at a time from your start_price to your worst_price.",
+  "A trade works for at most window_seconds from its first placement, in at most max_steps price steps of step_wait_seconds each; whatever is unfilled then is cancelled.",
+]
+window_seconds = 300 # owner, 2026-10-01 (ADR-0066)
+max_steps = 5
+step_wait_seconds = 50
+poll_seconds = 10
+partial_fill = "continue" # the remainder walks on within the same window
 
 # ---------------------------------------------------------------------------------------------
 # Event exclusions

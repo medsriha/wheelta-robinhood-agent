@@ -266,6 +266,37 @@ def test_cancel_request_is_pending_until_a_terminal_read_confirms_it(
     assert owned_unresolved_orders(conn, ACCOUNT) == ()
 
 
+def test_a_later_run_observing_a_cancelled_order_does_not_inherit_the_cancel(
+    conn: Conn, run_id: uuid.UUID, broker: BrokerLedger
+) -> None:
+    """The 2026-10-01 18:35Z sell run read an order a 14:20Z run had cancelled; the cancel
+    reached its assembly as `cancellation_without_call` and the audit could not be stored."""
+    _place(conn, run_id, broker, ORDER)
+    cancel = _call(
+        conn,
+        run_id,
+        "cancel_option_order",
+        {"account_number": "AGENTIC_ACCOUNT", "order_id": ORDER_ID},
+    )
+    _result(conn, run_id, broker, cancel, {"accepted": True})
+    cancelled = {
+        **ORDER,
+        "state": "cancelled",
+        "pending_quantity": "0",
+        "canceled_quantity": "2",
+        "updated_at": "2026-09-29T14:02:00Z",
+    }
+    _read_orders(conn, run_id, broker, [cancelled])
+
+    later_run = open_run_slot(conn, AppEnv.LOCAL, SLOT + timedelta(hours=4)).run_id
+    _read_orders(conn, later_run, BrokerLedger(conn, later_run, ACCOUNT), [cancelled])
+
+    (observed,) = run_order_records(conn, later_run)
+    assert observed.status is AttemptStatus.CANCELLED and observed.cancellations == ()
+    (own,) = run_order_records(conn, run_id)
+    assert [c.cancel_tool_call_id for c in own.cancellations] == [cancel.tool_call_id]
+
+
 def test_unanswered_place_stays_unknown_until_a_complete_read_shows_no_order(
     conn: Conn, run_id: uuid.UUID, broker: BrokerLedger
 ) -> None:

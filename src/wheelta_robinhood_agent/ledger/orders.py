@@ -717,7 +717,10 @@ def _linked_intent_ids(conn: Conn, account_scope_id: str) -> dict[uuid.UUID, set
 
 def run_order_records(conn: Conn, run_id: uuid.UUID) -> tuple[OrderRecord, ...]:
     """Every order this run placed or observed (an intent of the run, or an order event
-    recorded in the run), plus this run's intents with no linked order, for run assembly."""
+    recorded in the run), plus this run's intents with no linked order, for run assembly.
+
+    An observed order keeps only the cancellations whose cancel call is this run's (or is not
+    recorded at all): another run's cancel is that run's action, not one this run made."""
     order_ids = [
         r["order_id"]
         for r in _rows(
@@ -727,7 +730,9 @@ def run_order_records(conn: Conn, run_id: uuid.UUID) -> tuple[OrderRecord, ...]:
             (run_id,),
         )
     ]
-    records = [order_record(conn, order_id) for order_id in order_ids]
+    records = _without_foreign_cancellations(
+        conn, [order_record(conn, order_id) for order_id in order_ids], run_id
+    )
     linked = {r.intent.intent_id for r in records if r.intent is not None}
     for row in _rows(
         conn, _INTENT_SELECT + "WHERE i.run_id = %s ORDER BY t.requested_at", (run_id,)
@@ -735,6 +740,34 @@ def run_order_records(conn: Conn, run_id: uuid.UUID) -> tuple[OrderRecord, ...]:
         if row["intent_id"] not in linked:
             records.append(OrderRecord(intent=_intent(row), broker_order=None))
     return tuple(records)
+
+
+def _without_foreign_cancellations(
+    conn: Conn, records: list[OrderRecord], run_id: uuid.UUID
+) -> list[OrderRecord]:
+    cancel_ids = [c.cancel_tool_call_id for r in records for c in r.cancellations]
+    if not cancel_ids:
+        return records
+    foreign = {
+        row["tool_call_id"]
+        for row in _rows(
+            conn,
+            "SELECT tool_call_id FROM tool_calls WHERE tool_call_id = ANY(%s) AND run_id <> %s",
+            (cancel_ids, run_id),
+        )
+    }
+    if not foreign:
+        return records
+    return [
+        r.model_copy(
+            update={
+                "cancellations": tuple(
+                    c for c in r.cancellations if c.cancel_tool_call_id not in foreign
+                )
+            }
+        )
+        for r in records
+    ]
 
 
 def owned_unresolved_orders(conn: Conn, account_scope_id: str) -> tuple[OrderRecord, ...]:

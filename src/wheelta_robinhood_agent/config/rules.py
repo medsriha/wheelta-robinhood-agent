@@ -147,6 +147,26 @@ class Filters(_Section):
     min_cushion_ratio: DecimalRule  # ADR-0048
 
 
+class PartialFill(StrEnum):
+    """What a code-run walk does after a partial fill (ADR-0066)."""
+
+    CONTINUE = "continue"  # the remainder walks on within the same window
+    STOP = "stop"  # a partial fill ends the trade
+
+
+class OrderWalk(_Section):
+    """The code-run order walk (ADR-0066), applied by `agent/order_walk.py`. Fixed positive
+    counts in seconds: no marker, since every order needs them. `domain.order_walk.WalkTiming`
+    checks that the steps fit the window."""
+
+    notes: Notes = ()
+    window_seconds: StrictInt = Field(gt=0)
+    max_steps: StrictInt = Field(gt=0)
+    step_wait_seconds: StrictInt = Field(gt=0)
+    poll_seconds: StrictInt = Field(gt=0)
+    partial_fill: PartialFill
+
+
 class Orders(_Section):
     execution_order: StrictStr
     open_checks: StrictStr
@@ -155,6 +175,7 @@ class Orders(_Section):
     limit_price_bounds: StrictStr
     time_in_force: StrictStr
     working: Notes
+    walk: OrderWalk
 
 
 class Events(_Section):
