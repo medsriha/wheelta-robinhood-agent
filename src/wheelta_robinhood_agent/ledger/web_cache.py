@@ -1,11 +1,13 @@
 """Web search/fetch cache repository (ADR-0016, migrations/0001_initial.sql).
 
-Entries are appended once per successful WebSearch/WebFetch tool call and never updated.
+Entries are appended once per successful `tavily_search` call (ADR-0058; older rows hold
+WebSearch/WebFetch results) and never updated.
 Freshness is decided at read time from `retrieved_at` and a max age the caller passes in
 (`data_quality.freshness.news_max_age_seconds`), so changing the TTL needs no data change.
 """
 
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 
 import psycopg
@@ -13,10 +15,11 @@ from psycopg.types.json import Jsonb
 from pydantic import JsonValue
 
 from wheelta_robinhood_agent.domain.web_cache import (
+    SEARCH_TOOLS,
     WebCacheEntry,
     WebTool,
-    normalize_query,
     normalize_url,
+    search_cache_key,
     tickers_in,
     validate_ticker,
 )
@@ -41,14 +44,16 @@ def record_web_result(
     tool_input: str,
     result: JsonValue,
     retrieved_at: datetime,
+    options: Mapping[str, object] | None = None,
 ) -> WebCacheEntry:
-    """Append the result of one successful call. `tool_input` is the query or the URL.
+    """Append the result of one successful call. `tool_input` is the query or the URL, and
+    `options` a search's other arguments (part of its key, `search_cache_key`).
 
     Idempotent per tool call: recording the same tool call again returns the stored entry.
-    Only record results that passed the PostToolUse validation; errors are never cached.
+    Only record results that passed validation; errors are never cached.
     """
-    if tool is WebTool.WEB_SEARCH:
-        cache_key, query_raw, url = normalize_query(tool_input), tool_input, None
+    if tool in SEARCH_TOOLS:
+        cache_key, query_raw, url = search_cache_key(tool_input, options), tool_input, None
     else:
         cache_key, query_raw, url = normalize_url(tool_input), None, tool_input
     entry_id = new_id()
@@ -81,9 +86,12 @@ def fresh_entry_for_key(
     tool_input: str,
     now: datetime,
     max_age_seconds: int,
+    options: Mapping[str, object] | None = None,
 ) -> WebCacheEntry | None:
-    """The newest fresh entry for exactly this normalized query or URL, if any."""
-    key = normalize_query(tool_input) if tool is WebTool.WEB_SEARCH else normalize_url(tool_input)
+    """The newest fresh entry for exactly this search key or normalized URL, if any."""
+    key = (
+        search_cache_key(tool_input, options) if tool in SEARCH_TOOLS else normalize_url(tool_input)
+    )
     row = conn.execute(
         f"SELECT {_COLUMNS} FROM web_cache_entries e "  # noqa: S608 - constant column list
         "WHERE e.tool = %s AND e.cache_key = %s AND e.retrieved_at BETWEEN %s AND %s "
@@ -101,7 +109,8 @@ def fresh_entries_for_ticker(
     max_age_seconds: int,
     limit: int,
 ) -> tuple[WebCacheEntry, ...]:
-    """Fresh WebSearch entries tagged with `ticker` in web_cache_entry_tickers, newest first.
+    """Fresh `tavily_search` entries tagged with `ticker` in web_cache_entry_tickers, newest
+    first (earlier WebSearch rows have a different result shape and are not returned).
 
     Tags are written with the entry from domain.web_cache.tickers_in(query).
     """
@@ -111,7 +120,7 @@ def fresh_entries_for_ticker(
     rows = conn.execute(
         f"SELECT {_COLUMNS} FROM web_cache_entries e "  # noqa: S608 - constant column list
         "JOIN web_cache_entry_tickers tag ON tag.entry_id = e.entry_id AND tag.ticker = %s "
-        "WHERE e.tool = 'WebSearch' AND e.retrieved_at BETWEEN %s AND %s "
+        "WHERE e.tool = 'tavily_search' AND e.retrieved_at BETWEEN %s AND %s "
         "ORDER BY e.retrieved_at DESC, e.entry_id LIMIT %s",
         (ticker, now - timedelta(seconds=max_age_seconds), now, limit),
     ).fetchall()

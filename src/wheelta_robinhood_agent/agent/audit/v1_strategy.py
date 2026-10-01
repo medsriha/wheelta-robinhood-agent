@@ -4,7 +4,10 @@ For every placed (live) or intended (off) attempt:
 1. limit order, side sell_to_open or buy_to_close;
 2. BTC quantity <= short quantity available to close net of other working BTC orders;
 3. STO put: N <= C - limits.min_cash_reserve_usd;
-4. STO call: multiplier x quantity <= owned shares not otherwise reserved.
+4. STO call: multiplier x quantity <= owned shares not otherwise reserved;
+5. ADR-0057, the side belongs to the agent: the Sell Options agent never buys to close, and
+   the Buy-to-Close agent sells to open only for a ROLL decision (an unattributed sell-to-open
+   is unverifiable). Not checked for the legacy single agent.
 Live uses the pre-order broker state as reported; off uses the dry-run reservation projection.
 A missing broker field is unverifiable, never a zero reservation.
 """
@@ -27,7 +30,13 @@ from wheelta_robinhood_agent.agent.audit._common import (
 )
 from wheelta_robinhood_agent.agent.audit.context import AuditContext
 from wheelta_robinhood_agent.config.rules import RuleMarker
-from wheelta_robinhood_agent.domain.enums import AuditCheck, OptionRight, OrderSide
+from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
+    AuditCheck,
+    DecisionAction,
+    OptionRight,
+    OrderSide,
+)
 from wheelta_robinhood_agent.domain.run import AuditFinding
 
 LIMIT = "limit"
@@ -49,6 +58,8 @@ def check_v1(ctx: AuditContext) -> tuple[AuditFinding, ...]:
         side = attempt.side
         if side is None:
             continue
+        if ctx.agent_role is not AgentRole.WHEEL:
+            _role_side(ctx, out, attempt, side)
         pre = states[attempt.key]
         if side is OrderSide.BUY_TO_CLOSE:
             _close_quantity(ctx, out, attempt, pre)
@@ -79,6 +90,41 @@ def _identity(out: Findings, attempt: AuditAttempt) -> None:
         )
     else:
         out.ok("1", "limit order with a permitted side", attempt=attempt, observed=observed)
+
+
+def _role_side(ctx: AuditContext, out: Findings, attempt: AuditAttempt, side: OrderSide) -> None:
+    """V1.5 (ADR-0057): the order side belongs to this run's agent."""
+    observed = f"{ctx.agent_role.value}/{side.value}"
+    if side is OrderSide.BUY_TO_CLOSE:
+        if ctx.agent_role is AgentRole.SELL:
+            out.bad(
+                "5", "buy-to-close by the Sell Options agent", attempt=attempt, observed=observed
+            )
+        else:
+            out.ok(
+                "5", "buy-to-close by the Buy-to-Close agent", attempt=attempt, observed=observed
+            )
+        return
+    if ctx.agent_role is AgentRole.SELL:
+        out.ok("5", "sell-to-open by the Sell Options agent", attempt=attempt, observed=observed)
+    elif attempt.decision is None:
+        out.unknown(
+            "5",
+            Reason.UNASSOCIATED,
+            "sell-to-open by the Buy-to-Close agent with no decision to show it is a roll",
+            attempt=attempt,
+        )
+    elif attempt.decision.action is DecisionAction.ROLL:
+        out.ok(
+            "5", "roll replacement by the Buy-to-Close agent", attempt=attempt, observed=observed
+        )
+    else:
+        out.bad(
+            "5",
+            f"sell-to-open by the Buy-to-Close agent for {attempt.decision.action.value}",
+            attempt=attempt,
+            observed=observed,
+        )
 
 
 def _close_quantity(

@@ -40,6 +40,7 @@ from wheelta_robinhood_agent.integrations.robinhood.registry import (
     ROBINHOOD_REGISTRY,
 )
 from wheelta_robinhood_agent.integrations.status import McpHttpServer, SourceObservation
+from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 
 NOW = datetime(2026, 9, 23, 15, 30, tzinfo=UTC)
@@ -77,7 +78,7 @@ def test_nothing_accepted_withholds_every_remote_source_and_blocks_the_session()
     assert plan.required_unavailable == ("robinhood",)
     assert not plan.may_start
     assert plan.servers == ()
-    assert set(plan.tool_access.allowed_tools) == {"Agent", "WebSearch", "WebFetch", *LOCAL_TOOLS}
+    assert set(plan.tool_access.allowed_tools) == {"Agent", *LOCAL_TOOLS}
     assert {o.status for o in plan.observations} == {SourceStatus.DISABLED}
 
 
@@ -346,7 +347,7 @@ def test_orchestrator_table_lists_its_tools_then_mignon_types_and_models_once() 
     for model in models:
         assert roster.count(f"- `{model}`:") == 1
     # A Mignon's tools are its own prompt's business, never the orchestrator's table.
-    assert "WebSearch" not in table and "get_option_chains" not in table
+    assert "tavily" not in table and "get_option_chains" not in table
     assert "$1/$5" in roster
 
 
@@ -363,8 +364,47 @@ def test_login_scoped_workspace_reads_are_offered() -> None:
 def test_mignon_table_lists_only_its_role() -> None:
     plan = _plan()
     table = available_tools_table(plan, Role.COMPANY)
-    assert "`WebFetch`" in table and "get_option_positions" not in table
+    assert "get_financials" in table and "get_option_positions" not in table
     assert "Agent" not in table and "Mignon `" not in table
+
+
+TV = McpHttpServer(name="tavily", url="https://tv.example/mcp/", token=SecretStr("tvly-x"))  # type: ignore[arg-type]
+
+
+def _web_plan(tavily: Any = TV) -> Any:
+    return plan_session(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=True,
+        sources=(
+            RemoteSource(RH_VERIFIED, RH, required=True),
+            RemoteSource(WHEELTA_REGISTRY, WT),
+            RemoteSource(TAVILY_REGISTRY, tavily),
+        ),
+        observed_at=NOW,
+    )
+
+
+def test_tavily_is_proxied_and_listed_for_web_mignons_only() -> None:
+    """ADR-0058: Tavily goes through the validating proxy; its search and extract are in the
+    company and macro tables, never the market Mignon's or the orchestrator's."""
+    plan = _web_plan()
+    assert "tavily" in {s.name for s in plan.proxied} and "tavily" not in plan.withheld
+    for role in (Role.COMPANY, Role.MACRO):
+        table = available_tools_table(plan, role)
+        assert "| `mcp__tavily__tavily_search` | R |" in table
+        assert "| `mcp__tavily__tavily_extract` | R |" in table
+    assert "tavily" not in available_tools_table(plan, Role.MARKET)
+    assert "tavily" not in available_tools_table(plan)
+    assert "mcp__tavily__tavily_research" in plan.tool_access.disallowed_tools
+
+
+def test_tavily_without_a_key_is_withheld_and_the_run_still_starts() -> None:
+    disabled = SourceObservation(server="tavily", status=SourceStatus.DISABLED, observed_at=NOW)
+    plan = _web_plan(disabled)
+    assert plan.withheld["tavily"].startswith("unavailable before connect")
+    assert plan.may_start
+    assert not any(t.startswith("mcp__tavily__") for t in plan.tool_access.allowed_tools)
+    assert "tavily" in available_tools_table(plan, Role.COMPANY)  # named as withheld
 
 
 def test_disabled_mignons_leave_the_table_without_a_roster() -> None:

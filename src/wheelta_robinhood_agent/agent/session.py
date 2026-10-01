@@ -1,4 +1,4 @@
-"""Run the single Claude Agent SDK session for a run (ARCHITECTURE.md "Run lifecycle" 4-6).
+"""Run the Claude Agent SDK session of one run (ARCHITECTURE.md "Run lifecycle" 4-6).
 
 Two parts:
 
@@ -17,27 +17,30 @@ Two parts:
   discovery diff (401/403 → `needs-auth`); verify in trusted code, through the Robinhood
   upstream's `get_accounts`, that the configured account is Agentic-eligible (a failed or
   negative check withholds Robinhood; a pass lets `get_portfolio` snapshots be
-  `agentic_verified`); build hooks (tool access layer 3, recording,
-  result boundary, web cache), the proxies, and options; connect; poll `get_mcp_status` for
-  direct servers only (`pending` is intermediate; CLAUDE.md §8), withhold anything
-  unavailable, and only then send the start message. In-process servers (`wra_local` and the
-  proxies) are absent from `get_mcp_status` until the first query (real CLI 2.1.283), so they
-  are verified by the init `SystemMessage` check instead, which stops the run if Robinhood or
-  `wra_local` is not connected. A RunControl stop (signal, deadline, infrastructure failure)
-  interrupts the SDK. The last `ResultMessage` usage/cost (the session's running totals)
-  feeds `RunMetrics`. Its final text is parsed into AgentDecisionOutput v6; an invalid output
-  gets up to `MAX_OUTPUT_REPAIRS` follow-up turns listing the issues, with every tool denied
-  (ADR-0044). Each raw (redacted) response and its parse are persisted, each repair
-  correcting the one before. A valid output whose references do not resolve, or that leaves
-  an order action it could cite unclaimed, gets up to `MAX_REFERENCE_REPAIRS` such turns
-  listing those issues (ADR-0052, `SessionDeps.reference_check`).
+  `agentic_verified`); for the Buy-to-Close and Sell Options agents (ADR-0057), check the role's
+  start condition the same way (`agent/start_probe.py`): not met means `SKIPPED`, unknown means
+  no session (`NOT_STARTED`, fail closed); build hooks (tool access layer 3, recording, result
+  boundary, web cache), the proxies, and options; connect; poll `get_mcp_status` for direct
+  servers only (`pending` is intermediate; CLAUDE.md §8), withhold anything unavailable, and
+  only then send the start message. In-process servers (`wra_local` and the proxies) are absent
+  from `get_mcp_status` until the first query (real CLI 2.1.283), so they are verified by the
+  init `SystemMessage` check instead, which stops the run if Robinhood or `wra_local` is not
+  connected. A RunControl stop (signal, deadline, infrastructure failure) interrupts the SDK.
+  The last `ResultMessage` usage/cost (the session's running totals) feeds `RunMetrics`. Its
+  final text is parsed into AgentDecisionOutput v6; an invalid output gets up to
+  `MAX_OUTPUT_REPAIRS` follow-up turns listing the issues, with every tool denied (ADR-0044).
+  Each raw (redacted) response and its parse are persisted, each repair correcting the one
+  before. A valid output whose references do not resolve, or that leaves an order action it
+  could cite unclaimed, gets up to `MAX_REFERENCE_REPAIRS` such turns listing those issues
+  (ADR-0052, `SessionDeps.reference_check`).
 
 `assert_no_order_tools` re-checks the plan before any session is built: without an order
 venue no Tier X tool is allowed; with one only the three option-order tools are. The venue
 (ADR-0038) is `broker` in armed live (ADR-0034); in a dry run it is `simulated` when
 Robinhood is proxied (`simulated_broker.SimulatedBroker` answers the order tools in-process)
 and `none` otherwise. `broker_ledger.BrokerLedger` records orders for both venues: broker
-orders under the account scope, simulated ones under the run's own simulated scope.
+orders under the account scope, simulated ones under the tick's simulated scope (ADR-0057:
+the first run's id, shared with the second run, which also shares the simulated state).
 """
 
 import contextlib
@@ -118,9 +121,13 @@ from wheelta_robinhood_agent.agent.result_boundary import (
     extract_mcp_payload,
 )
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
-from wheelta_robinhood_agent.agent.simulated_broker import SimulatedBroker, simulated_scope_id
+from wheelta_robinhood_agent.agent.simulated_broker import (
+    SimulatedBroker,
+    SimulatedState,
+    simulated_scope_id,
+)
+from wheelta_robinhood_agent.agent.start_probe import probe_start_condition
 from wheelta_robinhood_agent.agent.tool_access import (
-    ALLOWED_BUILTINS,
     ToolAccess,
     build_tool_access,
 )
@@ -138,12 +145,14 @@ from wheelta_robinhood_agent.config.rules import LoadedRules
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.account import AgenticEligibility
 from wheelta_robinhood_agent.domain.decision_output import (
+    ROLE_ACTIONS,
     DecisionOutputParsed,
     DecisionOutputParseResult,
     ParseIssue,
     parse_agent_decision_output,
 )
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     ExecutionMode,
     MignonType,
     OrderVenue,
@@ -153,6 +162,12 @@ from wheelta_robinhood_agent.domain.enums import (
 )
 from wheelta_robinhood_agent.domain.gating import executes_orders, order_venue
 from wheelta_robinhood_agent.domain.orders import OrderRecord
+from wheelta_robinhood_agent.domain.start_conditions import (
+    STARTS_SESSION,
+    StartCondition,
+    StartOutcome,
+    unchecked_start,
+)
 from wheelta_robinhood_agent.integrations.mcp_upstream import (
     McpUpstream,
     UpstreamAuthError,
@@ -172,7 +187,15 @@ from wheelta_robinhood_agent.integrations.status import (
     SourceObservation,
     observe_server,
 )
+from wheelta_robinhood_agent.integrations.websearch.registry import (
+    EXTRACT_TOOL,
+    SEARCH_TOOL,
+)
+from wheelta_robinhood_agent.integrations.websearch.registry import (
+    SERVER_NAME as TAVILY,
+)
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
+from wheelta_robinhood_agent.ledger import orders as ledger_orders
 from wheelta_robinhood_agent.ledger import tool_calls as ledger_tool_calls
 from wheelta_robinhood_agent.observability.metrics import RunMetrics
 from wheelta_robinhood_agent.observability.redaction import Redactor
@@ -351,10 +374,14 @@ def plan_session(
 
 _TOOL_PURPOSES: Final[dict[str, str]] = {
     DELEGATION_TOOL: "Spawn one research Mignon (subagent_type, description, prompt)",
-    "WebSearch": "Public web context the structured tools lack (source tiers apply)",
-    "WebFetch": "Read one page from a trusted source (source tiers apply)",
+    f"mcp__{TAVILY}__{SEARCH_TOOL}": (
+        "Web search for public context the structured tools lack: leads, not sources"
+    ),
+    f"mcp__{TAVILY}__{EXTRACT_TOOL}": (
+        "Read up to 5 pages; only pages it returned are citable (source tiers apply)"
+    ),
     f"mcp__{LOCAL_SERVER_NAME}__{WEB_CACHE_TOOL_NAME}": (
-        "Fresh recorded WebSearch results for a ticker; read before searching again"
+        "Fresh recorded tavily_search results for a ticker; read before searching again"
     ),
     f"mcp__{LOCAL_SERVER_NAME}__{FACTS_TOOL_NAME}": (
         "Code-computed decision facts, sizing, and facts_ref for a candidate/position ref"
@@ -363,13 +390,11 @@ _TOOL_PURPOSES: Final[dict[str, str]] = {
 
 
 def _role_rows(plan: SessionPlan, role: Role) -> list[str]:
-    """Table rows for the role's tools allowed this run (built-ins first, then registries)."""
+    """Table rows for the role's tools allowed this run (`Agent` first, then registries)."""
     allowed = set(plan.tool_access.allowed_tools) & ROLE_TOOLS[role]
     rows = []
-    for name in (DELEGATION_TOOL, *ALLOWED_BUILTINS):
-        if name in allowed:
-            tier = "D" if name == DELEGATION_TOOL else "R"
-            rows.append(f"| `{name}` | {tier} | {_TOOL_PURPOSES[name]} |")
+    if DELEGATION_TOOL in allowed:
+        rows.append(f"| `{DELEGATION_TOOL}` | D | {_TOOL_PURPOSES[DELEGATION_TOOL]} |")
     for registry in plan.registries:
         if not registry.verified or registry.server in plan.withheld:
             continue
@@ -425,6 +450,9 @@ def available_tools_table(
 class SessionStatus(StrEnum):
     COMPLETED = "completed"  # a ResultMessage arrived without a stop request
     NOT_STARTED = "not_started"  # a required source was unavailable; no query was sent
+    # ADR-0057: the agent's start condition was not met (`SessionResult.start_condition`);
+    # no query was sent.
+    SKIPPED = "skipped"
     STOPPED = "stopped"  # the RunControl latch interrupted the session
     FAILED = "failed"  # the SDK/transport failed before a result
 
@@ -466,6 +494,16 @@ class SessionDeps:
     # ADR-0052: assembles a parsed output against this run's recorded calls (the
     # orchestrator binds `run_loader.check_references`). None: no reference turns.
     reference_check: ReferenceCheck | None = None
+    # ADR-0057: which agent this session is. CLOSE and SELL check their start condition
+    # before the model connects and may decide only their own actions.
+    role: AgentRole = AgentRole.WHEEL
+    # Earlier runs of the same tick (the sell run: the close run). Their unresolved orders
+    # count as working for this run's placements (ADR-0051).
+    related_run_ids: tuple[uuid.UUID, ...] = ()
+    # The run whose id names the tick's simulated order scope (default: this run).
+    order_scope_run_id: uuid.UUID | None = None
+    # The tick's simulated broker state (simulated venue only; None: a fresh one).
+    simulated_state: SimulatedState | None = None
 
 
 @dataclass
@@ -495,6 +533,8 @@ class SessionResult:
     reference_repairs: int = 0
     reference_issues: tuple[str, ...] | None = None
     reference_check_error: str | None = None
+    # ADR-0057: the trusted start-condition check (CLOSE/SELL); None if it did not run.
+    start_condition: StartCondition | None = None
 
 
 def _web_cache_parts(
@@ -581,6 +621,8 @@ def build_session_options(
             rules=pretrade_rules_from(deps.rules),
             clock=deps.clock,
             placements=lambda: placement_state(deps),
+            role=deps.role,
+            run_orders=lambda: ledger_orders.run_order_records(deps.conn, deps.run_id),
         ),
     )
     facts_service = DecisionFactsService(
@@ -603,6 +645,7 @@ def build_session_options(
                 registry=registry_by_name[name],
                 instruments=lambda iid: load_run_evidence(deps.conn, deps.run_id).instrument(iid),
                 clock=deps.clock,
+                state=deps.simulated_state or SimulatedState(),
             )
         proxy = ValidatingProxy(
             server=name,
@@ -619,7 +662,7 @@ def build_session_options(
                     deps.run_id,
                     deps.account_scope_id
                     if venue is OrderVenue.BROKER
-                    else simulated_scope_id(deps.run_id),
+                    else simulated_scope_id(deps.order_scope_run_id or deps.run_id),
                 )
                 if executes_orders(venue) and name == ROBINHOOD
                 else None
@@ -817,6 +860,32 @@ async def _check_agentic_account(
             result.withheld[ROBINHOOD] = reason
 
 
+async def _check_start_condition(deps: SessionDeps, upstream: McpUpstream | None) -> StartCondition:
+    """ADR-0057: the role's start condition from trusted reads (`agent/start_probe.py`).
+
+    Without a proxied Robinhood upstream there is no trusted channel: a proposal-only dry run
+    (Robinhood served directly, order venue `none`, ADR-0019) starts unchecked; any other
+    venue fails closed (UNAVAILABLE)."""
+    if upstream is None:
+        if deps.plan.order_venue is OrderVenue.NONE:
+            return unchecked_start(deps.role)
+        return StartCondition(
+            role=deps.role,
+            outcome=StartOutcome.UNAVAILABLE,
+            reason="no trusted Robinhood connection to read the start condition through",
+        )
+    return await probe_start_condition(
+        deps.role,
+        upstream,
+        account_number=deps.settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
+        min_settled_cash_usd=deps.rules.rules.sessions.sell_min_settled_cash_usd,
+        clock=deps.clock,
+        timeout_seconds=upstream_timeout_seconds(deps.settings.MCP_TOOL_TIMEOUT),
+        simulated=deps.simulated_state if deps.plan.order_venue is OrderVenue.SIMULATED else None,
+        mappers=deps.mappers,
+    )
+
+
 def _start_message(withheld: Mapping[str, str]) -> str:
     if not withheld:
         return START_MESSAGE
@@ -934,7 +1003,9 @@ async def _converse(
     """
     done = anyio.Event()
     last_result: ResultMessage | None = None
-    scope_id = order_scope(deps.plan.order_venue, deps.account_scope_id, deps.run_id)
+    scope_id = order_scope(
+        deps.plan.order_venue, deps.account_scope_id, deps.order_scope_run_id or deps.run_id
+    )
 
     async def watch(scope: anyio.CancelScope) -> None:
         while not done.is_set():
@@ -1008,7 +1079,9 @@ async def _converse(
                             output_gate.restrict(CLEANUP_DENIAL, CLEANUP_TOOLS)
                         text = await turn(cleanup_message(unresolved, result.order_cleanups))
                         continue
-                parsed = parse_agent_decision_output(deps.redactor.redact_text(text))
+                parsed = parse_agent_decision_output(
+                    deps.redactor.redact_text(text), ROLE_ACTIONS[deps.role]
+                )
                 if isinstance(parsed, DecisionOutputParsed):
                     # Off the event loop, so the watcher still enforces stop and deadline.
                     issues = await anyio.to_thread.run_sync(_reference_issues, deps, parsed, result)
@@ -1107,7 +1180,7 @@ def persist_output(deps: SessionDeps, result: SessionResult) -> None:
             observed_at=deps.clock(),
             corrects_output_id=previous,
         )
-        parsed = parse_agent_decision_output(raw)
+        parsed = parse_agent_decision_output(raw, ROLE_ACTIONS[deps.role])
         ledger_evidence.insert_agent_decision(
             deps.conn, run_id=deps.run_id, output_id=output_id, result=parsed
         )
@@ -1133,6 +1206,12 @@ async def run_agent_session(deps: SessionDeps) -> SessionResult:
             await _check_agentic_account(deps, upstreams[ROBINHOOD], withholding, result)
         if ROBINHOOD in result.withheld or deps.run_control.stop_requested:
             return result
+        if deps.role is not AgentRole.WHEEL:
+            result.start_condition = await _check_start_condition(deps, upstreams.get(ROBINHOOD))
+            if result.start_condition.outcome not in STARTS_SESSION:
+                if result.start_condition.outcome is StartOutcome.NOT_MET:
+                    result.status = SessionStatus.SKIPPED
+                return result
         await _run_client(deps, withholding, upstreams, result)
     if result.status is not SessionStatus.NOT_STARTED:
         close_unresolved_calls(deps)
@@ -1144,14 +1223,17 @@ async def run_agent_session(deps: SessionDeps) -> SessionResult:
 def placement_state(deps: SessionDeps) -> PlacementState:
     """This run's unresolved owned orders and its place calls without an outcome (ADR-0051).
 
-    Only this run's placements count: an older order the ledger cannot resolve (paged order
-    history, ADR-0034) must not block trading; the prompt's step 1 and ADR-0050 handle those.
+    Only this tick's placements count (this run's and, ADR-0057, those of its earlier runs):
+    an older order the ledger cannot resolve (paged order history, ADR-0034) must not block
+    trading; the prompt's step 1 and ADR-0050 handle those.
     """
-    scope = order_scope(deps.plan.order_venue, deps.account_scope_id, deps.run_id)
+    scope = order_scope(
+        deps.plan.order_venue, deps.account_scope_id, deps.order_scope_run_id or deps.run_id
+    )
     unresolved = tuple(
         r
         for r in unresolved_orders(deps.conn, scope)
-        if r.intent is not None and r.intent.run_id == deps.run_id
+        if r.intent is not None and r.intent.run_id in (deps.run_id, *deps.related_run_ids)
     )
     in_flight = sum(
         1
@@ -1163,7 +1245,9 @@ def placement_state(deps: SessionDeps) -> PlacementState:
 
 def cleanup_candidates(deps: SessionDeps) -> tuple[OrderRecord, ...]:
     """Unresolved owned orders that can still be working (ADR-0050, `needs_cleanup`)."""
-    scope = order_scope(deps.plan.order_venue, deps.account_scope_id, deps.run_id)
+    scope = order_scope(
+        deps.plan.order_venue, deps.account_scope_id, deps.order_scope_run_id or deps.run_id
+    )
     unresolved = unresolved_orders(deps.conn, scope)
     if not unresolved:
         return ()

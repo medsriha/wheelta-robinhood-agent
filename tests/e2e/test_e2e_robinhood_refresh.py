@@ -18,7 +18,7 @@ from e2e_support import SESSION_TIME, FakeClock, RecordingNotifier
 from pydantic import SecretStr
 from test_e2e_orchestrator import Harness
 
-from wheelta_robinhood_agent.domain.enums import AppEnv, RunStatus
+from wheelta_robinhood_agent.domain.enums import AgentRole, AppEnv, RunStatus
 from wheelta_robinhood_agent.domain.events import RunEventType
 from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
 from wheelta_robinhood_agent.integrations.robinhood.oauth import OAuthRefreshFailed, TokenPair
@@ -101,9 +101,15 @@ def _seed(h: Harness, key: SecretStr, tokens: Tokens, expires_in: timedelta) -> 
 
 
 def _credential_event(h: Harness) -> dict[str, Any]:
+    """The tick's one credential resolution, on the close run (ADR-0057); the sell run, when
+    it got that far, records the same resolution as reused, never a second refresh."""
     events = [e for e in h.events(RunEventType.METADATA) if "robinhood_credential" in e]
-    assert len(events) == 1
-    return dict(events[0]["robinhood_credential"])
+    first, *rest = (dict(e["robinhood_credential"]) for e in events)
+    assert first.pop("reused_in_tick") is False
+    for again in rest:
+        assert again.pop("reused_in_tick") is True and again == first
+    assert len(rest) <= 1
+    return first
 
 
 def _bearer(h: Harness) -> str:
@@ -112,9 +118,15 @@ def _bearer(h: Harness) -> str:
     servers = h.clis[0].options.mcp_servers
     assert isinstance(servers, dict)
     assert all("headers" not in cfg for cfg in servers.values())
-    (upstream,) = [s for s in h.world.upstream_servers if s.name == "robinhood"]
-    assert upstream.token is not None
-    return f"Bearer {upstream.token.get_secret_value()}"
+    # ADR-0057: each agent run of the tick opens its own upstream, with the same credential.
+    tokens = {
+        s.token.get_secret_value() if s.token is not None else None
+        for s in h.world.upstream_servers
+        if s.name == "robinhood"
+    }
+    (token,) = tokens
+    assert token is not None
+    return f"Bearer {token}"
 
 
 def _assert_no_token_leak(h: Harness, tokens: Tokens, caplog: pytest.LogCaptureFixture) -> None:
@@ -251,7 +263,8 @@ def test_production_refreshes_the_credential_and_runs_the_session(
         ROBINHOOD_TOKEN_ENCRYPTION_KEY=key.get_secret_value(),
     )
     h = Harness(settings, notifier, FakeClock(SESSION_TIME))
-    h.run_id = run_id_for(AppEnv.PRODUCTION, slot_for(SESSION_TIME))
+    h.run_id = run_id_for(AppEnv.PRODUCTION, slot_for(SESSION_TIME), AgentRole.SELL)
+    h.close_id = run_id_for(AppEnv.PRODUCTION, slot_for(SESSION_TIME), AgentRole.CLOSE)
     tokens = Tokens()
     with h.conn() as c:
         insert_credential(

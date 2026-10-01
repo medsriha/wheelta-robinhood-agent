@@ -48,7 +48,7 @@ from wheelta_robinhood_agent.domain.run_record import (
 )
 from wheelta_robinhood_agent.domain.tool_calls import ToolCallRecord
 
-ASSEMBLER_VERSION: Final = "assembler.v2"
+ASSEMBLER_VERSION: Final = "assembler.v3"
 """Version of the deterministic assembly algorithm; bump with any output-affecting change.
 v2 (ADR-0052): the `unassociated_place_matches_decision` finding."""
 

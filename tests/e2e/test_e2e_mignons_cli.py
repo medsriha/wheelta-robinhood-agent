@@ -157,10 +157,10 @@ def test_only_mignon_types_are_offered_and_web_is_denied_to_the_orchestrator(
     assert f"- {MARKET_T}:" in listing
     for builtin in ("- general-purpose:", "- Explore:", "- Plan:", "- claude:"):
         assert builtin not in listing, listing
-    (search,) = [c for c in out.recorder.requested_calls() if c["tool"] == "WebSearch"]
-    outcome = out.recorder.outcomes_for(out.recorder.ids[search["sdk_tool_use_id"]])
-    assert [o["status"] for o in outcome] == [ToolCallStatus.DENIED]
-    assert "orchestrator" in outcome[0]["reason"]
+    # ADR-0058: the built-in web tools are not loaded at all, so the CLI refuses the call
+    # before any hook or server (web research is Tavily's proxied tools, Mignons only).
+    assert not {"WebSearch", "WebFetch"} & set(first.tool_names())
+    assert "WebSearch" not in {c["tool"] for c in out.recorder.requested_calls()}
 
 
 def test_background_is_dropped_and_the_report_still_crosses_the_boundary(

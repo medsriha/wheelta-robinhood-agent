@@ -1,7 +1,11 @@
 import pytest
 
 from wheelta_robinhood_agent.domain.enums import RunStatus
-from wheelta_robinhood_agent.orchestrator.exit_codes import ExitCodeUndefined, exit_code_for
+from wheelta_robinhood_agent.orchestrator.exit_codes import (
+    ExitCodeUndefined,
+    combined_exit_code,
+    exit_code_for,
+)
 
 EXPECTED = {
     RunStatus.COMPLETED: 0,
@@ -11,6 +15,8 @@ EXPECTED = {
     RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL: 0,
     RunStatus.SKIPPED_NOT_DUE: 0,
     RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED: 0,
+    RunStatus.SKIPPED_NO_OPEN_SHORTS: 0,
+    RunStatus.SKIPPED_INSUFFICIENT_BALANCE: 0,
     RunStatus.FAILED: 1,
     RunStatus.TIMED_OUT: 2,
     RunStatus.STOPPED: 3,
@@ -37,3 +43,13 @@ def test_failure_codes_distinct_and_nonzero() -> None:
     codes = [EXPECTED[s] for s in (RunStatus.FAILED, RunStatus.TIMED_OUT, RunStatus.STOPPED)]
     assert len(set(codes)) == 3
     assert 0 not in codes
+
+
+def test_a_tick_exits_with_its_most_severe_run() -> None:
+    """ADR-0057: failed > timed out > stopped > ok, whichever agent it was."""
+    assert combined_exit_code((0, 0)) == 0
+    assert combined_exit_code((3, 0)) == 3
+    assert combined_exit_code((3, 2)) == 2
+    assert combined_exit_code((0, 1)) == 1
+    assert combined_exit_code((2, 1)) == 1
+    assert combined_exit_code(()) == 0

@@ -18,7 +18,13 @@ validated.
 Before the leg checks, `placements` (when wired) supplies this run's unresolved orders and
 in-flight placements for pure `domain.order_concurrency.check_concurrency` (ADR-0051): only
 buy-to-close orders on different contracts may work at the same time, funded together by the
-fresh account snapshot. Its denial reaches the agent the same way.
+fresh account snapshot. Its denial reaches the agent the same way. ADR-0057: for the Sell
+Options agent those include orders the same tick's Buy-to-Close run left unresolved.
+
+First of all, the agent role (ADR-0057) limits the sides, by pure `domain.role_gate.check_role`:
+the Sell Options agent never buys to close, and the Buy-to-Close agent sells to open only as a
+roll's replacement, on the underlying and right of a buy-to-close this run filled, for no
+more contracts than those fills less the replacements this run already placed (`run_orders`).
 """
 
 from collections.abc import Callable, Mapping
@@ -27,6 +33,8 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from wheelta_robinhood_agent.agent.facts_tool import RunEvidence
+from wheelta_robinhood_agent.domain.enums import AgentRole, OrderSide
+from wheelta_robinhood_agent.domain.options import OccSymbol
 from wheelta_robinhood_agent.domain.order_concurrency import (
     NewPlacement,
     PlacementLeg,
@@ -41,6 +49,7 @@ from wheelta_robinhood_agent.domain.pretrade import (
     pretrade_feedback,
     validate_opening_leg,
 )
+from wheelta_robinhood_agent.domain.role_gate import RoleLeg, RunFill, check_role
 
 
 def _text(value: object) -> str | None:
@@ -101,6 +110,10 @@ class PretradeGate:
     rules: PretradeRules
     clock: Callable[[], datetime]
     placements: Callable[[], PlacementState] | None = None
+    # ADR-0057: the agent placing the order, and every order this run placed (resolved or
+    # not) for the Buy-to-Close agent's roll-replacement check.
+    role: AgentRole = AgentRole.WHEEL
+    run_orders: Callable[[], tuple[OrderRecord, ...]] = lambda: ()
 
     def __call__(self, tool_input: Mapping[str, object]) -> str | None:
         """A denial reason with the failed checks and values, or None when all legs pass."""
@@ -127,6 +140,10 @@ class PretradeGate:
                 opening.append(option_id)
             closing = side.lower() == "buy" and effect.lower() == "close"
             parsed.append(PlacementLeg(option_id=option_id, closing=closing))
+        if self.role is not AgentRole.WHEEL:
+            denial = self._role(tool_input, parsed, opening)
+            if denial is not None:
+                return denial
         as_of = self.clock()
         state = self.placements() if self.placements is not None else None
         concurrent = state is not None and (
@@ -156,6 +173,42 @@ class PretradeGate:
             )
             validations.append(validate_opening_leg(leg_input, self.rules, as_of))
         return pretrade_feedback(validations)
+
+    def _role(
+        self, tool_input: Mapping[str, object], legs: list[PlacementLeg], opening: list[str]
+    ) -> str | None:
+        evidence = self.evidence() if opening else None
+
+        def occ(option_id: str | None) -> OccSymbol | None:
+            if evidence is None or option_id is None:
+                return None
+            instrument = evidence.instrument(option_id)
+            return instrument.occ_symbol if instrument is not None else None
+
+        role_legs = tuple(
+            RoleLeg(
+                option_id=leg.option_id,
+                closing=leg.closing,
+                opening=leg.option_id in opening,
+                occ_symbol=occ(leg.option_id) if leg.option_id in opening else None,
+            )
+            for leg in legs
+        )
+        fills: list[RunFill] = []
+        if self.role is AgentRole.CLOSE and opening:
+            for record in self.run_orders():
+                intent = record.intent
+                if intent is None or intent.side is None:
+                    continue
+                symbol = intent.occ_symbol or occ(intent.broker_instrument_id)
+                if intent.side is OrderSide.BUY_TO_CLOSE:
+                    quantity = record.filled_quantity or 0
+                else:
+                    quantity = intent.quantity or 0
+                fills.append(RunFill(side=intent.side, occ_symbol=symbol, quantity=quantity))
+        return check_role(
+            self.role, role_legs, quantity=_count(tool_input.get("quantity")), run=tuple(fills)
+        )
 
     def _concurrency(
         self,

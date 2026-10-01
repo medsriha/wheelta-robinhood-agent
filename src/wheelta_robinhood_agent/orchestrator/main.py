@@ -1,6 +1,18 @@
 """Run entrypoint: the full lifecycle of one cron fire (ARCHITECTURE.md "Run lifecycle").
 
-boot (settings, rules, prompt; fail fast) → effective mode off without `--run-now`: exit
+ADR-0057: a tick runs two agents in order, each its own run of the slot: the Buy-to-Close
+agent (`AgentRole.CLOSE`: close, roll, or hold existing shorts), then the Sell Options agent
+(`AgentRole.SELL`: new CSPs and CCs). The slot gate below (kill switch, NYSE session, next-run
+time) runs once, on the close run; a gate skip ends the tick. The sell run starts once the
+close run is final, whatever its status (completed, skipped, failed, timed out, or stopped),
+after re-checking the kill switch and the session. Each agent's session starts only when its
+start condition holds (`domain/start_conditions.py`, read in trusted code). One heartbeat
+and one run-summary email cover the tick; the exit code is the more severe of the two runs'.
+The close run's budget is `CLOSE_AGENT_TIMEOUT_SECONDS`; the sell run gets the rest of
+`RUN_TIMEOUT_SECONDS`. A re-fired slot only recovers interrupted runs: it never starts a
+session (CLAUDE.md §15).
+
+Per run: boot (settings, rules, prompts; fail fast) → effective mode off without `--run-now`: exit
 `skipped_dry_run_not_requested` before the ledger (ADR-0038) → logging → slot/run_id → ledger
 connection → single-flight lock (`skipped_concurrent`) → run slot (completed → no-op;
 interrupted → reconcile and finalize without a new session) → preflight (kill switch; a dry
@@ -12,7 +24,7 @@ simulated broker, with the same three option-order tools and a live-rendered pro
 direct-Robinhood dry run → no order tool) → prompt → agent session → the agent's `next_run`,
 if valid, replaces the fallback (live only; a dry run records it unapplied) →
 `assemble_run_record` → position notes (ADR-0018) → `run_audit` → persist → alerts/heartbeat
-→ run-summary email (ADR-0029: only when a session started) → exit code.
+→ run-summary email (ADR-0029: once per tick, when a session started) → exit code.
 
 Contains no trading logic. Everything the run decides is recorded as run events.
 `python -m wheelta_robinhood_agent.orchestrator [--run-now]` calls `main()`. `--run-now`
@@ -76,14 +88,15 @@ from wheelta_robinhood_agent.agent.session import (
     plan_session,
     run_session_sync,
 )
+from wheelta_robinhood_agent.agent.simulated_broker import SimulatedState
 from wheelta_robinhood_agent.agent.summary_loader import load_summary_research
 from wheelta_robinhood_agent.agent.trace_loader import load_decision_trace
 from wheelta_robinhood_agent.config.prompts import (
     PromptError,
     PromptTemplate,
     RenderedPrompt,
+    load_agent_prompts,
     load_mignon_prompts,
-    load_prompt,
     render_prompt,
 )
 from wheelta_robinhood_agent.config.rules import LoadedRules, RulesError, load_rules
@@ -99,6 +112,7 @@ from wheelta_robinhood_agent.domain.decision_output import (
     DecisionOutputParseFailure,
 )
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AppEnv,
     AuditOutcome,
     ExecutionMode,
@@ -116,6 +130,7 @@ from wheelta_robinhood_agent.domain.positions import PositionBook
 from wheelta_robinhood_agent.domain.run import AuditStatus
 from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
 from wheelta_robinhood_agent.domain.run_record import RunRecord
+from wheelta_robinhood_agent.domain.start_conditions import StartCondition, StartOutcome
 from wheelta_robinhood_agent.integrations.notifications.delivery import (
     DeliveryOutcome,
     DeliveryResult,
@@ -134,6 +149,8 @@ from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME 
 from wheelta_robinhood_agent.integrations.robinhood.server import build_robinhood_server
 from wheelta_robinhood_agent.integrations.robinhood.token_vault import TokenVault
 from wheelta_robinhood_agent.integrations.status import SourceObservation
+from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
+from wheelta_robinhood_agent.integrations.websearch.server import build_tavily_server
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.server import build_wheelta_server
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
@@ -160,6 +177,7 @@ from wheelta_robinhood_agent.observability.alerts import (
     HeartbeatPayload,
     build_alert,
     build_heartbeat,
+    heartbeat_status_for,
 )
 from wheelta_robinhood_agent.observability.decision_trace import decision_log_events
 from wheelta_robinhood_agent.observability.logging import (
@@ -170,14 +188,20 @@ from wheelta_robinhood_agent.observability.logging import (
 )
 from wheelta_robinhood_agent.observability.metrics import RunMetrics
 from wheelta_robinhood_agent.observability.redaction import Redactor
-from wheelta_robinhood_agent.observability.run_summary import RunSummaryInput
-from wheelta_robinhood_agent.orchestrator.exit_codes import EXIT_FAILED, EXIT_OK, exit_code_for
+from wheelta_robinhood_agent.observability.run_summary import RunSummaryInput, SlotSummaryInput
+from wheelta_robinhood_agent.orchestrator.exit_codes import (
+    EXIT_FAILED,
+    EXIT_OK,
+    combined_exit_code,
+    exit_code_for,
+)
 from wheelta_robinhood_agent.orchestrator.market_session import (
     TradingCalendar,
     build_nyse_calendar,
     evaluate_market_session,
 )
 from wheelta_robinhood_agent.orchestrator.preflight import (
+    PreflightProceed,
     PreflightReason,
     PreflightSkip,
     decide_preflight,
@@ -256,7 +280,7 @@ class HttpNotifier:
 class SummaryMailer(Protocol):
     """Run-summary email delivery (ADR-0029). Never raises; returns the typed result."""
 
-    def send(self, summary: RunSummaryInput, redactor: Redactor) -> EmailDeliveryResult: ...
+    def send(self, summary: SlotSummaryInput, redactor: Redactor) -> EmailDeliveryResult: ...
 
 
 @dataclass
@@ -266,7 +290,7 @@ class HttpSummaryMailer:
     config: RunSummaryEmailConfig
     _client: httpx.Client | None = None
 
-    def send(self, summary: RunSummaryInput, redactor: Redactor) -> EmailDeliveryResult:
+    def send(self, summary: SlotSummaryInput, redactor: Redactor) -> EmailDeliveryResult:
         if self._client is None:
             self._client = httpx.Client()
         return send_run_summary(summary, config=self.config, client=self._client, redactor=redactor)
@@ -315,6 +339,8 @@ class OrchestratorDeps:
     remote_boundary_accepted: bool = REMOTE_RESULT_BOUNDARY_ACCEPTED
     upstream_factory: UpstreamFactory | None = None
     registries: tuple[ToolRegistry, ToolRegistry] = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
+    # ADR-0058: Tavily web search (optional source; without a key it is disabled).
+    tavily_registry: ToolRegistry = TAVILY_REGISTRY
     mappers: Mapping[tuple[str, str], EvidenceMapper] = field(
         default_factory=lambda: VERIFIED_MAPPERS
     )
@@ -351,7 +377,7 @@ def _heartbeat(
 def run_once(
     settings: Settings,
     rules: LoadedRules,
-    template: PromptTemplate,
+    templates: Mapping[AgentRole, PromptTemplate],
     deps: OrchestratorDeps,
     mignon_templates: Mapping[MignonType, PromptTemplate] | None = None,
     *,
@@ -359,6 +385,7 @@ def run_once(
 ) -> int:
     """Run one cron fire and return the process exit code (exit_codes.py).
 
+    `templates` holds the close and sell agents' prompts (`load_agent_prompts`).
     `mignon_templates` defaults to the packaged Mignon prompts (`main` loads them at startup
     so a missing file fails before any network call). Dry runs are local and on demand
     (ADR-0038, ADR-0039): live runs only in production, on its calendar and schedule; with the
@@ -373,7 +400,7 @@ def run_once(
         mignon_templates = load_mignon_prompts()
     started = deps.clock()
     slot = slot_for(started)
-    run_id = run_id_for(settings.APP_ENV, slot)
+    run_id = run_id_for(settings.APP_ENV, slot, AgentRole.CLOSE)
     log = bind(_LOG, run_id=str(run_id), stage="boot", slot=slot.isoformat())
     if settings.effective_execution_mode is ExecutionMode.OFF:
         # ADR-0039: dry runs are local and on demand; outside local an off mode runs nothing.
@@ -400,16 +427,187 @@ def run_once(
                 settings, deps, RunStatus.SKIPPED_CONCURRENT, run_id, slot, "lock_contention"
             )
             return exit_code_for(RunStatus.SKIPPED_CONCURRENT)
-        run_slot = open_run_slot(conn, settings.APP_ENV, slot)
-        if run_slot.state is SlotState.COMPLETED:
-            log.info("slot already finalized; nothing to do", extra={"status": "noop"})
+        tick = _Tick(settings, rules, templates, deps, conn, slot, started, log)
+        tick.mignon_templates = dict(mignon_templates)
+        tick.run_now = run_now
+        return tick.run()
+
+
+# ADR-0057: a close run finalized by the slot gate ends the tick: no sell run.
+SLOT_GATE_STATUSES = frozenset(
+    {
+        RunStatus.SKIPPED_KILLED,
+        RunStatus.SKIPPED_MARKET_CLOSED,
+        RunStatus.SKIPPED_NOT_DUE,
+        RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED,
+    }
+)
+
+
+class _Tick:
+    """One cron fire: the close run, then the sell run (module docstring, ADR-0057)."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        rules: LoadedRules,
+        templates: Mapping[AgentRole, PromptTemplate],
+        deps: OrchestratorDeps,
+        conn: Conn,
+        slot: datetime,
+        started: datetime,
+        log: RunLoggerAdapter,
+    ) -> None:
+        self.settings = settings
+        self.rules = rules
+        self.templates = templates
+        self.deps = deps
+        self.conn = conn
+        self.slot = slot
+        self.started = started
+        self.log = log
+        self.mignon_templates: dict[MignonType, PromptTemplate] = {}
+        self.run_now = False
+        # ADR-0057: a dry-run tick's simulated broker state, shared by both runs.
+        self.simulated = SimulatedState()
+        # ADR-0021: resolved (and refreshed, at most once) by the tick's first run.
+        self.credential: list[CredentialResolution] = []
+        self.tick_alerts: set[AlertKind] = set()
+        self.runs: list[_Run] = []
+
+    def _new_run(self, role: AgentRole, run_id: uuid.UUID) -> "_Run":
+        budget = (
+            self.settings.CLOSE_AGENT_TIMEOUT_SECONDS
+            if role is AgentRole.CLOSE
+            else self.settings.RUN_TIMEOUT_SECONDS
+        )
+        run = _Run(
+            self.settings,
+            self.rules,
+            self.templates[role],
+            self.deps,
+            self.conn,
+            run_id,
+            self.slot,
+            self.started,
+            bind(_LOG, run_id=str(run_id), stage="boot", slot=self.slot.isoformat()),
+            role=role,
+            budget_seconds=budget,
+        )
+        run.mignon_templates = dict(self.mignon_templates)
+        run.run_now = self.run_now
+        run.simulated_state = self.simulated
+        run.tick_credential = self.credential
+        run.tick_alerts = self.tick_alerts
+        run.order_scope_run_id = run_id_for(self.settings.APP_ENV, self.slot, AgentRole.CLOSE)
+        self.runs.append(run)
+        return run
+
+    def run(self) -> int:
+        env = self.settings.APP_ENV
+        close_slot = open_run_slot(self.conn, env, self.slot, AgentRole.CLOSE)
+        if close_slot.state is not SlotState.NEW:
+            return self._refire(close_slot.state)
+        close = self._new_run(AgentRole.CLOSE, close_slot.run_id)
+        close.execute()
+        if close.final_status in SLOT_GATE_STATUSES or not close.gate_passed:
+            return self._finish_tick()
+        # Built before the sell row exists: nothing may fail between creating it and starting.
+        outcome = close.outcome_json()
+        sell_slot = open_run_slot(self.conn, env, self.slot, AgentRole.SELL)
+        if sell_slot.state is not SlotState.NEW:
+            # Only a racing process could have opened it; the lock forbids that.
+            raise LedgerError("the sell run of a new tick already exists")
+        sell = self._new_run(AgentRole.SELL, sell_slot.run_id)
+        sell.gate_at = close.gate_at
+        sell.related_run_ids = (close.run_id,)
+        sell.close_agent_outcome = outcome
+        sell.execute()
+        return self._finish_tick()
+
+    def _refire(self, close_state: SlotState) -> int:
+        """A slot that already has a close run: recover interrupted runs, start no session."""
+        env = self.settings.APP_ENV
+        if close_state is SlotState.INTERRUPTED:
+            self._new_run(AgentRole.CLOSE, run_id_for(env, self.slot, AgentRole.CLOSE)).recover()
+        sell_id = run_id_for(env, self.slot, AgentRole.SELL)
+        exists = self.conn.execute("SELECT 1 FROM runs WHERE run_id = %s", (sell_id,)).fetchone()
+        if exists is not None:
+            sell_slot = open_run_slot(self.conn, env, self.slot, AgentRole.SELL)
+            if sell_slot.state is SlotState.INTERRUPTED:
+                self._new_run(AgentRole.SELL, sell_slot.run_id).recover()
+        if not self.runs:
+            self.log.info("slot already finalized; nothing to do", extra={"status": "noop"})
             return EXIT_OK
-        run = _Run(settings, rules, template, deps, conn, run_id, slot, started, log)
-        run.mignon_templates = dict(mignon_templates)
-        run.run_now = run_now
-        if run_slot.state is SlotState.INTERRUPTED:
-            return run.recover()
-        return run.execute()
+        return self._finish_tick()
+
+    def _finish_tick(self) -> int:
+        """One heartbeat and one summary email for the tick (ADR-0057); the exit code is the
+        most severe of its runs'."""
+        finished = [r for r in self.runs if r.final_status is not None]
+        if not finished:
+            return EXIT_OK
+        failing = [
+            r
+            for r in finished
+            if r.final_status is not None
+            and heartbeat_status_for(r.final_status)
+            is not heartbeat_status_for(RunStatus.COMPLETED)
+        ]
+        lead = failing[0] if failing else finished[-1]
+        reason = "; ".join(
+            f"{r.role.value}={r.final_status.value}"
+            + (f" ({r.final_reason})" if r.final_reason else "")
+            for r in finished
+            if r.final_status is not None
+        )
+        if lead.final_status is not None:
+            _heartbeat(self.settings, self.deps, lead.final_status, lead.run_id, self.slot, reason)
+        if any(r.session_started for r in finished):
+            self._send_summary(finished)
+        return combined_exit_code(
+            tuple(exit_code_for(r.final_status) for r in finished if r.final_status)
+        )
+
+    def _next_run(self, runs: Sequence["_Run"]) -> NextRun | None:
+        """The tick's effective next run: the earliest agent request, else the fallback."""
+        chosen = [
+            r.next_run for r in runs if r.next_run and r.next_run.source is ScheduleSource.AGENT
+        ]
+        if chosen:
+            return min(chosen, key=lambda n: n.not_before)
+        fallback = [r.next_run for r in runs if r.next_run is not None]
+        return fallback[0] if fallback else None
+
+    def _send_summary(self, runs: Sequence["_Run"]) -> None:
+        """ADR-0029, ADR-0057: email the tick summary. Informational: never changes a status
+        or the exit code."""
+        mailer = self.deps.summary_mailer
+        if mailer is None:
+            return
+        lead = runs[0]
+        try:
+            next_run = self._next_run(runs)
+            summary = SlotSummaryInput(
+                environment=self.settings.APP_ENV,
+                slot=self.slot,
+                agents=tuple(r.summary_input() for r in runs),
+                next_run_at=next_run.not_before if next_run else None,
+                next_run_source=next_run.source.value if next_run else None,
+            )
+            result = mailer.send(summary, lead.redactor)
+        except Exception as exc:  # noqa: BLE001 - informational email: never fail the run
+            self.log.warning("run summary email failed", extra={"error_type": type(exc).__name__})
+            return
+        self.log.bind(stage="summary_email").info(
+            "run summary email",
+            extra={"delivery_status": result.status.value, "error": result.error},
+        )
+        if result.status is EmailDeliveryStatus.SKIPPED:
+            return
+        for run in runs:
+            if run.session_started:
+                run.record_summary_email(result, self.slot)
 
 
 class _Run:
@@ -426,10 +624,15 @@ class _Run:
         slot: datetime,
         started: datetime,
         log: RunLoggerAdapter,
+        *,
+        role: AgentRole,
+        budget_seconds: int,
     ) -> None:
         self.settings = settings
         self.rules = rules
         self.template = template
+        # ADR-0057: which agent this run is.
+        self.role = role
         # ADR-0025: set by run_once; rendered per run in _render when Mignons are allowed.
         self.mignon_templates: dict[MignonType, PromptTemplate] = {}
         self.mignon_prompts: dict[MignonType, RenderedPrompt] = {}
@@ -448,7 +651,8 @@ class _Run:
         self.scope_id = account_scope_id(settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER)
         # ADR-0038: where order tools go; the plan decides it (`_plan`), recovery reads it back.
         self.order_venue = order_venue(settings.effective_execution_mode, robinhood_proxied=False)
-        self.deadline = RunDeadline(started, settings.RUN_TIMEOUT_SECONDS)
+        # ADR-0057: measured from the tick's start, so the sell run gets what is left.
+        self.deadline = RunDeadline(started, budget_seconds)
         self._event_counter = 0
         self.alerts_sent: list[AlertKind] = []
         # ADR-0028: a hand-started local run (`--run-now`); set by run_once.
@@ -465,6 +669,24 @@ class _Run:
         self.audit_ran = False
         self.next_run: NextRun | None = None
         self.next_run_rationale: str | None = None
+        # ADR-0057: set by finalize; read by the tick for the heartbeat, email, and exit code.
+        self.final_status: RunStatus | None = None
+        self.final_reason: str | None = None
+        # The slot gate passed (close) or was re-checked and passed (sell).
+        self.gate_passed = False
+        self.start_condition: StartCondition | None = None
+        # Set by the tick: the close run of the same tick (sell only), the tick's order scope
+        # run, the shared simulated state, and the close run's outcome for the sell prompt.
+        self.related_run_ids: tuple[uuid.UUID, ...] = ()
+        self.order_scope_run_id: uuid.UUID | None = None
+        self.simulated_state: SimulatedState | None = None
+        self.close_agent_outcome: str | None = None
+        # ADR-0057, ADR-0021: the tick's one credential resolution, shared by both runs; a
+        # refresh is never attempted twice in a tick (a second try would be a retry).
+        self.tick_credential: list[CredentialResolution] = []
+        self.credential_reused = False
+        # Kinds already alerted by a run of this tick (`tick_alert`); shared by the tick.
+        self.tick_alerts: set[AlertKind] = set()
 
     # -- ledger helpers -------------------------------------------------------------------
 
@@ -514,6 +736,16 @@ class _Run:
                 attempted_at=self.deps.clock(),
             )
 
+    def tick_alert(
+        self, kind: AlertKind, message: str, details: Mapping[str, object] | None = None
+    ) -> None:
+        """An alert about a cause both runs of a tick share (the Robinhood credential): sent
+        by the first run that meets it only (ADR-0057)."""
+        if kind in self.tick_alerts:
+            return
+        self.tick_alerts.add(kind)
+        self.alert(kind, message, details)
+
     def observe_sources(self, observations: Sequence[SourceObservation]) -> None:
         for obs in observations:
             self.event(RunEventType.SOURCE_STATUS, obs.model_dump(mode="json"))
@@ -525,82 +757,94 @@ class _Run:
                 self.redactor.redact_text(detail) for detail in self.summary_diagnostics
             ]
         self.event(RunEventType.STATUS, payload or None, status=status)
-        _heartbeat(self.settings, self.deps, status, self.run_id, self.slot, reason)
-        if self.session_started:
-            self.send_summary(status, reason)
+        # ADR-0057: the tick sends one heartbeat and one email for both runs.
+        self.final_status, self.final_reason = status, reason
         snapshot = self.metrics.snapshot().model_dump(mode="json")
         self.log.bind(stage="finalize").info(
-            "run finished", extra={"status": status.value, "reason": reason, "metrics": snapshot}
+            "run finished",
+            extra={
+                "agent": self.role.value,
+                "status": status.value,
+                "reason": reason,
+                "metrics": snapshot,
+            },
         )
         return exit_code_for(status)
 
-    def send_summary(self, status: RunStatus, reason: str | None) -> None:
-        """ADR-0029: email the run summary. Informational: never changes status or exit code."""
-        mailer = self.deps.summary_mailer
-        if mailer is None:
-            return
-        try:
-            audit = self.audit_result
-            research_unavailable = None
-            try:
-                candidates, reports = load_summary_research(self.conn, self.run_id)
-            except Exception as exc:  # noqa: BLE001 - preserve the email if context loading fails
-                candidates, reports = (), ()
-                research_unavailable = type(exc).__name__
-            audit_details = (
-                tuple(
-                    f"{f.check_id.value} {f.outcome.value}: {f.detail}"
-                    for f in audit.findings
-                    if f.outcome is not AuditOutcome.PASS
-                )
-                + tuple(f"{e.check_id.value}: {e.error_type}: {e.message}" for e in audit.errors)
-                if audit is not None
-                else ()
-            )
-            summary = RunSummaryInput(
+    def summary_input(self) -> RunSummaryInput:
+        """This run's section of the tick's summary email (ADR-0029, ADR-0057)."""
+        if self.final_status is None:
+            raise SessionPlanError("a run summary is built only after the run is final")
+        if not self.session_started:
+            return RunSummaryInput(
                 run_id=str(self.run_id),
                 environment=self.settings.APP_ENV,
                 slot=self.slot,
-                status=status,
-                reason=reason,
+                status=self.final_status,
+                reason=self.final_reason,
+                agent=self.role,
+                session_started=False,
                 requested_execution_mode=self.settings.requested_execution_mode,
                 effective_execution_mode=self.settings.effective_execution_mode,
                 order_venue=self.order_venue,
-                record=self.summary_record,
-                candidates=candidates,
-                research_reports=reports,
-                research_unavailable=research_unavailable,
+                record=None,
                 diagnostic_details=tuple(self.summary_diagnostics),
-                audit_details=audit_details,
-                audit_status=(
-                    (audit.status.value if audit is not None else AuditStatus.FAILED.value)
-                    if self.audit_ran
-                    else None
-                ),
-                audit_violations=len(audit.violations) if audit is not None else 0,
-                audit_unverifiable=len(audit.unverifiable_checks) if audit is not None else 0,
                 alerts=tuple(k.value for k in self.alerts_sent),
-                next_run_at=self.next_run.not_before if self.next_run else None,
-                next_run_source=self.next_run.source.value if self.next_run else None,
-                next_run_rationale=self.next_run_rationale,
             )
-            result = mailer.send(summary, self.redactor)
-        except Exception as exc:  # noqa: BLE001 - informational email: never fail the run
-            self.log.warning("run summary email failed", extra={"error_type": type(exc).__name__})
-            return
-        log = self.log.bind(stage="summary_email")
-        log.info(
-            "run summary email",
-            extra={"delivery_status": result.status.value, "error": result.error},
+        audit = self.audit_result
+        research_unavailable = None
+        try:
+            candidates, reports = load_summary_research(self.conn, self.run_id)
+        except Exception as exc:  # noqa: BLE001 - preserve the email if context loading fails
+            candidates, reports = (), ()
+            research_unavailable = type(exc).__name__
+        audit_details = (
+            tuple(
+                f"{f.check_id.value} {f.outcome.value}: {f.detail}"
+                for f in audit.findings
+                if f.outcome is not AuditOutcome.PASS
+            )
+            + tuple(f"{e.check_id.value}: {e.error_type}: {e.message}" for e in audit.errors)
+            if audit is not None
+            else ()
         )
-        if result.status is EmailDeliveryStatus.SKIPPED:
-            return
+        return RunSummaryInput(
+            run_id=str(self.run_id),
+            environment=self.settings.APP_ENV,
+            slot=self.slot,
+            status=self.final_status,
+            reason=self.final_reason,
+            agent=self.role,
+            requested_execution_mode=self.settings.requested_execution_mode,
+            effective_execution_mode=self.settings.effective_execution_mode,
+            order_venue=self.order_venue,
+            record=self.summary_record,
+            candidates=candidates,
+            research_reports=reports,
+            research_unavailable=research_unavailable,
+            diagnostic_details=tuple(self.summary_diagnostics),
+            audit_details=audit_details,
+            audit_status=(
+                (audit.status.value if audit is not None else AuditStatus.FAILED.value)
+                if self.audit_ran
+                else None
+            ),
+            audit_violations=len(audit.violations) if audit is not None else 0,
+            audit_unverifiable=len(audit.unverifiable_checks) if audit is not None else 0,
+            alerts=tuple(k.value for k in self.alerts_sent),
+            next_run_at=self.next_run.not_before if self.next_run else None,
+            next_run_source=self.next_run.source.value if self.next_run else None,
+            next_run_rationale=self.next_run_rationale,
+        )
+
+    def record_summary_email(self, result: EmailDeliveryResult, slot: datetime) -> None:
+        """Record the tick's email delivery on this run (alerts_sent, ADR-0029)."""
         with contextlib.suppress(Exception):
             ledger_evidence.record_alert_sent(
                 self.conn,
                 run_id=self.run_id,
                 alert_kind=RUN_SUMMARY_EMAIL_KIND,
-                dedup_key=f"run-summary/{self.run_id}",
+                dedup_key=f"run-summary/{slot.isoformat()}",
                 payload={
                     "subject": result.subject,
                     "provider_message_id": result.provider_message_id,
@@ -615,6 +859,50 @@ class _Run:
                 attempted_at=self.deps.clock(),
             )
 
+    def outcome_json(self) -> str:
+        """ADR-0057: this (close) run's outcome for the sell prompt, from the ledger: status,
+        reason, start condition, and the orders it placed with their recorded state. Context
+        only: if the orders cannot be read, they are reported as unavailable (never as none),
+        so the sell run still starts."""
+        orders: list[dict[str, object]] | str = []
+        try:
+            orders = self._outcome_orders()
+        except Exception as exc:  # noqa: BLE001 - context for the next agent; never blocks it
+            self.log.warning(
+                "close-run orders unavailable for the sell prompt",
+                extra={"error_type": type(exc).__name__},
+            )
+            orders = f"unavailable ({type(exc).__name__}); read orders and positions yourself"
+        outcome = {
+            "status": self.final_status.value if self.final_status else None,
+            "reason": self.final_reason,
+            "start_condition": self.start_condition.model_dump(mode="json")
+            if self.start_condition
+            else None,
+            "orders": orders,
+        }
+        return json.dumps(outcome, sort_keys=True)
+
+    def _outcome_orders(self) -> list[dict[str, object]]:
+        orders: list[dict[str, object]] = []
+        for record in ledger_orders.run_order_records(self.conn, self.run_id):
+            intent = record.intent
+            orders.append(
+                {
+                    "occ_symbol": str(intent.occ_symbol)
+                    if intent is not None and intent.occ_symbol is not None
+                    else None,
+                    "side": intent.side_raw if intent is not None else None,
+                    "quantity": intent.quantity if intent is not None else None,
+                    "limit_price": str(intent.limit_price)
+                    if intent is not None and intent.limit_price is not None
+                    else None,
+                    "status": record.status.value,
+                    "filled_quantity": record.filled_quantity,
+                }
+            )
+        return orders
+
     def meta(self, *, prompt: RenderedPrompt | None, model_id: str | None) -> RunMeta:
         return RunMeta(
             run_id=self.run_id,
@@ -628,6 +916,7 @@ class _Run:
             prompt_id=self.template.prompt_id if prompt else None,
             prompt_hash=self.template.sha256 if prompt else None,
             model_id=model_id,
+            role=self.role,
         )
 
     # -- lifecycle ------------------------------------------------------------------------
@@ -637,6 +926,7 @@ class _Run:
         self.event(
             RunEventType.STARTED,
             {
+                "agent": self.role.value,
                 "config_snapshot": settings.config_snapshot(),
                 "rules_version": self.rules.version,
                 "rules_hash": self.rules.sha256,
@@ -679,19 +969,28 @@ class _Run:
                 },
             },
         )
-        not_before = latest_next_run_not_before(self.conn, settings.APP_ENV)
         # ADR-0038: a dry run is on demand only and never reads or writes the live schedule.
         dry_run = settings.effective_execution_mode is ExecutionMode.OFF
-        due = is_due(now, not_before)
+        if self.role is AgentRole.SELL:
+            # ADR-0057: the close run passed the schedule gate for the tick; its own next run,
+            # recorded since, must not make the sell run "not due".
+            not_before, due = None, True
+            schedule_check: dict[str, object] = {
+                "due": True,
+                "carried_from": [str(r) for r in self.related_run_ids],
+                "run_now": self.run_now,
+            }
+        else:
+            not_before = latest_next_run_not_before(self.conn, settings.APP_ENV)
+            due = is_due(now, not_before)
+            schedule_check = {
+                "not_before": not_before.isoformat() if not_before else None,
+                "due": due,
+                "run_now": self.run_now,
+            }
         self.event(
             RunEventType.METADATA,
-            {
-                "schedule_check": {
-                    "not_before": not_before.isoformat() if not_before else None,
-                    "due": due,
-                    "run_now": self.run_now,
-                }
-            },
+            {"schedule_check": schedule_check},
             key="metadata:schedule_check",
         )
         decision = decide_preflight(
@@ -704,7 +1003,8 @@ class _Run:
             on_demand=self.run_now,
         )
         if (
-            not dry_run
+            self.role is not AgentRole.SELL
+            and not dry_run
             and due
             and not (
                 isinstance(decision, PreflightSkip)
@@ -717,9 +1017,22 @@ class _Run:
             minutes = self.rules.rules.scheduling.fallback_next_run_minutes
             self.record_next_run(fallback_requested_at(now, minutes), ScheduleSource.FALLBACK)
         if isinstance(decision, PreflightSkip):
-            if decision.status is RunStatus.SKIPPED_KILLED and (due or dry_run):
+            if (
+                decision.status is RunStatus.SKIPPED_KILLED
+                and (due or dry_run)
+                and self.role is not AgentRole.SELL
+            ):
                 self.alert(AlertKind.KILL_SWITCH_ENGAGED, "KILL_SWITCH=true; the run did not start")
             return self.finalize(decision.status, decision.reason.value)
+        self.gate_passed = isinstance(decision, PreflightProceed)
+        if self._session_budget() <= ORDER_WIND_DOWN_SECONDS:
+            # ADR-0057: what is left of the tick budget (the sell run after a long close run)
+            # cannot hold a session outside the wind-down, so none is started.
+            self.alert(
+                AlertKind.RUN_TIMEOUT,
+                f"the {self.role.value} agent's run budget was used up before its session",
+            )
+            return self.finalize(RunStatus.TIMED_OUT, "no_budget_left")
         restore = (
             install_stop_signal_handlers(self.control, self.deps.clock)
             if (self.deps.install_signals)
@@ -785,28 +1098,36 @@ class _Run:
     def _robinhood_credential(self) -> CredentialResolution | None:
         """ADR-0021: in refresh_token mode, the access token for this run (refreshed and
         persisted first if near expiry). None in the other modes. Recorded without secrets;
-        every token seen is added to the run's redactor."""
+        every token seen is added to the run's redactor. ADR-0057: resolved once per tick; the
+        second run reuses the first's resolution, success or failure, so a refresh is never
+        retried."""
         settings = self.settings
         if settings.ROBINHOOD_MCP_AUTH is not RobinhoodMcpAuth.REFRESH_TOKEN:
             return None
         key = settings.ROBINHOOD_TOKEN_ENCRYPTION_KEY
         if key is None:  # Settings rejects this; kept so the type is narrowed without assert
             raise SessionPlanError("refresh_token mode without an encryption key")
-        resolution = resolve_robinhood_credential(
-            self.conn,
-            environment=settings.APP_ENV,
-            vault=TokenVault(key),
-            clock=self.deps.clock,
-            refresher=self.deps.oauth_refresher,
-            insert=self.deps.insert_credential,
-        )
+        reused = bool(self.tick_credential)
+        self.credential_reused = reused
+        if reused:
+            resolution = self.tick_credential[0]
+        else:
+            resolution = resolve_robinhood_credential(
+                self.conn,
+                environment=settings.APP_ENV,
+                vault=TokenVault(key),
+                clock=self.deps.clock,
+                refresher=self.deps.oauth_refresher,
+                insert=self.deps.insert_credential,
+            )
+            self.tick_credential.append(resolution)
         self.redactor = Redactor(
             account_number=settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER,
             secrets=(*settings_secrets(settings), *resolution.secrets),
         )
         self.event(
             RunEventType.METADATA,
-            {"robinhood_credential": resolution.event_payload()},
+            {"robinhood_credential": {**resolution.event_payload(), "reused_in_tick": reused}},
             key="metadata:robinhood_credential",
         )
         log = self.log.bind(stage="robinhood_auth")
@@ -831,6 +1152,7 @@ class _Run:
                     required=True,
                 ),
                 RemoteSource(wt_registry, build_wheelta_server(self.settings)),
+                RemoteSource(self.deps.tavily_registry, build_tavily_server(self.settings, now)),
             ),
             observed_at=now,
             remote_boundary_accepted=(
@@ -877,11 +1199,15 @@ class _Run:
             "owned_orders": json.dumps([r.model_dump(mode="json") for r in owned], sort_keys=True),
             "recent_decisions": "[]",
         }
+        if self.role is AgentRole.SELL:
+            # ADR-0057: what the Buy-to-Close agent did this tick (context, from the ledger).
+            values["close_agent_outcome"] = self.close_agent_outcome or "null"
         rendered = render_prompt(self.template, values)
         self.mignon_prompts = self._render_mignons(plan, now)
         self.event(
             RunEventType.METADATA,
             {
+                "agent": self.role.value,
                 "prompt_id": rendered.prompt_id,
                 "prompt_version": rendered.version,
                 "prompt_template_hash": rendered.template_sha256,
@@ -935,7 +1261,7 @@ class _Run:
         unavailable_reason: str | None = None
         if credential is not None and credential.status is CredentialStatus.PERSIST_FAILED:
             unavailable_reason = "robinhood_credential_unsaved"
-            self.alert(
+            self.tick_alert(
                 AlertKind.ROBINHOOD_CREDENTIAL_UNSAVED,
                 credential.operator_message or "rotated Robinhood credential not saved",
                 {"credential": credential.event_payload()},
@@ -948,7 +1274,7 @@ class _Run:
                     if credential is not None and credential.operator_message
                     else "Robinhood needs authentication; no trading session was started"
                 )
-                self.alert(
+                self.tick_alert(
                     AlertKind.ROBINHOOD_NEEDS_AUTH,
                     message,
                     {"credential": credential.event_payload()} if credential else None,
@@ -1003,6 +1329,10 @@ class _Run:
             interrupt_grace_seconds=self.deps.interrupt_grace_seconds or INTERRUPT_GRACE_SECONDS,
             status_poll_interval=self.deps.status_poll_interval or STATUS_POLL_INTERVAL_SECONDS,
             reference_check=reference_check,
+            role=self.role,
+            related_run_ids=self.related_run_ids,
+            order_scope_run_id=self.order_scope_run_id,
+            simulated_state=self.simulated_state,
         )
         self.metrics.stage_started("agent", self.deps.clock())
         try:
@@ -1019,9 +1349,42 @@ class _Run:
         session: SessionResult | None,
         unavailable_reason: str | None = None,
     ) -> int:
-        self.session_started = session is not None and session.status is not (
-            SessionStatus.NOT_STARTED
+        self.session_started = session is not None and session.status not in (
+            SessionStatus.NOT_STARTED,
+            SessionStatus.SKIPPED,
         )
+        if session is not None and session.start_condition is not None:
+            self.start_condition = session.start_condition
+            self.event(
+                RunEventType.METADATA,
+                {"start_condition": session.start_condition.model_dump(mode="json")},
+                key="metadata:start_condition",
+            )
+            self.log.bind(stage="start_condition").info(
+                "start condition", extra=session.start_condition.model_dump(mode="json")
+            )
+            if session.status is SessionStatus.SKIPPED:
+                # ADR-0057: nothing for this agent to do; no session, assembly, or audit.
+                self.observe_sources(session.observations[len(plan.observations) :])
+                if session.eligibility is not None:
+                    self.event(
+                        RunEventType.METADATA,
+                        {"agentic_eligibility": session.eligibility.model_dump(mode="json")},
+                    )
+                return self.finalize(
+                    self._skip_status(), self._skip_reason(session.start_condition)
+                )
+            if session.start_condition.outcome is StartOutcome.UNAVAILABLE:
+                unavailable_reason = unavailable_reason or "start_condition_unavailable"
+                self.summary_diagnostics.append(
+                    f"Start condition unavailable: {session.start_condition.reason}"
+                )
+                self.alert(
+                    AlertKind.START_CONDITION_UNAVAILABLE,
+                    f"the {self.role.value} agent's start condition could not be read; "
+                    "no session was started",
+                    {"reason": session.start_condition.reason},
+                )
         if session is not None:
             self.summary_diagnostics.extend(session.error_details)
             self.summary_diagnostics.extend(
@@ -1079,7 +1442,7 @@ class _Run:
                 o.server == ROBINHOOD and o.status is SourceStatus.NEEDS_AUTH
                 for o in session.observations[len(plan.observations) :]
             ):
-                self.alert(AlertKind.ROBINHOOD_NEEDS_AUTH, "Robinhood reported needs-auth")
+                self.tick_alert(AlertKind.ROBINHOOD_NEEDS_AUTH, "Robinhood reported needs-auth")
         stop = self.control.stop_record
         if stop is not None:
             self.event(
@@ -1108,6 +1471,17 @@ class _Run:
         if not audit_ok and status is RunStatus.COMPLETED:
             status, reason = RunStatus.FAILED, "audit_failed"
         return self.finalize(status, reason)
+
+    def _skip_status(self) -> RunStatus:
+        return (
+            RunStatus.SKIPPED_NO_OPEN_SHORTS
+            if self.role is AgentRole.CLOSE
+            else RunStatus.SKIPPED_INSUFFICIENT_BALANCE
+        )
+
+    @staticmethod
+    def _skip_reason(condition: StartCondition) -> str:
+        return condition.reason
 
     def _log_decisions(self) -> None:
         """One structured log line per decision from the recorded trace (observability only:
@@ -1318,7 +1692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         settings = load_settings()
         rules = load_rules()
-        template = load_prompt()
+        templates = load_agent_prompts()
         mignon_templates = load_mignon_prompts()
     except (SettingsError, RulesError, PromptError) as exc:
         logging.basicConfig(level=logging.ERROR, stream=sys.stderr)
@@ -1339,7 +1713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run_once(
             settings,
             rules,
-            template,
+            templates,
             OrchestratorDeps(notifier=notifier, summary_mailer=mailer),
             mignon_templates,
             run_now=run_now,

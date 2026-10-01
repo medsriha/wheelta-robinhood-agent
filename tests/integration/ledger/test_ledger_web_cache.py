@@ -29,10 +29,18 @@ def _call(conn: Conn, run_id: uuid.UUID, sdk_id: str, tool: WebTool) -> uuid.UUI
     ).tool_call_id  # fmt: skip
 
 
-def _search(conn: Conn, run_id: uuid.UUID, sdk_id: str, query: str, at: datetime) -> uuid.UUID:
-    call = _call(conn, run_id, sdk_id, WebTool.WEB_SEARCH)
-    record_web_result(conn, run_id=run_id, tool_call_id=call, tool=WebTool.WEB_SEARCH,
-                      tool_input=query, result={"links": [query]}, retrieved_at=at)  # fmt: skip
+def _search(
+    conn: Conn,
+    run_id: uuid.UUID,
+    sdk_id: str,
+    query: str,
+    at: datetime,
+    tool: WebTool = WebTool.TAVILY_SEARCH,
+    options: dict[str, object] | None = None,
+) -> uuid.UUID:
+    call = _call(conn, run_id, sdk_id, tool)
+    record_web_result(conn, run_id=run_id, tool_call_id=call, tool=tool, tool_input=query,
+                      result={"links": [query]}, retrieved_at=at, options=options)  # fmt: skip
     return call
 
 
@@ -42,8 +50,8 @@ def run_id(conn: Conn) -> uuid.UUID:
 
 
 def test_record_is_idempotent_and_append_only(conn: Conn, run_id: uuid.UUID) -> None:
-    call = _call(conn, run_id, "toolu_1", WebTool.WEB_SEARCH)
-    kwargs = dict(run_id=run_id, tool_call_id=call, tool=WebTool.WEB_SEARCH,
+    call = _call(conn, run_id, "toolu_1", WebTool.TAVILY_SEARCH)
+    kwargs = dict(run_id=run_id, tool_call_id=call, tool=WebTool.TAVILY_SEARCH,
                   tool_input="AAPL earnings", result={"a": 1}, retrieved_at=T0)  # fmt: skip
     first = record_web_result(conn, **kwargs)  # type: ignore[arg-type]
     again = record_web_result(conn, **kwargs)  # type: ignore[arg-type]
@@ -60,14 +68,14 @@ def test_record_is_idempotent_and_append_only(conn: Conn, run_id: uuid.UUID) -> 
 
 def test_fresh_entry_for_key_respects_ttl_and_normalization(conn: Conn, run_id: uuid.UUID) -> None:
     _search(conn, run_id, "toolu_1", "AAPL  Earnings", T0)
-    hit = fresh_entry_for_key(conn, tool=WebTool.WEB_SEARCH, tool_input="aapl earnings",
+    hit = fresh_entry_for_key(conn, tool=WebTool.TAVILY_SEARCH, tool_input="aapl earnings",
                               now=T0 + timedelta(seconds=TTL), max_age_seconds=TTL)  # fmt: skip
     assert hit is not None
     late = T0 + timedelta(seconds=TTL + 1)
-    stale = fresh_entry_for_key(conn, tool=WebTool.WEB_SEARCH, tool_input="aapl earnings",
+    stale = fresh_entry_for_key(conn, tool=WebTool.TAVILY_SEARCH, tool_input="aapl earnings",
                                 now=late, max_age_seconds=TTL)  # fmt: skip
     assert stale is None
-    future = fresh_entry_for_key(conn, tool=WebTool.WEB_SEARCH, tool_input="aapl earnings",
+    future = fresh_entry_for_key(conn, tool=WebTool.TAVILY_SEARCH, tool_input="aapl earnings",
                                  now=T0 - timedelta(seconds=1), max_age_seconds=TTL)  # fmt: skip
     assert future is None
 
@@ -98,6 +106,10 @@ def test_fresh_entries_for_ticker(conn: Conn, run_id: uuid.UUID) -> None:
                                        limit=5)  # fmt: skip
     assert [e.query_raw for e in entries] == ["(AAPL) guidance", "AAPL earnings date"]
     assert all("AAPL" in e.tickers for e in entries)
+    # Pre-ADR-0058 WebSearch rows have another result shape and are not returned.
+    _search(conn, run_id, "t6", "AAPL builtin", T0, tool=WebTool.WEB_SEARCH)
+    again = fresh_entries_for_ticker(conn, ticker="AAPL", now=now, max_age_seconds=TTL, limit=5)
+    assert [e.query_raw for e in again] == ["(AAPL) guidance", "AAPL earnings date"]
     tags = conn.execute(
         "SELECT ticker FROM web_cache_entry_tickers t JOIN web_cache_entries e "
         "USING (entry_id) WHERE e.query_raw = 'AAPLX fund news'"
@@ -109,6 +121,21 @@ def test_fresh_entries_for_ticker(conn: Conn, run_id: uuid.UUID) -> None:
         fresh_entries_for_ticker(conn, ticker="aapl", now=now, max_age_seconds=TTL, limit=5)
     with pytest.raises(ValueError):
         fresh_entries_for_ticker(conn, ticker="AAPL", now=now, max_age_seconds=TTL, limit=0)
+
+
+def test_tavily_search_key_includes_its_arguments(conn: Conn, run_id: uuid.UUID) -> None:
+    """ADR-0058 (migration 0007): a search narrowed differently is another entry."""
+    week = {"max_results": 5, "time_range": "week"}
+    _search(conn, run_id, "toolu_1", "AAPL  Earnings", T0, options=week)
+    hit = fresh_entry_for_key(conn, tool=WebTool.TAVILY_SEARCH, tool_input="aapl earnings",
+                              now=T0, max_age_seconds=TTL, options=week)  # fmt: skip
+    assert hit is not None and hit.tool is WebTool.TAVILY_SEARCH and hit.tickers == ("AAPL",)
+    day = {"max_results": 5, "time_range": "day"}
+    assert fresh_entry_for_key(conn, tool=WebTool.TAVILY_SEARCH, tool_input="aapl earnings",
+                               now=T0, max_age_seconds=TTL, options=day) is None  # fmt: skip
+    builtin = fresh_entry_for_key(conn, tool=WebTool.WEB_SEARCH, tool_input="aapl earnings",
+                                  now=T0, max_age_seconds=TTL, options=week)  # fmt: skip
+    assert builtin is None
 
 
 def test_tier_unused_marker() -> None:

@@ -5,9 +5,12 @@ docs/DATA_QUALITY.md "Delivery and failure contract"; CLAUDE.md §2.3-2.4, §8, 
 
 - **Local tools** (`wra_local`): our own code produced the JSON text, so it is parsed and
   delivered as `validated` data. Unparseable output becomes an `error` envelope.
-- **Built-ins** (WebSearch/WebFetch): the redacted payload is recorded as `validated` data.
-  The hook records but cannot replace built-in output (hooks.py), so web content stays
-  labeled untrusted by the prompt and source tiers (CLAUDE.md §11).
+- **Built-ins**: the redacted payload is recorded as `validated` data (no built-in web tool
+  is enabled since ADR-0058; `Agent` hand-backs are validated in hooks.py).
+- **Tavily** (ADR-0058, `integrations/websearch/results.py`): only a search/extract payload
+  is delivered, normalized and labelled untrusted web content, with no evidence ref. Anything
+  else (a cap notice, a changed shape) is `missing` with a fixed gap, and a tool error never
+  carries Tavily's own text: web-facing text is untrusted (CLAUDE.md §11, §24).
 - **Remote MCP tools** (Robinhood, Wheelta): a result is `validated` only if a verified
   `EvidenceMapper` exists for that exact (server, tool). The mapper normalizes the payload
   into typed evidence (`MappedEvidence`) with code-issued evidence IDs and candidate refs.
@@ -76,6 +79,13 @@ from wheelta_robinhood_agent.domain.facts_compute import BoardScreen
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     SERVER_NAME as ROBINHOOD_SERVER,
 )
+from wheelta_robinhood_agent.integrations.websearch.registry import (
+    SERVER_NAME as TAVILY_SERVER,
+)
+from wheelta_robinhood_agent.integrations.websearch.results import (
+    TavilyResultError,
+    normalize_result,
+)
 from wheelta_robinhood_agent.integrations.wheelta.registry import (
     SERVER_NAME as WHEELTA_SERVER,
 )
@@ -111,6 +121,10 @@ CONTEXT_ONLY_TOOLS: Final = frozenset(
     }
 )
 CONTEXT_ONLY_GAP: Final = "context only: no verified result mapping; not evidence"
+TAVILY_ERROR_GAP: Final = (
+    "the web tool returned an error (its text is not delivered); try other arguments or "
+    "another source, and report what is missing as a gap"
+)
 
 # (server, tool) -> mapper. Only tools whose result shapes were captured and verified
 # (ADR-0017 fixtures, tests/fixtures/robinhood/results/; robinhood_mappers.py).
@@ -202,10 +216,21 @@ class BoundaryValidator:
         except (PayloadError, TypeError, ValueError) as exc:
             return self._invalid(request, EnvelopeKind.ERROR, f"unrecognized result: {exc}")
         if kind is PayloadKind.TOOL_ERROR:
-            return self._invalid(request, EnvelopeKind.ERROR, self._tool_error_gap(payload))
+            gap = (
+                TAVILY_ERROR_GAP
+                if request.server == TAVILY_SERVER
+                else self._tool_error_gap(payload)
+            )
+            return self._invalid(request, EnvelopeKind.ERROR, gap)
         redacted = self.redactor.redact(payload)
         if request.server == LOCAL_SERVER_NAME:
             return self._envelope(request, EnvelopeKind.VALIDATED, data=redacted)
+        if request.server == TAVILY_SERVER:
+            try:
+                web, web_gaps = normalize_result(request.tool, redacted)
+            except TavilyResultError as exc:
+                return self._invalid(request, EnvelopeKind.MISSING, str(exc))
+            return self._envelope(request, EnvelopeKind.VALIDATED, data=web, gaps=web_gaps)
         mapper = self.mappers.get((request.server, request.tool))
         if mapper is None and (request.server, request.tool) in CONTEXT_ONLY_TOOLS:
             # ADR-0026: delivered as redacted context with account values dropped. It carries

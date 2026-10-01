@@ -35,6 +35,9 @@ _EXIT_CODES: Final = MappingProxyType(
         RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED: EXIT_OK,
         # Deliberate operator stop; alerted separately, not a failure.
         RunStatus.SKIPPED_KILLED: EXIT_OK,
+        # ADR-0057: an agent's start condition was not met; the normal outcome of a quiet book.
+        RunStatus.SKIPPED_NO_OPEN_SHORTS: EXIT_OK,
+        RunStatus.SKIPPED_INSUFFICIENT_BALANCE: EXIT_OK,
         # CLAUDE.md §14: non-zero for failures; distinct so alerting can tell them apart.
         RunStatus.FAILED: EXIT_FAILED,
         RunStatus.TIMED_OUT: EXIT_TIMED_OUT,
@@ -45,6 +48,15 @@ _EXIT_CODES: Final = MappingProxyType(
 
 class ExitCodeUndefined(ValueError):
     """The status has no exit code because it is not final (`running`)."""
+
+
+# ADR-0057: a tick of two runs exits with the more severe of their codes.
+_SEVERITY: Final = (EXIT_OK, EXIT_STOPPED, EXIT_TIMED_OUT, EXIT_FAILED)
+
+
+def combined_exit_code(codes: tuple[int, ...]) -> int:
+    """The most severe exit code of a tick's runs (failed > timed out > stopped > ok)."""
+    return max(codes, key=_SEVERITY.index, default=EXIT_OK)
 
 
 def exit_code_for(status: RunStatus) -> int:

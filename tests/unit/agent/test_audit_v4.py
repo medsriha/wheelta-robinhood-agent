@@ -26,6 +26,7 @@ from wheelta_robinhood_agent.domain.decision_output import (
     ProposedLeg,
 )
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AttemptStatus,
     AuditOutcome,
     DataQuality,
@@ -61,6 +62,18 @@ def test_one_management_decision_per_lineage() -> None:
     assert outcomes(check_v4(s.ctx()), "1") == [V]
     s.decide(DecisionAction.HOLD, target_ref="position:unknown")
     assert outcomes(check_v4(s.ctx()), "1") == [V, V]
+
+
+def test_sell_agent_makes_no_management_decision() -> None:
+    """ADR-0057: shorts are the close agent's; the sell agent's coverage is no management."""
+    s = Scenario()
+    s.role = AgentRole.SELL
+    s.position("position:1", "put-1", PUT)
+    assert outcomes(check_v4(s.ctx()), "1") == [P]
+    s.decide(DecisionAction.HOLD, target_ref="position:1")
+    assert outcomes(check_v4(s.ctx()), "1") == [V]
+    s.role = AgentRole.CLOSE
+    assert outcomes(check_v4(s.ctx()), "1") == [P]
 
 
 def test_coverage_unverifiable_without_book_or_output() -> None:

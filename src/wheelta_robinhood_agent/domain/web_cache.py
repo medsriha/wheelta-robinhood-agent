@@ -1,13 +1,16 @@
 """Web search/fetch cache rules (ADR-0016). Pure: keys, ticker matching, freshness.
 
-The cache avoids paying twice for the same web research. Entries are recorded results of the
-built-in WebSearch/WebFetch tools; they stay untrusted data (CLAUDE.md §11, §24) and carry
-their original tool-call provenance. The TTL is `data_quality.freshness.news_max_age_seconds`,
+The cache avoids paying twice for the same web research. Entries are recorded results of
+Tavily `tavily_search` calls (ADR-0058; earlier rows hold the built-in WebSearch/WebFetch,
+which are no longer enabled); they stay untrusted data (CLAUDE.md §11, §24) and carry their
+original tool-call provenance. The TTL is `data_quality.freshness.news_max_age_seconds`,
 passed in by the caller, never a constant here.
 """
 
+import json
 import re
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from typing import Self
@@ -23,8 +26,13 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 
 class WebTool(StrEnum):
+    # Built-ins recorded before ADR-0058; read back from old rows only.
     WEB_SEARCH = "WebSearch"
     WEB_FETCH = "WebFetch"
+    TAVILY_SEARCH = "tavily_search"
+
+
+SEARCH_TOOLS = frozenset({WebTool.WEB_SEARCH, WebTool.TAVILY_SEARCH})
 
 
 def normalize_query(query: str) -> str:
@@ -34,6 +42,16 @@ def normalize_query(query: str) -> str:
     stemming or reordering, so a cache hit never answers a different question.
     """
     return _WHITESPACE_RE.sub(" ", query).strip().casefold()
+
+
+def search_cache_key(query: str, options: Mapping[str, object] | None = None) -> str:
+    """Cache key for a search: `normalize_query(query)`, then the call's other arguments as
+    sorted JSON when there are any. A search narrowed differently (another time range or
+    domain list) is another question, so it never shares an entry."""
+    key = normalize_query(query)
+    if not options:
+        return key
+    return f"{key} {json.dumps(dict(options), sort_keys=True, separators=(',', ':'))}"
 
 
 def normalize_url(url: str) -> str:

@@ -1,20 +1,25 @@
 """Run-summary email content (ADR-0029). Pure: no HTTP, no clock, no LLM.
 
-One summary is sent for every run whose agent session started. It is built from what the run
-recorded (the assembled RunRecord, the audit status, alerts, the next run), never from the
-agent's free text alone. `summary_facts` is the redacted JSON handed to the prose writer and
-`render_facts_text` is the deterministic facts block every email carries, so a figure in the
-prose can always be checked against the recorded one. Delivery is in
+ADR-0057: one summary is sent per tick in which an agent session started. A tick runs the
+Buy-to-Close agent, then the Sell Options agent, each its own run; the email
+(`SlotSummaryInput`) has one section per agent run, in that order, a skipped agent included with
+its reason, then the tick's next run. Each section comes from one `RunSummaryInput`, built from
+what the run recorded (the assembled RunRecord, the audit status, alerts, the next run), never
+from the agent's free text alone. `summary_facts` is the redacted JSON handed to the prose
+writer and `render_facts_text` is the deterministic facts block every email carries, so a figure
+in the prose can always be checked against the recorded one. Delivery is in
 ``integrations/notifications``.
 """
 
 import html
 from datetime import datetime
 from decimal import Decimal
+from typing import Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AppEnv,
     AttemptStatus,
     ExecutionMode,
@@ -53,6 +58,10 @@ class RunSummaryInput(BaseModel):
     slot: AwareDatetime
     status: RunStatus
     reason: str | None
+    # ADR-0057: which agent this run is, and whether its session started (a skipped or
+    # unstarted agent is reported by status and reason only).
+    agent: AgentRole = AgentRole.WHEEL
+    session_started: bool = True
     requested_execution_mode: ExecutionMode
     effective_execution_mode: ExecutionMode
     # ADR-0038; defaults from the mode (live: broker, off: none) when not given.
@@ -275,6 +284,7 @@ def summary_facts(summary: RunSummaryInput, redactor: Redactor) -> dict[str, Jso
             "effective_execution_mode": summary.effective_execution_mode.value,
             "order_venue": summary.order_venue.value,
             "orders_sent_to_broker": summary.order_venue is OrderVenue.BROKER,
+            "session_started": summary.session_started,
         },
         "record": _record_facts(summary.record) if summary.record is not None else None,
         "candidates": [c for c in _candidate_facts(summary)],
@@ -491,3 +501,108 @@ def render_bodies(prose: str | None, facts_text: str, redactor: Redactor) -> tup
         f"{html.escape(facts_text)}</pre></div>"
     )
     return text, body
+
+
+# ADR-0057: one email per tick ------------------------------------------------------------
+
+AGENT_TITLES = {
+    AgentRole.CLOSE: "Buy-to-Close agent",
+    AgentRole.SELL: "Sell Options agent",
+    AgentRole.WHEEL: "Wheel agent",
+}
+
+
+class SlotSummaryInput(BaseModel):
+    """One tick's email: each agent run in order, then the tick's effective next run (the
+    earliest agent request, else the fallback)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    environment: AppEnv
+    slot: AwareDatetime
+    agents: tuple[RunSummaryInput, ...] = Field(min_length=1)
+    next_run_at: AwareDatetime | None = None
+    next_run_source: str | None = None
+
+    @model_validator(mode="after")
+    def _same_slot(self) -> Self:
+        if any(a.slot != self.slot or a.environment != self.environment for a in self.agents):
+            raise ValueError("every agent run must belong to the summary's slot")
+        return self
+
+
+def _agent_activity(summary: RunSummaryInput) -> str:
+    if not summary.session_started:
+        return summary.status.value
+    activity = build_subject(summary).split(" · ")[2]
+    return f"{summary.status.value}, {activity}"
+
+
+def build_slot_subject(summary: SlotSummaryInput) -> str:
+    """`[Wheelta agent] <mode> · close: <outcome> · sell: <outcome> · <slot UTC>`."""
+    first = summary.agents[0]
+    parts = [
+        f"{SUBJECT_PREFIX} {_mode_label(first.effective_execution_mode, first.order_venue)}",
+        *(f"{a.agent.value}: {_agent_activity(a)}" for a in summary.agents),
+        f"{summary.slot:%Y-%m-%d %H:%M} UTC",
+    ]
+    return " · ".join(parts)
+
+
+def slot_summary_facts(summary: SlotSummaryInput, redactor: Redactor) -> dict[str, JsonValue]:
+    """The redacted JSON the prose writer summarizes: one entry per agent run, in order."""
+    agents: list[JsonValue] = []
+    for agent in summary.agents:
+        if agent.session_started:
+            facts: dict[str, JsonValue] = summary_facts(agent, redactor)
+        else:
+            facts = {
+                "run": {
+                    "run_id": agent.run_id,
+                    "status": agent.status.value,
+                    "reason": agent.reason,
+                    "session_started": False,
+                },
+                "diagnostic_details": list(agent.diagnostic_details),
+                "alerts": list(agent.alerts),
+            }
+        agents.append({"agent": AGENT_TITLES[agent.agent], **facts})
+    redacted = redactor.redact(
+        {
+            "tick": {
+                "environment": summary.environment.value,
+                "slot": summary.slot.isoformat(),
+                "next_run_not_before": _iso(summary.next_run_at),
+                "next_run_source": summary.next_run_source,
+            },
+            "agents": agents,
+        }
+    )
+    if not isinstance(redacted, dict):  # redact() preserves mappings; narrowed for typing
+        raise TypeError("redacted facts must stay a mapping")
+    return redacted
+
+
+def render_slot_facts_text(summary: SlotSummaryInput, redactor: Redactor) -> str:
+    """The deterministic facts block: one section per agent run, then the tick's next run."""
+    sections: list[str] = []
+    for agent in summary.agents:
+        title = f"== {AGENT_TITLES[agent.agent]} =="
+        if agent.session_started:
+            sections.append(f"{title}\n{render_facts_text(agent, redactor)}")
+            continue
+        lines = [
+            title,
+            f"Run {agent.run_id}",
+            f"Status: {agent.status.value}" + (f" ({agent.reason})" if agent.reason else ""),
+            "No session started.",
+            *(f"Diagnostic: {d}" for d in dict.fromkeys(agent.diagnostic_details)),
+        ]
+        if agent.alerts:
+            lines.append("Alerts: " + ", ".join(agent.alerts))
+        sections.append(redactor.redact_text("\n".join(lines)))
+    if summary.next_run_at is not None:
+        source = f" ({summary.next_run_source})" if summary.next_run_source else ""
+        at = summary.next_run_at.isoformat()
+        sections.append(f"Next run of both agents not before: {at}{source}")
+    return "\n\n".join(sections)

@@ -12,7 +12,7 @@ from wheelta_robinhood_agent.orchestrator import main as orchestrator_main
 def _patch_startup(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
     monkeypatch.setattr(orchestrator_main, "load_settings", lambda: _Settings())
     monkeypatch.setattr(orchestrator_main, "load_rules", lambda: object())
-    monkeypatch.setattr(orchestrator_main, "load_prompt", lambda: object())
+    monkeypatch.setattr(orchestrator_main, "load_agent_prompts", lambda: {})
     monkeypatch.setattr(orchestrator_main, "configure_logging", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator_main, "settings_secrets", lambda s: ())
 

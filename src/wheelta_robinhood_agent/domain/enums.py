@@ -65,6 +65,16 @@ class AppEnv(StrEnum):
     PRODUCTION = "production"
 
 
+class AgentRole(StrEnum):
+    """Which agent a run is (ADR-0057). Each due tick runs CLOSE (buy-to-close and rolls of
+    existing shorts), then SELL (new CSPs and CCs), as separate runs of the same slot.
+    WHEEL is the single agent of earlier releases; only legacy runs carry it."""
+
+    WHEEL = "wheel"
+    CLOSE = "close"
+    SELL = "sell"
+
+
 class RunStatus(StrEnum):
     """Run status (INTERFACES.md "Run and RunControl")."""
 
@@ -81,6 +91,11 @@ class RunStatus(StrEnum):
     # ADR-0038: a scheduled tick while the effective mode is off; dry runs start only on
     # demand (`--run-now`).
     SKIPPED_DRY_RUN_NOT_REQUESTED = "skipped_dry_run_not_requested"
+    # ADR-0057: the Buy-to-Close agent's start condition (an open short option) is not met.
+    SKIPPED_NO_OPEN_SHORTS = "skipped_no_open_shorts"
+    # ADR-0057: the Sell Options agent's start condition (settled cash or coverable shares)
+    # is not met.
+    SKIPPED_INSUFFICIENT_BALANCE = "skipped_insufficient_balance"
     STOPPED = "stopped"
     TIMED_OUT = "timed_out"
     FAILED = "failed"
@@ -133,7 +148,8 @@ class ToolCallStatus(StrEnum):
 
 
 class DecisionAction(StrEnum):
-    """AgentDecisionOutput v5 actions (OUTPUT_ASSEMBLY.md)."""
+    """AgentDecisionOutput v6 actions (OUTPUT_ASSEMBLY.md). Which ones each agent role may
+    use: `decision_output.ROLE_ACTIONS` (ADR-0057)."""
 
     OPEN_CSP = "OPEN_CSP"
     OPEN_CC = "OPEN_CC"

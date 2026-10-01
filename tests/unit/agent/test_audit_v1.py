@@ -21,6 +21,7 @@ from test_audit_builders import (
 from wheelta_robinhood_agent.agent.audit import WorkingOrderObservation, check_v1
 from wheelta_robinhood_agent.config.rules import RuleMarker
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AttemptStatus,
     AuditOutcome,
     DecisionAction,
@@ -338,3 +339,45 @@ def test_side_unknown_skips_funding_checks() -> None:
     f = check_v1(s.ctx())
     assert [x.sub_item for x in f] == ["1"]
     assert AttemptStatus.FILLED  # keep import used
+
+
+# V1.5 (ADR-0057) ------------------------------------------------------------------------------
+
+
+def test_role_side_not_checked_for_the_legacy_agent() -> None:
+    s = Scenario()
+    live_csp(s)
+    assert outcomes(check_v1(s.ctx()), "5") == []
+
+
+def test_sell_agent_opens_and_never_closes() -> None:
+    s = Scenario()
+    s.role = AgentRole.SELL
+    live_csp(s)
+    assert outcomes(check_v1(s.ctx()), "5") == [P]
+    s.state(190, shorts=(("put-1", 1),))
+    s.place(200, "put-1", PUT, BTC, 1, "0.50")
+    assert outcomes(check_v1(s.ctx()), "5") == [P, V]
+
+
+def test_close_agent_opens_only_for_a_roll() -> None:
+    s = Scenario()
+    s.role = AgentRole.CLOSE
+    live_csp(s)  # an OPEN_CSP decision
+    f = check_v1(s.ctx())
+    assert outcomes(f, "5") == [V]
+    assert only(f, "5").observed_value == "close/sell_to_open"
+    s.decisions[0].action = DecisionAction.ROLL
+    assert outcomes(check_v1(s.ctx()), "5") == [P]
+
+
+def test_close_agent_unattributed_open_is_unverifiable() -> None:
+    s = Scenario()
+    s.role = AgentRole.CLOSE
+    s.inst("put-1", PUT)
+    s.state(90)
+    s.place(100, "put-1", PUT, STO, 1, "1.10")
+    assert reasons(check_v1(s.ctx()), "5") == ["unassociated_action"]
+    s.state(190, shorts=(("put-1", 1),))
+    s.place(200, "put-1", PUT, BTC, 1, "0.50")
+    assert outcomes(check_v1(s.ctx()), "5")[-1] is P

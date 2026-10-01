@@ -20,10 +20,11 @@ from wheelta_robinhood_agent.agent.web_cache import (
 )
 from wheelta_robinhood_agent.domain.enums import ExecutionMode
 from wheelta_robinhood_agent.domain.web_cache import (
+    SEARCH_TOOLS,
     WebCacheEntry,
     WebTool,
-    normalize_query,
     normalize_url,
+    search_cache_key,
     tickers_in,
 )
 
@@ -36,8 +37,8 @@ RUN = uuid.uuid4()
 class FakeStore:
     entries: list[WebCacheEntry] = field(default_factory=list)
 
-    def _key(self, tool: WebTool, raw: str) -> str:
-        return normalize_query(raw) if tool is WebTool.WEB_SEARCH else normalize_url(raw)
+    def _key(self, tool: WebTool, raw: str, options: Any = None) -> str:
+        return search_cache_key(raw, options) if tool in SEARCH_TOOLS else normalize_url(raw)
 
     def fresh_for_ticker(
         self, ticker: str, now: datetime, max_age_seconds: int, limit: int
@@ -45,16 +46,21 @@ class FakeStore:
         hits = [
             e
             for e in self.entries
-            if e.tool is WebTool.WEB_SEARCH
+            if e.tool is WebTool.TAVILY_SEARCH
             and ticker in e.tickers
             and e.is_fresh(now, max_age_seconds)
         ]
         return tuple(sorted(hits, key=lambda e: e.retrieved_at, reverse=True)[:limit])
 
     def fresh_for_key(
-        self, tool: WebTool, tool_input: str, now: datetime, max_age_seconds: int
+        self,
+        tool: WebTool,
+        tool_input: str,
+        now: datetime,
+        max_age_seconds: int,
+        options: Any = None,
     ) -> WebCacheEntry | None:
-        key = self._key(tool, tool_input)
+        key = self._key(tool, tool_input, options)
         hits = [
             e
             for e in self.entries
@@ -71,15 +77,17 @@ class FakeStore:
         tool_input: str,
         result: JsonValue,
         retrieved_at: datetime,
+        options: Any = None,
     ) -> WebCacheEntry:
+        search = tool in SEARCH_TOOLS
         entry = WebCacheEntry(
             entry_id=uuid.uuid4(),
             run_id=run_id,
             tool_call_id=tool_call_id,
             tool=tool,
-            cache_key=self._key(tool, tool_input),
-            tickers=tickers_in(tool_input) if tool is WebTool.WEB_SEARCH else (),
-            query_raw=tool_input if tool is WebTool.WEB_SEARCH else None,
+            cache_key=self._key(tool, tool_input, options),
+            tickers=tickers_in(tool_input) if search else (),
+            query_raw=tool_input if search else None,
             url=tool_input if tool is WebTool.WEB_FETCH else None,
             result=result,
             retrieved_at=retrieved_at,
@@ -94,41 +102,56 @@ def _capture(store: FakeStore, tool: str, tool_input: dict[str, Any], at: dateti
                               retrieved_at=at)  # fmt: skip
 
 
+SEARCH = "tavily_search"
+
+
 def test_web_tool_input() -> None:
-    assert web_tool_input("WebSearch", {"query": "AAPL"}) == (WebTool.WEB_SEARCH, "AAPL")
-    assert web_tool_input("WebSearch", {"query": "  "}) is None
-    assert web_tool_input("WebSearch", {}) is None
-    assert web_tool_input("WebFetch", {"url": "https://x.com/a"}) == (
-        WebTool.WEB_FETCH,
-        "https://x.com/a",
+    assert web_tool_input(SEARCH, {"query": "AAPL", "max_results": 5}) == (
+        WebTool.TAVILY_SEARCH,
+        "AAPL",
+        {"max_results": 5},
     )
-    assert web_tool_input("WebFetch", {"url": "file:///etc/passwd"}) is None
-    assert web_tool_input("WebFetch", {"url": 3}) is None
+    assert web_tool_input(SEARCH, {"query": "  "}) is None
+    assert web_tool_input(SEARCH, {}) is None
+    # ADR-0058: only Tavily searches are cached; the built-ins and extracts are not.
+    assert web_tool_input("WebSearch", {"query": "AAPL"}) is None
+    assert web_tool_input("WebFetch", {"url": "https://x.com/a"}) is None
+    assert web_tool_input("tavily_extract", {"urls": ["https://x.com/a"]}) is None
     assert web_tool_input("mcp__robinhood__get_equity_quotes", {"symbol": "AAPL"}) is None
 
 
 def test_capture_and_denial() -> None:
     store = FakeStore()
     assert _capture(store, "mcp__wheelta__wheelta_quotes", {"symbols": ["AAPL"]}) is None
-    assert cached_search_denial(store, "WebSearch", {"query": "AAPL earnings"}, T0, TTL) is None
-    entry = _capture(store, "WebSearch", {"query": "AAPL earnings"})
+    assert cached_search_denial(store, SEARCH, {"query": "AAPL earnings"}, T0, TTL) is None
+    entry = _capture(store, SEARCH, {"query": "AAPL earnings"})
     assert entry is not None
-    reason = cached_search_denial(store, "WebSearch", {"query": "aapl  EARNINGS"},
+    reason = cached_search_denial(store, SEARCH, {"query": "aapl  EARNINGS"},
                                   T0 + timedelta(seconds=30), TTL)  # fmt: skip
     assert reason is not None
     assert "30 s ago" in reason and str(entry.tool_call_id) in reason
     assert f"mcp__{LOCAL_SERVER_NAME}__{WEB_CACHE_TOOL_NAME}" in reason
-    assert cached_search_denial(store, "WebSearch", {"query": "AAPL earnings"},
+    assert cached_search_denial(store, SEARCH, {"query": "AAPL earnings"},
                                 T0 + timedelta(seconds=TTL + 1), TTL) is None  # fmt: skip
-    assert cached_search_denial(store, "WebSearch", {"query": "AAPL guidance"}, T0, TTL) is None
+    assert cached_search_denial(store, SEARCH, {"query": "AAPL guidance"}, T0, TTL) is None
     assert cached_search_denial(store, "Bash", {"command": "ls"}, T0, TTL) is None
+
+
+def test_a_search_narrowed_differently_is_not_a_cache_hit() -> None:
+    store = FakeStore()
+    _capture(store, SEARCH, {"query": "AAPL earnings", "time_range": "week"})
+    hit = {"query": "AAPL earnings", "time_range": "week"}
+    assert cached_search_denial(store, SEARCH, hit, T0, TTL) is not None
+    other = {"query": "AAPL earnings", "time_range": "day"}
+    assert cached_search_denial(store, SEARCH, other, T0, TTL) is None
+    assert cached_search_denial(store, SEARCH, {"query": "AAPL earnings"}, T0, TTL) is None
 
 
 def test_lookup_tool_returns_labelled_fresh_entries() -> None:
     store = FakeStore()
-    _capture(store, "WebSearch", {"query": "AAPL earnings"})
-    _capture(store, "WebSearch", {"query": "MSFT earnings"})
-    _capture(store, "WebSearch", {"query": "AAPL old"}, T0 - timedelta(seconds=TTL + 1))
+    _capture(store, SEARCH, {"query": "AAPL earnings"})
+    _capture(store, SEARCH, {"query": "MSFT earnings"})
+    _capture(store, SEARCH, {"query": "AAPL old"}, T0 - timedelta(seconds=TTL + 1))
     lookup = build_web_cache_tool(store, lambda: T0 + timedelta(seconds=5), TTL)
     out = asyncio.run(lookup.handler({"ticker": "AAPL"}))
     assert "is_error" not in out

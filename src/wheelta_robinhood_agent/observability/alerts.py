@@ -55,6 +55,8 @@ class AlertKind(StrEnum):
     AUDIT_FAILURE = "audit_failure"
     # ADR-0050: an owned order was still unresolved when the session ended.
     ORDERS_LEFT_WORKING = "orders_left_working"
+    # ADR-0057: an agent's start condition could not be read, so its session did not start.
+    START_CONDITION_UNAVAILABLE = "start_condition_unavailable"
 
 
 class AlertSpec(BaseModel):
@@ -83,6 +85,7 @@ ALERT_SPECS: Mapping[AlertKind, AlertSpec] = {
     AlertKind.AUDIT_VIOLATION: AlertSpec(severity=AlertSeverity.ERROR, runbook="R12"),
     AlertKind.AUDIT_FAILURE: AlertSpec(severity=AlertSeverity.ERROR, runbook="R16"),
     AlertKind.ORDERS_LEFT_WORKING: AlertSpec(severity=AlertSeverity.WARNING, runbook="R19"),
+    AlertKind.START_CONDITION_UNAVAILABLE: AlertSpec(severity=AlertSeverity.ERROR, runbook="R20"),
 }
 
 
@@ -166,6 +169,10 @@ _SUCCESS_STATUSES = frozenset(
         RunStatus.SKIPPED_NOT_DUE,
         # ADR-0038: a scheduled tick while dry runs are on-demand only.
         RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED,
+        # ADR-0057: an agent whose start condition was not met (nothing to close; no cash
+        # or coverable shares to sell against).
+        RunStatus.SKIPPED_NO_OPEN_SHORTS,
+        RunStatus.SKIPPED_INSUFFICIENT_BALANCE,
     }
 )
 

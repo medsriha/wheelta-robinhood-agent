@@ -73,6 +73,7 @@ def make_settings(ledger_db_url: SecretStr) -> Any:
             "ROBINHOOD_MCP_ACCESS_TOKEN": "rh-test-token",
             "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER": ACCOUNT_NUMBER,
             "WHEELTA_MCP_TOKEN": "wt-test-token",
+            "TAVILY_API_KEY": "tvly-test-key",
             "DATABASE_URL": ledger_db_url.get_secret_value(),
             "RUN_TIMEOUT_SECONDS": 1500,
         }

@@ -155,7 +155,9 @@ def build_place_attempt(
     call_id = call.identity.tool_call_id
     status, reasons = _status_and_reasons(call, order, findings)
     intent = order.intent if order is not None else None
-    if intent is None:
+    # A place denied before dispatch (pre-trade or role check, ADR-0048, ADR-0057) never
+    # records an intent: nothing was sent, so its absence is expected, not a finding.
+    if intent is None and ReasonCode.NOT_DISPATCHED not in reasons:
         findings.append(
             _finding(
                 "place_intent_missing",

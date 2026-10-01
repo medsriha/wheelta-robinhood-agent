@@ -4,15 +4,16 @@ Pure: builds configuration only, no I/O. The session:
 
 - sees only `tool_access` (layers 1 and 2), with `permission_mode="dontAsk"`, never
   `bypassPermissions` (it ignores `allowed_tools`);
-- has built-ins restricted to `Agent` (spawns Mignons) and WebSearch/WebFetch (Mignons only)
-  through `tools`, and carries exactly the Mignon definitions built from `agent/mignons.py`
-  (ADR-0025) plus the CLI variables that design depends on (`mignons.cli_env`);
+- has built-ins restricted to `Agent` (spawns Mignons) through `tools` (web research is
+  Tavily's proxied MCP tools since ADR-0058), and carries exactly the Mignon definitions
+  built from `agent/mignons.py` (ADR-0025) plus the CLI variables that design depends on
+  (`mignons.cli_env`);
 - loads no filesystem settings or CLAUDE.md (`setting_sources=[]`) and only the MCP servers
   given here (`strict_mcp_config=True`): remote HTTP servers (direct delivery, ADR-0019 local
   dry runs only) plus in-process SDK servers named in `LOCAL_SDK_SERVER_NAMES` (`wra_local`:
   web_cache_lookup and get_decision_facts) or `PROXY_SDK_SERVER_NAMES` (the validating proxy
-  for `robinhood` and `wheelta`, ADR-0023). No other server type (stdio, SSE) is ever
-  configured;
+  for `robinhood`, `wheelta`, and `tavily`, ADR-0023, ADR-0058). No other server type
+  (stdio, SSE) is ever configured;
 - runs in an explicit scratch directory;
 - uses the pinned model (`Settings.AGENT_MODEL`) and the given hooks (layer 3).
 
@@ -52,13 +53,14 @@ from wheelta_robinhood_agent.config.settings import MODEL_ALIASES
 from wheelta_robinhood_agent.domain.enums import MignonType
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
 from wheelta_robinhood_agent.integrations.status import McpHttpServer
+from wheelta_robinhood_agent.integrations.websearch.registry import SERVER_NAME as TAVILY
 from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
 
 PERMISSION_MODE: Final[Literal["dontAsk"]] = "dontAsk"
 # The only in-process SDK MCP servers a session may carry. Their tools are local Tier R code.
 LOCAL_SDK_SERVER_NAMES: Final = frozenset({LOCAL_SERVER_NAME})
 # In-process validating proxies (agent/proxy.py) for the remote sources, under their own names.
-PROXY_SDK_SERVER_NAMES: Final = frozenset({ROBINHOOD, WHEELTA})
+PROXY_SDK_SERVER_NAMES: Final = frozenset({ROBINHOOD, WHEELTA, TAVILY})
 _REQUIRED_HOOK_EVENTS: tuple[HookEvent, ...] = ("PreToolUse", "PostToolUse", "PostToolUseFailure")
 
 

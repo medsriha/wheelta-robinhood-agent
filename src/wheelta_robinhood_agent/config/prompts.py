@@ -12,28 +12,30 @@ from types import MappingProxyType
 
 from pydantic import BaseModel, ConfigDict
 
-from wheelta_robinhood_agent.domain.enums import MignonType
+from wheelta_robinhood_agent.domain.enums import AgentRole, MignonType
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-# ADR-0028: the orchestrator prompt (v7 plus the agent-chosen next run); paired with
-# AgentDecisionOutput v6. v10 (ADR-0035): the final message is bare JSON. v11 (ADR-0040):
-# cash and capacity come from decision facts, not the raw snapshot's missing fields. v12
-# (ADR-0048): code validates sell-to-open placements and returns failed checks as feedback.
-# v13 (ADR-0050): finish with no order working; order cleanup turns and wind-down. v14
-# (ADR-0052): execution_refs cite each order call's delivered `order_call_ref`. v15
-# (ADR-0053): discovery rounds and the rendered work deadline. v16 (ADR-0055): each position's
-# entry_note is weighed before a hold, close, or roll. v17 (ADR-0056): Mignon reports carry
-# dropped and web-sourced findings.
-ACTIVE_PROMPT_ID = "wheel_agent"
-ACTIVE_PROMPT_VERSION = 17
+# ADR-0057: one orchestrator prompt per agent of a due tick, each paired with
+# AgentDecisionOutput v6. Both carry over wheel_agent v17 (ADR-0028 next run, ADR-0035 bare
+# JSON, ADR-0040 cash from decision facts, ADR-0048 pre-trade validation, ADR-0050 order
+# cleanup, ADR-0052 order_call_ref, ADR-0053 discovery rounds and work deadline, ADR-0055
+# entry notes, ADR-0056 Mignon salvage). wheel_close manages existing shorts (CLOSE, ROLL,
+# HOLD); wheel_sell opens new CSPs and CCs. wheel_agent v17 stays on disk for earlier runs.
+ACTIVE_PROMPTS: Mapping[AgentRole, tuple[str, int]] = MappingProxyType(
+    {
+        AgentRole.CLOSE: ("wheel_close", 1),
+        AgentRole.SELL: ("wheel_sell", 1),
+    }
+)
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {
         # ADR-0056: web-sourced numbers, absences as gaps, dropped findings, fetch hygiene.
         MignonType.MARKET: ("mignon_market", 5),  # v4, ADR-0053: scanner beside the board
-        MignonType.COMPANY: ("mignon_company", 3),
-        MignonType.MACRO: ("mignon_macro", 3),
+        # ADR-0058: Tavily tavily_search/tavily_extract replace WebSearch/WebFetch.
+        MignonType.COMPANY: ("mignon_company", 4),
+        MignonType.MACRO: ("mignon_macro", 4),
     }
 )
 
@@ -75,11 +77,7 @@ class RenderedPrompt(BaseModel):
     sha256: str
 
 
-def load_prompt(
-    prompt_id: str = ACTIVE_PROMPT_ID,
-    version: int = ACTIVE_PROMPT_VERSION,
-    prompts_dir: Path = PROMPTS_DIR,
-) -> PromptTemplate:
+def load_prompt(prompt_id: str, version: int, prompts_dir: Path = PROMPTS_DIR) -> PromptTemplate:
     """Read `<prompt_id>.v<version>.md`. The hash covers the exact file bytes."""
     if not re.fullmatch(r"[a-z_]+", prompt_id) or version < 1:
         raise PromptError(f"invalid prompt identity: {prompt_id!r} v{version}")
@@ -94,6 +92,14 @@ def load_prompt(
         text=data.decode("utf-8"),
         sha256=hashlib.sha256(data).hexdigest(),
     )
+
+
+def load_agent_prompts(prompts_dir: Path = PROMPTS_DIR) -> dict[AgentRole, PromptTemplate]:
+    """Each agent role's active orchestrator prompt (`ACTIVE_PROMPTS`). Raises PromptError."""
+    return {
+        role: load_prompt(prompt_id, version, prompts_dir)
+        for role, (prompt_id, version) in ACTIVE_PROMPTS.items()
+    }
 
 
 def load_mignon_prompts(prompts_dir: Path = PROMPTS_DIR) -> dict[MignonType, PromptTemplate]:

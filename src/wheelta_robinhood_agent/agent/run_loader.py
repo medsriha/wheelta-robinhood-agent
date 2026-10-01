@@ -79,6 +79,7 @@ from wheelta_robinhood_agent.domain.decision_output import (
     DecisionOutputParseFailure,
 )
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AppEnv,
     AttemptStatus,
     ExecutionMode,
@@ -119,6 +120,8 @@ class RunMeta:
     prompt_id: str | None
     prompt_hash: str | None
     model_id: str | None
+    # ADR-0057: which agent the run is (role-dependent audit checks).
+    role: AgentRole = AgentRole.WHEEL
 
 
 @dataclass(frozen=True)
@@ -610,4 +613,5 @@ def load_audit_context(
         decision_output=decision_output,
         run_record=run_record,
         position_book=book,
+        agent_role=meta.role,
     )

@@ -26,9 +26,10 @@ from wheelta_robinhood_agent.integrations.robinhood.registry import (
     ROBINHOOD_REGISTRY,
 )
 from wheelta_robinhood_agent.integrations.status import McpHttpServer
+from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 
-REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
+REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, TAVILY_REGISTRY)
 ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
 SCRATCH = Path("/private/tmp/wra-scratch")
 PROMPTS = {m: f"rendered {m.value} prompt" for m in MignonType}
@@ -79,7 +80,7 @@ def test_options_contract() -> None:
     assert o.permission_mode == "dontAsk"
     assert o.setting_sources == []
     assert o.strict_mcp_config is True
-    assert o.tools == ["Agent", "WebSearch", "WebFetch"]
+    assert o.tools == ["Agent"]
     assert o.model == "claude-test-model"
     assert o.cwd == SCRATCH
     assert o.max_turns == 40 and o.max_budget_usd == 2.5
@@ -173,7 +174,7 @@ def test_unsafe_tool_access_rejected() -> None:
         ({"permission_mode": "bypassPermissions"}, "bypassPermissions"),
         ({"permission_mode": "default"}, "dontAsk"),
         ({"setting_sources": None}, "settings"),
-        ({"tools": ["WebSearch", "WebFetch", "Bash"]}, "built-in"),
+        ({"tools": ["Agent", "WebSearch", "WebFetch"]}, "built-in"),
         ({"skills": "all"}, "skills"),
     ],
 )
@@ -192,8 +193,9 @@ def test_mignon_definitions_follow_their_roles() -> None:
         assert d.model == o.model and d.maxTurns == 40 and d.background is False
         assert not {"Agent", *ORDER_TOOLS} & set(d.tools)
         assert not any("get_option_positions" in t or "get_portfolio" in t for t in d.tools)
-    assert "WebSearch" not in o.agents[MK].tools
-    assert "WebFetch" in o.agents["mignon-company--claude-test-model"].tools
+    assert "mcp__tavily__tavily_search" not in o.agents[MK].tools
+    assert "mcp__tavily__tavily_extract" in o.agents["mignon-company--claude-test-model"].tools
+    assert not {"WebSearch", "WebFetch"} & {t for d in o.agents.values() for t in d.tools}
 
 
 def test_disabled_mignons_leave_no_agents_and_no_web() -> None:
@@ -235,7 +237,7 @@ def _with_agent(o: Any, name: str, **changes: Any) -> Any:
     [
         ("general-purpose", {}, "not a Mignon type"),
         ("mignon-market", {}, "not a Mignon type"),
-        (MK, {"tools": ["WebSearch"]}, "tools differ"),
+        (MK, {"tools": ["mcp__tavily__tavily_search"]}, "tools differ"),
         (MK, {"tools": None}, "tools differ"),
         (MK, {"model": "inherit"}, "pinned model its name names"),
         (MK, {"model": "opus"}, "pinned model its name names"),

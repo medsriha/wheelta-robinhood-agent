@@ -1,6 +1,8 @@
 """V4 Decision and assembled-record invariants (docs/VALIDATION.md "V4").
 
-1. Each initial short lineage has exactly one management decision (CLOSE/ROLL/HOLD).
+1. Each initial short lineage has exactly one management decision (CLOSE/ROLL/HOLD). ADR-0057:
+   checked for the Buy-to-Close agent (and the legacy single agent); the Sell Options agent
+   manages no position, so it makes no management decision at all.
 2. Legs match the decision's action (exact shape when unsubmitted; compatible prefix live).
 3. Live: every recorded place/cancel call appears exactly once in the record; known placed or
    filled statuses carry the broker ID; unassociated actions make attribution unverifiable.
@@ -23,6 +25,7 @@ from wheelta_robinhood_agent.agent.audit._common import (
 )
 from wheelta_robinhood_agent.agent.audit.context import AuditContext
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AttemptStatus,
     AuditCheck,
     DecisionAction,
@@ -67,6 +70,19 @@ def check_v4(ctx: AuditContext) -> tuple[AuditFinding, ...]:
 
 
 def _coverage(ctx: AuditContext, out: Findings, record: RunRecord) -> None:
+    if ctx.agent_role is AgentRole.SELL:
+        managed = [d for d in record.decisions if d.action in MANAGEMENT_ACTIONS]
+        if managed:
+            for d in managed:
+                out.bad(
+                    "1",
+                    "management decision by the Sell Options agent",
+                    decision_ref=d.decision_ref,
+                    observed=d.action.value,
+                )
+        else:
+            out.ok("1", "the Sell Options agent made no management decision")
+        return
     book = ctx.position_book
     if not output_available(ctx):
         out.unknown("1", Reason.MISSING_FINAL_OUTPUT, "decision coverage unknown without output")

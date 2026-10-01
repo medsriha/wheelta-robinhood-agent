@@ -36,7 +36,7 @@ from wheelta_robinhood_agent.domain.base import (
     require_unique,
 )
 from wheelta_robinhood_agent.domain.decision_output import AgentDecisionOutput
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, OrderVenue
+from wheelta_robinhood_agent.domain.enums import AgentRole, ExecutionMode, OrderVenue
 from wheelta_robinhood_agent.domain.facts import DecisionFacts
 from wheelta_robinhood_agent.domain.gating import (
     check_venue,
@@ -193,6 +193,8 @@ class AuditContext(DomainModel):
     run_record: RunRecord | None = None
     position_book: PositionBook | None = None
     day_history: DayHistory | None = None
+    # ADR-0057: which agent the run is; V1 checks its order sides, V4 its decision coverage.
+    agent_role: AgentRole = AgentRole.WHEEL
 
     _hash: str | None = PrivateAttr(default=None)
 

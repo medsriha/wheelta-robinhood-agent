@@ -12,10 +12,11 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import BaseModel
 
-from wheelta_robinhood_agent.config.prompts import load_prompt
+from wheelta_robinhood_agent.config.prompts import load_agent_prompts
 from wheelta_robinhood_agent.domain.decision_output import (
     LIMIT_PRICE_PATTERN,
     NEXT_RUN_AT_PATTERN,
+    ROLE_ACTIONS,
     SCHEMA_VERSION,
     AgentDecisionOutput,
     CancellationRationale,
@@ -27,7 +28,7 @@ from wheelta_robinhood_agent.domain.decision_output import (
     ResearchQuestion,
     parse_agent_decision_output,
 )
-from wheelta_robinhood_agent.domain.enums import DecisionAction
+from wheelta_robinhood_agent.domain.enums import AgentRole, DecisionAction
 
 SCHEMA_PATH = (
     Path(__file__).resolve().parents[3]
@@ -121,10 +122,33 @@ def test_valid_document_parses() -> None:
     assert isinstance(decision.proposed_legs[0].limit_price, Decimal)
 
 
-def test_prompt_example_parses() -> None:
-    prompt = load_prompt().body
-    example = prompt.split("```json", 1)[1].split("```", 1)[0]
-    assert parse_agent_decision_output(example).ok
+def test_prompt_examples_parse_for_their_role() -> None:
+    for role, template in load_agent_prompts().items():
+        example = template.body.split("```json", 1)[1].split("```", 1)[0]
+        assert parse_agent_decision_output(example, ROLE_ACTIONS[role]).ok
+
+
+def test_role_actions_split_management_from_opening() -> None:
+    """ADR-0057: the close agent manages shorts, the sell agent opens; WHEEL is unrestricted."""
+    assert ROLE_ACTIONS[AgentRole.CLOSE] == {
+        DecisionAction.CLOSE,
+        DecisionAction.ROLL,
+        DecisionAction.HOLD,
+    }
+    assert ROLE_ACTIONS[AgentRole.SELL] == {DecisionAction.OPEN_CSP, DecisionAction.OPEN_CC}
+    assert ROLE_ACTIONS[AgentRole.WHEEL] == frozenset(DecisionAction)
+
+
+def test_disallowed_action_is_a_parse_issue() -> None:
+    raw = json.dumps(_valid())  # an OPEN_CSP decision
+    assert parse_agent_decision_output(raw, ROLE_ACTIONS[AgentRole.SELL]).ok
+    result = parse_agent_decision_output(raw, ROLE_ACTIONS[AgentRole.CLOSE])
+    assert isinstance(result, DecisionOutputParseFailure)
+    assert [(i.loc, i.kind) for i in result.issues] == [
+        ("decisions.0.action", "action_not_allowed")
+    ]
+    assert "OPEN_CSP is not an action of this agent" in result.issues[0].message
+    assert result.raw_text == raw
 
 
 def test_empty_output_and_bytes() -> None:

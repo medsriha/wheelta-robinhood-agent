@@ -12,11 +12,12 @@ from wheelta_robinhood_agent.domain.enums import ExecutionMode, OrderVenue, Tool
 from wheelta_robinhood_agent.domain.gating import check_venue, executes_orders, order_venue
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 
-# Built-in Agent SDK tools the session never needs (CLAUDE.md §8). It needs MCP tools, web
-# search/fetch (Mignons only), and `Agent` to spawn Mignons (ADR-0025). `Task` is the CLI's
-# alias of `Agent`: listing it here would disable `Agent` as well (real CLI 2.1.283), so it
-# is left out; it has no tier and the hook denies it. `SendMessage` (resume a subagent) is
-# denied: follow-ups spawn a new Mignon.
+# Built-in Agent SDK tools the session never needs (CLAUDE.md §8). It needs MCP tools and
+# `Agent` to spawn Mignons (ADR-0025). Web research is Tavily's MCP tools behind the validating
+# proxy (ADR-0058), so the built-in WebSearch/WebFetch, whose results the hook cannot replace,
+# are disabled. `Task` is the CLI's alias of `Agent`: listing it here would disable `Agent` as
+# well (real CLI 2.1.283), so it is left out; it has no tier and the hook denies it.
+# `SendMessage` (resume a subagent) is denied: follow-ups spawn a new Mignon.
 DISALLOWED_BUILTINS = (
     "Bash",
     "BashOutput",
@@ -29,12 +30,12 @@ DISALLOWED_BUILTINS = (
     "Read",
     "SendMessage",
     "TodoWrite",
+    "WebFetch",
+    "WebSearch",
     "Write",
 )
-# Research built-ins (Tier R): used by Mignons only.
-ALLOWED_BUILTINS = ("WebSearch", "WebFetch")
 # Every built-in the session loads (`ClaudeAgentOptions.tools`).
-SESSION_BUILTINS = (DELEGATION_TOOL, *ALLOWED_BUILTINS)
+SESSION_BUILTINS = (DELEGATION_TOOL,)
 
 
 class ToolAccess(BaseModel):
@@ -68,7 +69,7 @@ def build_tool_access(
     - Every other Tier X tool and every EXCLUDED tool: disallowed in every mode.
     By role (ADR-0025, agent/mignons.py): a tool is allowed only if some role may use it.
     With `mignons` False (their limits are not integers) only the orchestrator's tools count,
-    and `Agent` and the web built-ins are disallowed.
+    and `Agent` is disallowed.
     A tool absent from every registry is in neither list; `dontAsk` and the hook deny it.
     """
     roles = tuple(Role) if mignons else (Role.ORCHESTRATOR,)

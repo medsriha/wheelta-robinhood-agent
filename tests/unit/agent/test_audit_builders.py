@@ -27,6 +27,7 @@ from wheelta_robinhood_agent.domain.decision_output import (
     ProposedLeg,
 )
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AppEnv,
     AttemptStatus,
     AuditCheck,
@@ -180,6 +181,8 @@ class Scenario:
         self.day: DayHistory | None = DayHistory(trading_date=T0.date(), prior_new_lineage_ids=())
         self.place_unrecorded: set[UUID] = set()
         self.drop_calls: set[UUID] = set()
+        # ADR-0057: the agent whose run this is.
+        self.role = AgentRole.WHEEL
 
     # -- tool calls ---------------------------------------------------------------------------
 
@@ -796,6 +799,7 @@ class Scenario:
             run_record=self.run_record(),
             position_book=self.book,
             day_history=self.day,
+            agent_role=self.role,
         )
 
 

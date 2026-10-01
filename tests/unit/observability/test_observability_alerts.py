@@ -120,6 +120,8 @@ _non_success = st.sampled_from(
             RunStatus.SKIPPED_DRY_RUN_NOT_LOCAL,
             RunStatus.SKIPPED_NOT_DUE,
             RunStatus.SKIPPED_DRY_RUN_NOT_REQUESTED,
+            RunStatus.SKIPPED_NO_OPEN_SHORTS,
+            RunStatus.SKIPPED_INSUFFICIENT_BALANCE,
         )
     ]
 )

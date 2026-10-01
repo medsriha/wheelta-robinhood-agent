@@ -905,7 +905,7 @@ def test_determinism_with_and_without_output() -> None:
     assert input_hash(changed, None) != input_hash(context, None)
     raw = canonical_json(assemble_run_record(context, out))
     assert raw.startswith(
-        b'{"assembler_version":"assembler.v2","cancellation_rationales":[],"cancellations":[]'
+        b'{"assembler_version":"assembler.v3","cancellation_rationales":[],"cancellations":[]'
     )
 
 
@@ -1056,6 +1056,9 @@ def test_agent_omits_actions_all_survive() -> None:
     assert [c.status for c in cancels] == [CancellationStatus.UNKNOWN, CancellationStatus.PENDING]
     found = codes(record)
     assert "cancel_not_dispatched" in found and "place_intent_missing" in found
+    # The denied place (uid 12) was never sent: no intent is expected, so no finding for it.
+    missing = [f for f in record.findings if f.code == "place_intent_missing"]
+    assert missing and all(uid(12) not in f.tool_call_ids for f in missing)
     assert record.decisions[0].legs == ()
 
 

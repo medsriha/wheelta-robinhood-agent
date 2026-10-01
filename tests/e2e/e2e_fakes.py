@@ -159,9 +159,13 @@ def build_world(as_of: datetime) -> FakeWorld:
                 },
             }
         },
-        web_results={"AAPL earnings date": [{"title": "AAPL earnings", "url": "https://x.test"}]},
+        web_results={
+            "AAPL earnings date": [
+                {"title": "AAPL earnings", "url": "https://x.test", "content": "Oct 29"}
+            ]
+        },
     )
-    return add_fake_wheelta(world)
+    return add_fake_tavily(add_fake_wheelta(world))
 
 
 def add_fake_wheelta(world: FakeWorld) -> FakeWorld:
@@ -172,6 +176,28 @@ def add_fake_wheelta(world: FakeWorld) -> FakeWorld:
     world.handlers["wheelta"] = {
         t.name: (lambda args: _text({"ok": True})) for t in WHEELTA_REGISTRY.tools
     }
+    return world
+
+
+def add_fake_tavily(world: FakeWorld) -> FakeWorld:
+    """A fake Tavily server (ADR-0058) listing every registered tool. Search answers from
+    `world.web_results` by query; extract returns a page for every URL; the excluded tools
+    must never be reached."""
+    from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
+
+    def search(args: dict[str, Any]) -> dict[str, Any]:
+        query = str(args.get("query"))
+        return _text({"query": query, "results": world.web_results.get(query, [])})
+
+    def extract(args: dict[str, Any]) -> dict[str, Any]:
+        pages = [{"url": u, "raw_content": "fetched page"} for u in args.get("urls", [])]
+        return _text({"results": pages, "failed_results": []})
+
+    def excluded(args: dict[str, Any]) -> dict[str, Any]:
+        raise AssertionError("an excluded Tavily tool reached the fake server")
+
+    world.handlers["tavily"] = {t.name: excluded for t in TAVILY_REGISTRY.tools}
+    world.handlers["tavily"] |= {"tavily_search": search, "tavily_extract": extract}
     return world
 
 

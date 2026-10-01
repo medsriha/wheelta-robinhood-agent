@@ -21,6 +21,7 @@ from wheelta_robinhood_agent.domain.base import (
     require_unique,
 )
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AppEnv,
     AuditCheck,
     AuditOutcome,
@@ -33,18 +34,20 @@ from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
 
 
 class RunIdentity(DomainModel):
-    """`run_id` is deterministic from `(environment, slot)`; slot is a whole 5-minute UTC slot."""
+    """`run_id` is deterministic from `(environment, slot, agent)`; slot is a whole 5-minute
+    UTC slot (ADR-0057: `agent` is WHEEL for runs of earlier releases)."""
 
     run_id: UUID
     environment: AppEnv
     slot: UtcDatetime
+    agent: AgentRole = AgentRole.WHEEL
 
     @model_validator(mode="after")
     def _check_identity(self) -> Self:
         if self.slot != slot_for(self.slot):
             raise ValueError("slot must be a whole 5-minute UTC slot")
-        if self.run_id != run_id_for(self.environment, self.slot):
-            raise ValueError("run_id does not match (environment, slot)")
+        if self.run_id != run_id_for(self.environment, self.slot, self.agent):
+            raise ValueError("run_id does not match (environment, slot, agent)")
         return self
 
 

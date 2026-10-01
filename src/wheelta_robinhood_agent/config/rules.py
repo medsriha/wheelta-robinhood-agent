@@ -21,6 +21,7 @@ from pydantic import (
     StrictInt,
     StrictStr,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -264,6 +265,22 @@ class Scheduling(_Section):
         return self
 
 
+class Sessions(_Section):
+    """When each agent of a due tick starts (ADR-0057), applied by trusted code before the
+    model connects (`domain/start_conditions.py`). A fixed decimal string: no marker, since
+    every sell run needs it."""
+
+    notes: Notes = ()
+    sell_min_settled_cash_usd: Decimal = Field(ge=0)
+
+    @field_validator("sell_min_settled_cash_usd", mode="before")
+    @classmethod
+    def _decimal_string(cls, value: object) -> object:
+        if isinstance(value, str) and _DECIMAL_RE.fullmatch(value):
+            return Decimal(value)
+        raise ValueError(f"sell_min_settled_cash_usd must be a decimal string, got {value!r}")
+
+
 class Freshness(_Section):
     notes: Notes = ()
     # ADR-0054: discovery screening only; no code reads it (facts and orders keep the
@@ -328,6 +345,7 @@ class TradingRules(_Section):
     workspace: Workspace
     mignons: Mignons
     scheduling: Scheduling
+    sessions: Sessions
     data_quality: DataQuality
 
 

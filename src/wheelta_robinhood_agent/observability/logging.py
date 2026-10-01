@@ -107,6 +107,7 @@ def settings_secrets(settings: Settings) -> tuple[SecretStr, ...]:
         settings.ROBINHOOD_MCP_ACCESS_TOKEN,
         settings.ROBINHOOD_TOKEN_ENCRYPTION_KEY,
         settings.WHEELTA_MCP_TOKEN,
+        settings.TAVILY_API_KEY,
         settings.DATABASE_URL,
         settings.HEARTBEAT_URL,
         settings.ALERT_WEBHOOK_URL,

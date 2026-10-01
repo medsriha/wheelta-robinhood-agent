@@ -24,7 +24,7 @@ def _patch(old: str, new: str) -> bytes:
 
 def test_real_file_loads() -> None:
     loaded = load_rules()
-    assert loaded.version == loaded.rules.meta.version == 14
+    assert loaded.version == loaded.rules.meta.version == 15
     assert len(loaded.sha256) == 64
     r = loaded.rules
     assert r.limits.max_contracts_per_order == 10
@@ -34,7 +34,8 @@ def test_real_file_loads() -> None:
     assert isinstance(r.filters.min_abs_delta, Decimal)
     assert r.scope.leveraged_inverse_etfs_allowed is False
     assert [rule.id for rule in r.management.rules] == [1, 2, 3, 4, 5, 6, 7]
-    assert r.meta.signed_off_on == "2026-09-30" and r.meta.adr == "ADR-0054"
+    assert r.meta.signed_off_on == "2026-09-30" and r.meta.adr == "ADR-0057"
+    assert r.sessions.sell_min_settled_cash_usd == Decimal("1000.00")
     assert r.selection.max_discovery_rounds == 3 and len(r.selection.discovery) == 5
     assert r.filters.min_annualized_yield_ratio == Decimal("0.25")
     assert r.filters.min_cushion_ratio == Decimal("0.04")
@@ -101,7 +102,12 @@ def test_tbd_loads_as_unset() -> None:
             'underlying_denylist = ["brk.b"]',
             "scope.underlying_denylist",
         ),
-        ("version = 14", 'version = "14"', "meta.version"),
+        ("version = 15", 'version = "15"', "meta.version"),
+        (
+            'sell_min_settled_cash_usd = "1000.00"',
+            "sell_min_settled_cash_usd = 1000",
+            "sessions.sell_min_settled_cash_usd",
+        ),
         (
             "fallback_next_run_minutes = 60",
             "fallback_next_run_minutes = 0",

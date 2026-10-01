@@ -50,3 +50,20 @@ def test_railway_cron_ticks_once_per_slot() -> None:
     config = (Path(__file__).resolve().parents[2] / ".railway" / "railway.py").read_text()
     match = re.search(r'^CRON_SCHEDULE = "\*/(\d+) ', config, re.M)
     assert match is not None and int(match.group(1)) == SLOT_MINUTES
+
+
+def test_each_agent_of_a_tick_has_its_own_run_id() -> None:
+    """ADR-0057: the close and sell runs of a slot differ; the legacy agent keeps its id."""
+    import uuid
+
+    from wheelta_robinhood_agent.domain.enums import AgentRole
+    from wheelta_robinhood_agent.domain.run_identity import RUN_ID_NAMESPACE
+
+    slot = datetime(2026, 9, 25, 15, 5, tzinfo=UTC)
+    legacy = run_id_for(AppEnv.PRODUCTION, slot)
+    close = run_id_for(AppEnv.PRODUCTION, slot, AgentRole.CLOSE)
+    sell = run_id_for(AppEnv.PRODUCTION, slot, AgentRole.SELL)
+    assert len({legacy, close, sell}) == 3
+    assert legacy == run_id_for(AppEnv.PRODUCTION, slot, AgentRole.WHEEL)
+    assert legacy == uuid.uuid5(RUN_ID_NAMESPACE, f"production:{slot.isoformat()}")
+    assert close == uuid.uuid5(RUN_ID_NAMESPACE, f"production:{slot.isoformat()}:close")

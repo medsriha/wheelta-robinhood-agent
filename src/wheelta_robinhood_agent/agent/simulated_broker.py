@@ -27,10 +27,12 @@ without any order reaching Robinhood:
   the broker's `cash` nets short-put collateral is unverified, and the facts service already
   treats CSP reserved cash as unavailable while any short put is held.
 
-State lives only in this object, for one session: nothing carries over to another run (owner
-decisions 2026-09-28 and 2026-09-29). The ledger records every call, and `BrokerLedger`
-records the simulated orders, fills, and lineages under a per-run scope
-(`simulated_scope_id`), never the account's own scope.
+State lives only in memory, in a `SimulatedState` (owner decisions 2026-09-28 and
+2026-09-29). ADR-0057: one state serves the two runs of a dry-run tick (Buy-to-Close, then
+Sell Options), so the second sees the first's fills; nothing carries over to another tick.
+The ledger records every call, and `BrokerLedger` records the simulated orders, fills, and
+lineages under a simulated scope (`simulated_scope_id`, one per tick: the close run's id),
+never the account's own scope.
 
 Responses follow the captured output schemas
 (`tests/fixtures/robinhood/output_schemas_orders_2026-09-28.json`) so they pass the same
@@ -83,12 +85,14 @@ __all__ = [
     "SIMULATED_SCOPE_PREFIX",
     "InstrumentLookup",
     "SimulatedBroker",
+    "SimulatedState",
     "simulated_scope_id",
 ]
 
 
 def simulated_scope_id(run_id: uuid.UUID) -> str:
-    """The ledger account scope of one dry run's simulated orders (never a real account's)."""
+    """The ledger account scope of one dry-run tick's simulated orders (never a real
+    account's). ADR-0057: `run_id` is the tick's first run, shared by both of its runs."""
     return f"{SIMULATED_SCOPE_PREFIX}{run_id}"
 
 
@@ -148,6 +152,26 @@ class _Request:
 
 
 @dataclass
+class SimulatedState:
+    """What the simulated broker has done. ADR-0057: one object serves both runs of a dry-run
+    tick, so the Sell Options agent's reads see the Buy-to-Close agent's simulated fills."""
+
+    # Simulated orders by id, oldest first, in the broker's order JSON shape.
+    orders: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
+    # place ref_id -> simulated order id (the tool's idempotency key).
+    ref_ids: dict[str, str] = field(default_factory=dict)
+    # Real orders a read showed working, and those cancelled in simulation.
+    real_working: set[str] = field(default_factory=set)
+    real_cancelled: dict[str, str] = field(default_factory=dict)
+    # ADR-0046: net short contracts the simulated fills added (+) or closed (-), by option
+    # id, and the instrument each names.
+    short_delta: dict[str, int] = field(default_factory=dict)
+    filled_instruments: dict[str, OptionInstrument] = field(default_factory=dict)
+    # Short quantity per option id in the latest real positions read.
+    real_short: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class SimulatedBroker:
     """`McpUpstream` for the Robinhood proxy in a simulated-venue dry run (module docstring)."""
 
@@ -156,19 +180,8 @@ class SimulatedBroker:
     instruments: InstrumentLookup
     clock: Callable[[], datetime]
     id_factory: Callable[[], uuid.UUID] = uuid.uuid4
-    # Simulated orders by id, oldest first, in the broker's order JSON shape.
-    _orders: dict[str, dict[str, JsonValue]] = field(default_factory=dict)
-    # place ref_id -> simulated order id (the tool's idempotency key).
-    _ref_ids: dict[str, str] = field(default_factory=dict)
-    # Real orders a read showed working this run, and those cancelled in simulation.
-    _real_working: set[str] = field(default_factory=set)
-    _real_cancelled: dict[str, str] = field(default_factory=dict)
-    # ADR-0046: net short contracts this run's fills added (+) or closed (-), by option id,
-    # and the instrument each names.
-    _short_delta: dict[str, int] = field(default_factory=dict)
-    _filled_instruments: dict[str, OptionInstrument] = field(default_factory=dict)
-    # Short quantity per option id in the latest real positions read this run.
-    _real_short: dict[str, int] = field(default_factory=dict)
+    # ADR-0057: shared by the close and sell runs of one dry-run tick.
+    state: SimulatedState = field(default_factory=SimulatedState)
 
     def __post_init__(self) -> None:
         if self.upstream.server != self.registry.server:
@@ -281,8 +294,8 @@ class SimulatedBroker:
     def _place(self, arguments: Mapping[str, Any]) -> dict[str, JsonValue]:
         req = self._request(arguments)
         ref_id = _text(arguments.get("ref_id"))
-        if ref_id is not None and ref_id in self._ref_ids:
-            return {"data": {"order": dict(self._orders[self._ref_ids[ref_id]])}}
+        if ref_id is not None and ref_id in self.state.ref_ids:
+            return {"data": {"order": dict(self.state.orders[self.state.ref_ids[ref_id]])}}
         opening = req.leg.side == "sell" and req.leg.position_effect == "open"
         closing = req.leg.side == "buy" and req.leg.position_effect == "close"
         if not (opening or closing):
@@ -334,17 +347,17 @@ class SimulatedBroker:
                 }
             ],
         }
-        self._orders[order_id] = order
+        self.state.orders[order_id] = order
         if ref_id is not None:
-            self._ref_ids[ref_id] = order_id
+            self.state.ref_ids[ref_id] = order_id
         change = req.quantity if opening else -req.quantity
-        self._short_delta[option_id] = self._short_delta.get(option_id, 0) + change
-        self._filled_instruments[option_id] = req.instrument
+        self.state.short_delta[option_id] = self.state.short_delta.get(option_id, 0) + change
+        self.state.filled_instruments[option_id] = req.instrument
         return {"data": {"order": dict(order)}}
 
     def _short_held(self, option_id: str) -> int:
         """Short contracts known this run: the latest real read plus this run's fills."""
-        return self._real_short.get(option_id, 0) + self._short_delta.get(option_id, 0)
+        return self.state.real_short.get(option_id, 0) + self.state.short_delta.get(option_id, 0)
 
     def _cancel(self, arguments: Mapping[str, Any]) -> dict[str, JsonValue]:
         if _text(arguments.get("account_number")) is None:
@@ -353,7 +366,7 @@ class SimulatedBroker:
         if order_id is None:
             raise _Refused("order_id is required")
         now = self.clock().isoformat()
-        order = self._orders.get(order_id)
+        order = self.state.orders.get(order_id)
         if order is not None:
             if order["state"] not in _WORKING:
                 raise _Refused("the order is not open")  # every simulated order is filled
@@ -366,8 +379,8 @@ class SimulatedBroker:
                 last_transaction_at=now,
                 is_replaceable=False,
             )
-        elif order_id in self._real_working and order_id not in self._real_cancelled:
-            self._real_cancelled[order_id] = now
+        elif order_id in self.state.real_working and order_id not in self.state.real_cancelled:
+            self.state.real_cancelled[order_id] = now
         else:
             raise _Refused("no open order with this order_id")
         return {"data": {"accepted": True}}
@@ -405,8 +418,8 @@ class SimulatedBroker:
         if not isinstance(order_id, str):
             return order
         if order.get("state") in _WORKING:
-            self._real_working.add(order_id)
-        when = self._real_cancelled.get(order_id)
+            self.state.real_working.add(order_id)
+        when = self.state.real_cancelled.get(order_id)
         if when is None or order.get("state") not in _WORKING:
             return order
         return {
@@ -436,7 +449,7 @@ class SimulatedBroker:
             return result
         real = [self._observe_real(o) if isinstance(o, dict) else o for o in listed or []]
         simulated: list[JsonValue] = [
-            dict(o) for o in reversed(self._orders.values()) if self._matches(o, arguments)
+            dict(o) for o in reversed(self.state.orders.values()) if self._matches(o, arguments)
         ]
         if not simulated and real == (listed or []):
             return result
@@ -444,7 +457,7 @@ class SimulatedBroker:
         return _result({**payload, "data": {**data, "orders": orders}})
 
     def _new_short_row(self, option_id: str, quantity: int) -> dict[str, JsonValue]:
-        instrument = self._filled_instruments[option_id]
+        instrument = self.state.filled_instruments[option_id]
         occ = instrument.occ_symbol
         return {
             "option_id": option_id,
@@ -481,8 +494,8 @@ class SimulatedBroker:
             seen.add(option_id)
             real = _count(row.get("quantity")) if row.get("type") == "short" else None
             if real is not None:
-                self._real_short[option_id] = real
-            delta = self._short_delta.get(option_id, 0)
+                self.state.real_short[option_id] = real
+            delta = self.state.short_delta.get(option_id, 0)
             if delta == 0 or real is None:
                 rows.append(row)
                 continue
@@ -490,7 +503,7 @@ class SimulatedBroker:
         first_page = not arguments.get(_CURSOR)
         added = [
             self._new_short_row(option_id, delta)
-            for option_id, delta in self._short_delta.items()
+            for option_id, delta in self.state.short_delta.items()
             if first_page and delta > 0 and option_id not in seen
         ]
         if not added and rows == (listed or []):

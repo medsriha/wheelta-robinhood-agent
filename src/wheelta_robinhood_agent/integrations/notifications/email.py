@@ -5,7 +5,8 @@
 call falls back to the facts-only body, and a failed send returns a typed result the caller
 records. Emails are informational and never affect run status or the exit code.
 
-Resend requests carry an Idempotency-Key (`run-summary/<env>/<run_id>`), so retrying a
+ADR-0057: one email per tick covers both agent runs of the slot. Resend requests carry an
+Idempotency-Key (`run-summary/<env>/<slot>`), so retrying a
 transport error, 5xx or 429 cannot send a second copy. The API key, the recipient and the
 response body are never logged or returned: provider validation errors can echo recipients.
 """
@@ -29,11 +30,11 @@ from wheelta_robinhood_agent.integrations.notifications.delivery import (
 from wheelta_robinhood_agent.integrations.notifications.summarizer import write_run_summary
 from wheelta_robinhood_agent.observability.redaction import Redactor
 from wheelta_robinhood_agent.observability.run_summary import (
-    RunSummaryInput,
-    build_subject,
+    SlotSummaryInput,
+    build_slot_subject,
     render_bodies,
-    render_facts_text,
-    summary_facts,
+    render_slot_facts_text,
+    slot_summary_facts,
 )
 
 _log = logging.getLogger(__name__)
@@ -186,26 +187,26 @@ class RunSummaryEmailConfig:
     send_timeout_seconds: float = 10.0
 
 
-def idempotency_key_for(summary: RunSummaryInput) -> str:
-    return f"run-summary/{summary.environment.value}/{summary.run_id}"
+def idempotency_key_for(summary: SlotSummaryInput) -> str:
+    return f"run-summary/{summary.environment.value}/{summary.slot.isoformat()}"
 
 
 def send_run_summary(
-    summary: RunSummaryInput,
+    summary: SlotSummaryInput,
     *,
     config: RunSummaryEmailConfig,
     client: httpx.Client,
     redactor: Redactor,
     sleep: Callable[[float], None] = time.sleep,
 ) -> EmailDeliveryResult:
-    """Write, compose and send one run's summary email. Never raises."""
+    """Write, compose and send one tick's summary email. Never raises."""
     if not config.enabled or config.resend_api_key is None or config.to_address is None:
         return EmailDeliveryResult(status=EmailDeliveryStatus.SKIPPED)
     try:
-        subject = redactor.redact_text(build_subject(summary))
-        facts_text = render_facts_text(summary, redactor)
+        subject = redactor.redact_text(build_slot_subject(summary))
+        facts_text = render_slot_facts_text(summary, redactor)
         prose = write_run_summary(
-            summary_facts(summary, redactor),
+            slot_summary_facts(summary, redactor),
             client=client,
             api_key=config.anthropic_api_key,
             model=config.model,

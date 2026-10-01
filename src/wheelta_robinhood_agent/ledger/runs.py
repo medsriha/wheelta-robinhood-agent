@@ -1,7 +1,8 @@
 """Run identity, run events, and the run-status projection (CLAUDE.md §15, INTERFACES.md).
 
-A run is one row per (environment, slot) with a deterministic run_id. Status is never stored
-on that row: it is the latest `status` event. Slot classification:
+A run is one row per (environment, slot, agent) with a deterministic run_id (ADR-0057: a due
+tick runs the close agent, then the sell agent; rows of earlier releases are agent `wheel`).
+Status is never stored on that row: it is the latest `status` event. Slot classification:
 
 - NEW: this call inserted the identity row.
 - COMPLETED: the latest status event is a finalizing status. The caller no-ops.
@@ -23,7 +24,7 @@ from typing import Final
 
 import psycopg
 
-from wheelta_robinhood_agent.domain.enums import AppEnv, RunStatus
+from wheelta_robinhood_agent.domain.enums import AgentRole, AppEnv, RunStatus
 from wheelta_robinhood_agent.domain.events import RunEventType
 from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
 from wheelta_robinhood_agent.ledger.errors import IdentityConflict, LedgerError, UnknownEntity
@@ -46,6 +47,7 @@ class RunSlot:
     slot: datetime
     state: SlotState
     current_status: RunStatus | None
+    agent: AgentRole = AgentRole.WHEEL
 
 
 @dataclass(frozen=True)
@@ -59,35 +61,40 @@ class RunProjection:
 
 
 def open_run_slot(
-    conn: psycopg.Connection[tuple[object, ...]], environment: AppEnv, slot: datetime
+    conn: psycopg.Connection[tuple[object, ...]],
+    environment: AppEnv,
+    slot: datetime,
+    agent: AgentRole = AgentRole.WHEEL,
 ) -> RunSlot:
-    """Create or get the run identity for (environment, slot) and classify the slot.
+    """Create or get the run identity for (environment, slot, agent) and classify it.
 
     Call only while holding the single-flight lock (lock.py). Raises ValueError if `slot` is
     not a whole 5-minute UTC slot and IdentityConflict if a stored row has a different run_id.
     """
     if slot != slot_for(slot):
         raise ValueError(f"slot must be a whole 5-minute UTC slot, got {slot.isoformat()}")
-    run_id = run_id_for(environment, slot)
+    run_id = run_id_for(environment, slot, agent)
     with conn.transaction():
         inserted = conn.execute(
-            "INSERT INTO runs (run_id, environment, slot) VALUES (%s, %s, %s) "
-            "ON CONFLICT (environment, slot) DO NOTHING RETURNING run_id",
-            (run_id, environment.value, slot),
+            "INSERT INTO runs (run_id, environment, slot, agent) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (environment, slot, agent) DO NOTHING RETURNING run_id",
+            (run_id, environment.value, slot, agent.value),
         ).fetchone()
         if inserted is not None:
-            return RunSlot(run_id, environment, slot, SlotState.NEW, None)
+            return RunSlot(run_id, environment, slot, SlotState.NEW, None, agent)
         stored = conn.execute(
-            "SELECT run_id FROM runs WHERE environment = %s AND slot = %s",
-            (environment.value, slot),
+            "SELECT run_id FROM runs WHERE environment = %s AND slot = %s AND agent = %s",
+            (environment.value, slot, agent.value),
         ).fetchone()
     if stored is None:
         raise LedgerError("run row vanished after a unique conflict")
     if as_uuid(stored[0]) != run_id:
-        raise IdentityConflict(f"stored run_id for {environment.value} {slot.isoformat()} differs")
+        raise IdentityConflict(
+            f"stored run_id for {environment.value} {slot.isoformat()} {agent.value} differs"
+        )
     status = current_run_status(conn, run_id)
     state = SlotState.COMPLETED if status in FINAL_STATUSES else SlotState.INTERRUPTED
-    return RunSlot(run_id, environment, slot, state, status)
+    return RunSlot(run_id, environment, slot, state, status, agent)
 
 
 def append_run_event(
@@ -173,19 +180,45 @@ def run_event_payloads(
 def latest_next_run_not_before(
     conn: psycopg.Connection[tuple[object, ...]], environment: AppEnv
 ) -> datetime | None:
-    """The `not_before` of the environment's latest `schedule` event (ADR-0028), or None if
-    no run has recorded one. Latest means the newest slot, then the highest sequence within
-    it (a run's agent choice follows its fallback). Raises LedgerError on a malformed payload.
+    """When the next session may start (ADR-0028, ADR-0057), or None if no run has recorded
+    a `schedule` event.
+
+    Only the newest slot with a schedule event counts. Within it, the earliest agent-chosen
+    `not_before` wins (the close and sell agents may each request one); with none, the
+    slot's fallback (the latest fallback event) stands. Raises LedgerError on a malformed
+    payload.
     """
-    row = conn.execute(
+    rows = conn.execute(
         "SELECT e.payload FROM run_events e JOIN runs r ON r.run_id = e.run_id "
-        "WHERE r.environment = %s AND e.event_type = %s "
-        "ORDER BY r.slot DESC, e.sequence DESC LIMIT 1",
-        (environment.value, RunEventType.SCHEDULE.value),
-    ).fetchone()
-    if row is None:
+        "WHERE r.environment = %s AND e.event_type = %s AND r.slot = ("
+        "  SELECT max(r2.slot) FROM run_events e2 JOIN runs r2 ON r2.run_id = e2.run_id "
+        "  WHERE r2.environment = %s AND e2.event_type = %s) "
+        "ORDER BY e.sequence",
+        (
+            environment.value,
+            RunEventType.SCHEDULE.value,
+            environment.value,
+            RunEventType.SCHEDULE.value,
+        ),
+    ).fetchall()
+    if not rows:
         return None
-    payload = row[0]
+    agent_times: list[datetime] = []
+    fallback: datetime | None = None
+    for (payload,) in rows:
+        not_before = _not_before(payload)
+        if isinstance(payload, dict) and payload.get("source") == AGENT_SCHEDULE_SOURCE:
+            agent_times.append(not_before)
+        else:
+            fallback = not_before
+    return min(agent_times) if agent_times else fallback
+
+
+# orchestrator/schedule.py ScheduleSource.AGENT (the ledger does not import the orchestrator).
+AGENT_SCHEDULE_SOURCE: Final = "agent"
+
+
+def _not_before(payload: object) -> datetime:
     raw = payload.get("not_before") if isinstance(payload, dict) else None
     if not isinstance(raw, str):
         raise LedgerError("schedule event has no not_before")

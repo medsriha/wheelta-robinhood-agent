@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import JsonValue
+from pydantic import JsonValue, SecretStr
 from test_hooks import (
     ACCOUNT,
     BOARD,
@@ -29,16 +29,20 @@ from test_hooks import (
     denied_reason,
     drive,
     make_deps,
+    wire,
 )
 
 from wheelta_robinhood_agent.agent.account_scope import NOT_SCOPED
 from wheelta_robinhood_agent.agent.hooks import EnvelopeKind, last_assistant_text
 from wheelta_robinhood_agent.agent.local_server import LOCAL_REGISTRY
 from wheelta_robinhood_agent.agent.mignons import MignonLimits
+from wheelta_robinhood_agent.agent.result_boundary import BoundaryValidator
 from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
+from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
+from wheelta_robinhood_agent.observability.redaction import Redactor
 
 LIMITS = MignonLimits(max_per_run=8, max_concurrent=4, max_turns_per_mignon=40)
 MARKET_ID, COMPANY_ID = "a-market-1", "a-company-1"
@@ -49,6 +53,7 @@ COMPANY = {"agent_id": COMPANY_ID, "agent_type": COMPANY_T}
 SPAWN = {"description": "screen", "prompt": "Screen AAPL puts.", "subagent_type": MARKET_T}
 EVIDENCE, CANDIDATE = "evidence:e-1", "candidate:c-1"
 URL = "https://investor.example.com/q3"
+SEARCH, EXTRACT = "mcp__tavily__tavily_search", "mcp__tavily__tavily_extract"
 
 
 class RefValidator:
@@ -72,7 +77,9 @@ class RefValidator:
 
 def session(**overrides: Any) -> Session:
     overrides.setdefault("mignon_limits", LIMITS)
-    overrides.setdefault("registries", (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, LOCAL_REGISTRY))
+    overrides.setdefault(
+        "registries", (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, TAVILY_REGISTRY, LOCAL_REGISTRY)
+    )
     overrides.setdefault("account_scope_table", {**SCOPE, "get_financials": NOT_SCOPED})
     overrides.setdefault("validator", RefValidator())
     return Session(make_deps(**overrides))
@@ -127,9 +134,7 @@ def assert_ok(out: Any) -> None:
 # ---- role scoping ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "tool", ["WebSearch", "WebFetch", BOARD, "mcp__wra_local__web_cache_lookup"]
-)
+@pytest.mark.parametrize("tool", [SEARCH, EXTRACT, BOARD, "mcp__wra_local__web_cache_lookup"])
 def test_orchestrator_cannot_research_directly(tool: str) -> None:
     s = session()
     assert_denied(s, s.pre(tool, {"query": "AAPL"}), "not available to the orchestrator")
@@ -159,9 +164,10 @@ def test_mignon_never_gets_order_or_workspace_tools_even_live() -> None:
 
 def test_mignon_types_have_their_own_tools() -> None:
     s = session()
-    assert_denied(s, s.pre("WebSearch", {"query": "q"}, **MARKET), "mignon-market")
+    assert_denied(s, s.pre(SEARCH, {"query": "q"}, **MARKET), "mignon-market")
     s2 = session()
-    assert_allowed(s2, s2.pre("WebSearch", {"query": "q"}, **COMPANY))
+    out = s2.pre(SEARCH, {"query": "q"}, **COMPANY)
+    assert denied_reason(out) is None and "updatedInput" in out["hookSpecificOutput"]
 
 
 def test_mignon_call_is_attributed_when_recorded() -> None:
@@ -346,70 +352,107 @@ def test_ref_handed_over_in_the_task_is_citable() -> None:
     assert envelope["kind"] == "validated"
 
 
-def test_a_number_from_a_fetched_page_is_kept_and_labelled_web_sourced() -> None:
-    """ADR-0056: the 2026-09-30 election date, cited to a fetched article, now survives."""
-    s = session()
-    spawn = {**SPAWN, "subagent_type": COMPANY_T}
-    assert_ok(s.pre("Agent", spawn, use_id="toolu_agent"))
-    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
-    s.post("WebFetch", {"url": URL, "code": 200, "result": "page"}, use_id="toolu_f")
-    text = report(finding("The first round is on October 4, 2026.", urls=[URL]))
+def web_session(**overrides: Any) -> Session:
+    """A session whose results go through the real result boundary (ADR-0058)."""
+    redactor = Redactor(account_number=SecretStr(ACCOUNT))
+    return session(validator=BoundaryValidator(redactor=redactor), redactor=redactor, **overrides)
+
+
+def spawn_company(s: Session) -> None:
+    assert_ok(s.pre("Agent", {**SPAWN, "subagent_type": COMPANY_T}, use_id="toolu_agent"))
+
+
+def extract(
+    s: Session,
+    urls: list[str],
+    *,
+    ok: list[str] | None = None,
+    failed: list[str] | None = None,
+    agent: dict[str, str] = COMPANY,
+    use_id: str = "toolu_f",
+) -> Any:
+    """One tavily_extract by `agent`; Tavily returns content for `ok` (default: every URL)."""
+    assert_ok(s.pre(EXTRACT, {"urls": urls, "query": "q"}, use_id=use_id, **agent))
+    payload = {
+        "results": [{"url": u, "raw_content": "page text"} for u in (urls if ok is None else ok)],
+        "failed_results": [{"url": u, "error": "Pay via x402 to continue"} for u in failed or []],
+    }
+    return s.post(EXTRACT, {"structuredContent": payload, "content": []}, use_id=use_id)
+
+
+def cite(s: Session, url: str, claim: str = "The first round is on October 4, 2026.") -> Any:
+    text = report(finding(claim, urls=[url]))
     out = s.post("Agent", agent_response(text, COMPANY_ID, COMPANY_T), use_id="toolu_agent")
-    envelope = delivered_envelope(out)
+    return delivered_envelope(out)
+
+
+def test_a_number_from_an_extracted_page_is_kept_and_labelled_web_sourced() -> None:
+    """ADR-0056: the 2026-09-30 election date, cited to an extracted article, survives."""
+    s = web_session()
+    spawn_company(s)
+    out = extract(s, [URL])
+    delivered = wire(out["hookSpecificOutput"]["updatedToolOutput"])
+    assert delivered["kind"] == "validated" and delivered["data"]["untrusted_web_content"]
+    envelope = cite(s, URL)
     assert envelope["kind"] == "validated"
     assert envelope["data"]["web_sourced_findings"] == [0]
     assert envelope["data"]["dropped_findings"] == []
 
 
-@pytest.mark.parametrize("code", [403, 404, 500, "403", None])
-def test_a_refused_fetch_is_failed_uncached_and_not_citable(code: Any) -> None:
-    """ADR-0056: a non-2xx WebFetch delivered no page: recorded failed, never captured into the
-    web cache, never a fetched URL, and the session continues."""
-    captured: list[Any] = []
-    s = session(web_capture=lambda *args: captured.append(args))
-    spawn = {**SPAWN, "subagent_type": COMPANY_T}
-    assert_ok(s.pre("Agent", spawn, use_id="toolu_agent"))
-    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
-    out = s.post("WebFetch", {"url": URL, "code": code, "bytes": 0, "result": ""}, use_id="toolu_f")
-    assert "continue_" not in out and not s.deps.run_control.stop_requested
-    outcome = [kw for n, kw in s.rec.events if n == "outcome"][-1]
-    assert outcome["status"] is ToolCallStatus.FAILED and f"HTTP {code}" in outcome["reason"]
-    assert captured == []
-    text = report(finding("Page says so.", urls=[URL]))
-    out = s.post("Agent", agent_response(text, COMPANY_ID, COMPANY_T), use_id="toolu_agent")
-    reasons = delivered_envelope(out)["data"]["dropped_findings"][0]["reasons"]
+def test_a_url_tavily_returned_no_content_for_is_not_citable() -> None:
+    """ADR-0056/0058: a failed URL is not a source, and Tavily's error text is not delivered."""
+    s = web_session()
+    spawn_company(s)
+    out = extract(s, [URL], ok=[], failed=[URL])
+    delivered = wire(out["hookSpecificOutput"]["updatedToolOutput"])
+    assert delivered["data"]["failed_urls"] == [URL]
+    assert "x402" not in json.dumps(delivered)
+    reasons = cite(s, URL)["data"]["dropped_findings"][0]["reasons"]
     assert any("not fetched" in r for r in reasons)
 
 
-def test_a_refused_or_timed_out_url_is_not_fetched_again_this_run() -> None:
-    """ADR-0056: by any Mignon, after a non-2xx result or a failed (timed-out) call."""
-    from wheelta_robinhood_agent.agent.hooks import REFUSED_FETCH_DENIAL
+def test_a_search_result_is_a_lead_not_a_source() -> None:
+    s = web_session()
+    spawn_company(s)
+    assert_ok(s.pre(SEARCH, {"query": "AAPL election"}, use_id="toolu_s", **COMPANY))
+    result = {"query": "q", "results": [{"url": URL, "content": "October 4", "score": 0.9}]}
+    s.post(SEARCH, {"structuredContent": result, "content": []}, use_id="toolu_s")
+    reasons = cite(s, URL)["data"]["dropped_findings"][0]["reasons"]
+    assert any("not fetched" in r for r in reasons)
 
-    s = session()
-    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
-    s.post("WebFetch", {"url": URL, "code": 403, "bytes": 0, "result": ""}, use_id="toolu_f")
-    out = s.pre("WebFetch", {"url": URL, "prompt": "again"}, use_id="toolu_g", **COMPANY)
-    assert denied_reason(out) == REFUSED_FETCH_DENIAL
+
+def test_a_failed_or_timed_out_url_is_not_extracted_again_this_run() -> None:
+    """ADR-0056: by any Mignon, after no content, a failed call, or a cap notice."""
+    s = web_session()
+    extract(s, [URL], ok=[], failed=[URL])
+    out = s.pre(EXTRACT, {"urls": [URL]}, use_id="toolu_g", **COMPANY)
+    assert URL in (denied_reason(out) or "") and "not extracted again" in (denied_reason(out) or "")
     slow = "https://slow.example.com/page"
-    assert_ok(s.pre("WebFetch", {"url": slow, "prompt": "q"}, use_id="toolu_h", **COMPANY))
-    s.fail("WebFetch", use_id="toolu_h", error="timeout of 60000ms exceeded")
+    assert_ok(s.pre(EXTRACT, {"urls": [slow]}, use_id="toolu_h", **COMPANY))
+    s.fail(EXTRACT, use_id="toolu_h", error="timeout of 60000ms exceeded")
     other = {"agent_id": "a-company-2", "agent_type": COMPANY_T}
-    out = s.pre("WebFetch", {"url": slow, "prompt": "q"}, use_id="toolu_i", **other)
-    assert denied_reason(out) == REFUSED_FETCH_DENIAL
+    out = s.pre(EXTRACT, {"urls": [slow]}, use_id="toolu_i", **other)
+    assert "not extracted again" in (denied_reason(out) or "")
+    capped = "https://capped.example.com/page"
+    assert_ok(s.pre(EXTRACT, {"urls": [capped]}, use_id="toolu_j", **COMPANY))
+    notice = {"code": "monthly_cap_reached", "message": "Pay via x402", "next_actions": []}
+    out = s.post(EXTRACT, {"structuredContent": notice, "content": []}, use_id="toolu_j")
+    delivered = wire(out["hookSpecificOutput"]["updatedToolOutput"])
+    assert delivered["kind"] == "missing" and "monthly_cap_reached" in delivered["gaps"][0]
+    assert "x402" not in json.dumps(delivered)
+    out = s.pre(EXTRACT, {"urls": [capped]}, use_id="toolu_k", **other)
+    assert "not extracted again" in (denied_reason(out) or "")
 
 
-def test_a_mignon_may_fetch_a_page_another_mignon_fetched_but_not_repeat_its_own() -> None:
-    """ADR-0056: a fetch is citable only by the Mignon that made it, so the cache does not deny
-    another Mignon's fetch of the same page; a Mignon's own repeat is denied."""
-    from wheelta_robinhood_agent.agent.hooks import REPEAT_FETCH_DENIAL
-
-    s = session(web_precheck=lambda tool, args: "identical fetch recorded")
-    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
-    s.post("WebFetch", {"url": URL, "code": 200, "result": "page"}, use_id="toolu_f")
-    out = s.pre("WebFetch", {"url": URL, "prompt": "again"}, use_id="toolu_g", **COMPANY)
-    assert denied_reason(out) == REPEAT_FETCH_DENIAL
+def test_a_mignon_may_extract_a_page_another_mignon_extracted_but_not_repeat_its_own() -> None:
+    """ADR-0056: a page is citable only by the Mignon that extracted it, so the cache does not
+    deny another Mignon's extract of the same page; a Mignon's own repeat is denied."""
+    s = web_session(web_precheck=lambda tool, args: "identical fetch recorded")
+    extract(s, [URL])
+    out = s.pre(EXTRACT, {"urls": [URL]}, use_id="toolu_g", **COMPANY)
+    assert "already extracted" in (denied_reason(out) or "")
     other = {"agent_id": "a-company-2", "agent_type": COMPANY_T}
-    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_h", **other))
+    assert_ok(s.pre(EXTRACT, {"urls": [URL]}, use_id="toolu_h", **other))
 
 
 def test_review_and_delivery_agree_on_refs_handed_over_in_the_task(tmp_path: Path) -> None:
@@ -455,15 +498,16 @@ def test_dropped_reasons_never_echo_the_mignons_text() -> None:
         assert echoed not in dumped
 
 
-def test_fetched_url_is_citable_by_the_mignon_that_fetched_it() -> None:
-    s = session()
-    spawn = {**SPAWN, "subagent_type": COMPANY_T}
-    assert_ok(s.pre("Agent", spawn, use_id="toolu_agent"))
-    assert_ok(s.pre("WebFetch", {"url": URL, "prompt": "q"}, use_id="toolu_f", **COMPANY))
-    s.post("WebFetch", {"text": "page"}, use_id="toolu_f")
-    text = report(finding("Management reaffirmed guidance.", urls=[URL]))
-    out = s.post("Agent", agent_response(text, COMPANY_ID, COMPANY_T), use_id="toolu_agent")
-    assert delivered_envelope(out)["kind"] == "validated"
+def test_extracted_url_is_citable_by_the_mignon_that_extracted_it() -> None:
+    """Both the requested spelling and the one Tavily returned are citable."""
+    s = web_session()
+    spawn_company(s)
+    asked = "https://Investor.Example.com/q3#guidance"
+    extract(s, [asked], ok=[URL])
+    for url in (asked, URL):
+        envelope = cite(s, url, "Management reaffirmed guidance.")
+        assert envelope["kind"] == "validated" and envelope["data"]["dropped_findings"] == []
+        spawn_company(s)
 
 
 def test_report_from_a_different_mignon_type_is_invalid() -> None:

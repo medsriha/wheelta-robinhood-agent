@@ -15,8 +15,8 @@ three layers (CLAUDE.md §8):
 3. the PreToolUse hook (`agent/hooks.py`): a call is allowed only if its tool is in the
    caller's role, identified by the hook input's `agent_id`/`agent_type`.
 
-Known limit: built-ins a Mignon uses must be in the session's `tools`, so the orchestrator
-also *sees* WebSearch/WebFetch; the hook denies them on the main thread.
+Web research (ADR-0058) is Tavily's `tavily_search`/`tavily_extract` behind the validating
+proxy, for the company and macro Mignons only. The built-in WebSearch/WebFetch are disabled.
 
 Model choice (ADR-0025 amendment): each Mignon type is offered once per model in the owner's
 allowlist (`Settings.mignon_models`), as agent name `<type>--<model id>`
@@ -49,11 +49,16 @@ from wheelta_robinhood_agent.config.rules import TradingRules
 from wheelta_robinhood_agent.config.settings import MODEL_ID_PATTERN
 from wheelta_robinhood_agent.domain.enums import MignonType
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
+from wheelta_robinhood_agent.integrations.websearch.registry import (
+    EXTRACT_TOOL,
+    SEARCH_TOOL,
+)
+from wheelta_robinhood_agent.integrations.websearch.registry import SERVER_NAME as TAVILY
 from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
 
 DELEGATION_TOOL: Final = "Agent"
 AGENT_NAME_SEP: Final = "--"
-WEB_TOOLS: Final = ("WebSearch", "WebFetch")
+WEB_TOOLS: Final = (f"mcp__{TAVILY}__{SEARCH_TOOL}", f"mcp__{TAVILY}__{EXTRACT_TOOL}")
 # Agent tool inputs the hook accepts; `model`, `cwd`, `run_in_background`, `name` etc. are
 # denied so the orchestrator cannot change a Mignon's model, directory, or mode.
 AGENT_INPUT_KEYS: Final = frozenset({"description", "prompt", "subagent_type"})

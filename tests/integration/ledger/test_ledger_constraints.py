@@ -8,7 +8,7 @@ import psycopg
 import pytest
 from pytest_socket import SocketBlockedError
 
-from wheelta_robinhood_agent.domain.enums import AppEnv
+from wheelta_robinhood_agent.domain.enums import AgentRole, AppEnv
 from wheelta_robinhood_agent.ledger.runs import open_run_slot
 
 Conn = psycopg.Connection[tuple[object, ...]]
@@ -21,14 +21,31 @@ def test_tcp_sockets_stay_blocked() -> None:
         socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
 
-def test_run_slot_is_unique_per_environment(conn: Conn) -> None:
+def test_run_slot_is_unique_per_environment_and_agent(conn: Conn) -> None:
     open_run_slot(conn, AppEnv.STAGING, SLOT)
-    with pytest.raises(psycopg.errors.UniqueViolation, match="runs_environment_slot_key"):
+    with pytest.raises(psycopg.errors.UniqueViolation, match="runs_environment_slot_agent_key"):
         conn.execute(
             "INSERT INTO runs (run_id, environment, slot) VALUES (%s, 'staging', %s)",
             (uuid.uuid4(), SLOT),
         )
     open_run_slot(conn, AppEnv.PRODUCTION, SLOT)  # same slot, other environment: allowed
+    # ADR-0057: the close and sell runs of one slot are distinct identities.
+    open_run_slot(conn, AppEnv.STAGING, SLOT, AgentRole.CLOSE)
+    open_run_slot(conn, AppEnv.STAGING, SLOT, AgentRole.SELL)
+    with pytest.raises(psycopg.errors.UniqueViolation, match="runs_environment_slot_agent_key"):
+        conn.execute(
+            "INSERT INTO runs (run_id, environment, slot, agent) "
+            "VALUES (%s, 'staging', %s, 'sell')",
+            (uuid.uuid4(), SLOT),
+        )
+
+
+def test_run_agent_is_a_closed_set(conn: Conn) -> None:
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO runs (run_id, environment, slot, agent) VALUES (%s, 'local', %s, 'x')",
+            (uuid.uuid4(), SLOT),
+        )
 
 
 @pytest.mark.parametrize("minute", [0, 5, 30, 55])

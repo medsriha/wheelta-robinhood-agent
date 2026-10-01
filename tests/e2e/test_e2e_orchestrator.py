@@ -62,10 +62,11 @@ from wheelta_robinhood_agent.agent.session import (
     OUTPUT_REPAIR_DENIAL,
     plan_session,
 )
-from wheelta_robinhood_agent.config.prompts import load_prompt
+from wheelta_robinhood_agent.config.prompts import load_agent_prompts
 from wheelta_robinhood_agent.config.rules import load_rules
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     AppEnv,
     AttemptStatus,
     ExecutionMode,
@@ -92,9 +93,10 @@ from wheelta_robinhood_agent.orchestrator.market_session import (
 )
 
 RULES = load_rules()
-TEMPLATE = load_prompt()
+TEMPLATES = load_agent_prompts()
 ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
 VERIFIED_RH = ROBINHOOD_REGISTRY.model_copy(update={"verified": True})
+TAVILY_SEARCH, TAVILY_EXTRACT = "mcp__tavily__tavily_search", "mcp__tavily__tavily_extract"
 Script = Callable[[FakeModel], Any]
 # Schedule and calendar gates apply to armed live only (ADR-0038), which runs only in
 # production (ADR-0039).
@@ -109,7 +111,10 @@ class Harness:
         self.clis: list[FakeCli] = []
         self.mailer = RecordingMailer()
         self.world = build_world(clock.now)
-        self.run_id = run_id_for(settings.APP_ENV, slot_for(clock.now))
+        # ADR-0057: the fake world holds no short option, so a due tick's close run skips
+        # and the scripted session is the sell run's; `close_id` is the tick's close run.
+        self.run_id = run_id_for(settings.APP_ENV, slot_for(clock.now), AgentRole.SELL)
+        self.close_id = run_id_for(settings.APP_ENV, slot_for(clock.now), AgentRole.CLOSE)
         # Answers output repair turns (ADR-0044); None repeats the previous final text.
         self.followup: Script | None = None
 
@@ -143,24 +148,42 @@ class Harness:
                 and self.settings.APP_ENV is AppEnv.LOCAL
             )
         return run_once(
-            self.settings, RULES, TEMPLATE, self.deps(script, **overrides), run_now=run_now
+            self.settings, RULES, TEMPLATES, self.deps(script, **overrides), run_now=run_now
         )
 
     def conn(self) -> Any:
         return connect(self.settings.DATABASE_URL)
 
-    def status(self) -> RunStatus | None:
+    def _exists(self, run_id: Any) -> bool:
         with self.conn() as c:
-            return run_projection(c, self.run_id).status
+            return (
+                c.execute("SELECT 1 FROM runs WHERE run_id = %s", (run_id,)).fetchone() is not None
+            )
 
-    def events(self, event_type: RunEventType) -> list[dict[str, Any]]:
+    def status(self) -> RunStatus | None:
+        """The sell run's status, or the close run's when the tick ended before a sell run
+        (a slot-gate skip, ADR-0057)."""
+        run_id = self.run_id if self._exists(self.run_id) else self.close_id
         with self.conn() as c:
-            rows = c.execute(
-                "SELECT payload FROM run_events WHERE entity_id = %s AND event_type = %s "
-                "ORDER BY sequence",
-                (self.run_id, event_type.value),
-            ).fetchall()
-        return [r[0] for r in rows]
+            return run_projection(c, run_id).status
+
+    def close_status(self) -> RunStatus | None:
+        with self.conn() as c:
+            return run_projection(c, self.close_id).status
+
+    def events(self, event_type: RunEventType, run_id: Any = None) -> list[dict[str, Any]]:
+        """One run's events, or by default the tick's: the close run's, then the sell run's."""
+        ids = [run_id] if run_id is not None else [self.close_id, self.run_id]
+        out: list[dict[str, Any]] = []
+        with self.conn() as c:
+            for rid in ids:
+                rows = c.execute(
+                    "SELECT payload FROM run_events WHERE entity_id = %s AND event_type = %s "
+                    "ORDER BY sequence",
+                    (rid, event_type.value),
+                ).fetchall()
+                out.extend(r[0] for r in rows)
+        return out
 
 
 @pytest.fixture
@@ -220,7 +243,8 @@ def test_completed_slot_is_a_no_op(harness: Callable[..., Harness]) -> None:
 def _tick(h: Harness, at: datetime) -> None:
     """Move the harness to a later cron tick: its slot, run_id, and a fresh fake world."""
     h.clock.now = at
-    h.run_id = run_id_for(h.settings.APP_ENV, slot_for(at))
+    h.run_id = run_id_for(h.settings.APP_ENV, slot_for(at), AgentRole.SELL)
+    h.close_id = run_id_for(h.settings.APP_ENV, slot_for(at), AgentRole.CLOSE)
     h.world = build_world(at)
 
 
@@ -248,9 +272,19 @@ def test_initial_run_records_the_hourly_fallback(harness: Callable[..., Harness]
         }
     ]
     (check,) = [
-        e["schedule_check"] for e in h.events(RunEventType.METADATA) if "schedule_check" in e
+        e["schedule_check"]
+        for e in h.events(RunEventType.METADATA, h.close_id)
+        if "schedule_check" in e
     ]
     assert check == {"not_before": None, "due": True, "run_now": False}
+    # ADR-0057: the sell run carries the close run's gate over instead of re-reading it.
+    (carried,) = [
+        e["schedule_check"]
+        for e in h.events(RunEventType.METADATA, h.run_id)
+        if "schedule_check" in e
+    ]
+    assert carried == {"due": True, "carried_from": [str(h.close_id)], "run_now": False}
+    assert h.close_status() is RunStatus.SKIPPED_NO_OPEN_SHORTS
 
 
 def test_agent_next_run_gates_later_ticks(harness: Callable[..., Harness]) -> None:
@@ -403,20 +437,21 @@ def test_agent_next_run_beyond_the_max_gap_is_capped(
 def test_unplaceable_agent_next_run_keeps_the_fallback_and_the_audit(
     harness: Callable[..., Harness],
 ) -> None:
-    # The third calendar built in a run places the agent's time (after the market-session
-    # and fallback calendars); make it fail as a broken calendar would.
+    # The fourth calendar built in a tick places the agent's time (after the close run's
+    # market-session and fallback calendars and the sell run's market-session calendar,
+    # ADR-0057); make it fail as a broken calendar would.
     built: list[object] = []
 
     def calendar_factory(start: Any, end: Any) -> Any:
         built.append((start, end))
-        if len(built) == 3:
+        if len(built) == 4:
             raise CalendarOutOfRange("simulated calendar failure")
         return build_nyse_calendar(start, end)
 
     h = harness(**LIVE)
     script = _next_run_script("2026-09-24T15:00:00Z")
     assert h.run(script, calendar_factory=calendar_factory) == 0, h.notifier.alert_kinds()
-    assert len(built) == 3
+    assert len(built) == 4
     assert h.status() is RunStatus.COMPLETED
     assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == ["fallback"]
     rejected = [e for e in h.events(RunEventType.METADATA) if "next_run_rejected" in e]
@@ -500,7 +535,8 @@ def test_production_defaults_proxy_both_verified_sources(
     harness: Callable[..., Harness],
 ) -> None:
     """Direct delivery is not accepted, so a remote source reaches the model only through the
-    validating proxy (ADR-0023), and only with a verified registry (Wheelta: ADR-0041)."""
+    validating proxy (ADR-0023), and only with a verified registry (Wheelta: ADR-0041;
+    Tavily: ADR-0058)."""
     h = harness()
     h.run(remote_boundary_accepted=False, registries=(ROBINHOOD_REGISTRY, WHEELTA_REGISTRY))
     assert len(h.clis) == 1
@@ -510,11 +546,13 @@ def test_production_defaults_proxy_both_verified_sources(
     assert {n: c["type"] for n, c in servers.items()} == {
         "robinhood": "sdk",
         "wheelta": "sdk",
+        "tavily": "sdk",
         "wra_local": "sdk",
     }
     statuses = {e["server"]: e["status"] for e in h.events(RunEventType.SOURCE_STATUS)}
     assert statuses["robinhood"] == "connected"
     assert statuses["wheelta"] == "connected"
+    assert statuses["tavily"] == "connected"
 
 
 def test_an_unverified_registry_is_still_withheld(harness: Callable[..., Harness]) -> None:
@@ -528,8 +566,28 @@ def test_an_unverified_registry_is_still_withheld(harness: Callable[..., Harness
 # -- Agentic-account eligibility (trusted get_accounts check, CLAUDE.md §9) ----------------------
 
 
-def _metadata(h: Harness, key: str) -> list[Any]:
-    return [e[key] for e in h.events(RunEventType.METADATA) if key in e]
+def _close_agent_has_work(monkeypatch: pytest.MonkeyPatch, h: Harness) -> None:
+    """The trusted start probe reports a held short to the close agent and nothing to do for
+    the sell agent (ADR-0057), so the scripted session is the close run's. The fake world's
+    positions read is always empty, so the probe itself is replaced."""
+    from wheelta_robinhood_agent.agent import session as session_module
+    from wheelta_robinhood_agent.domain.enums import AgentRole as Role
+    from wheelta_robinhood_agent.domain.start_conditions import StartCondition, StartOutcome
+
+    async def probe(role: Role, *args: Any, **kwargs: Any) -> StartCondition:
+        if role is Role.CLOSE:
+            return StartCondition(
+                role=role, outcome=StartOutcome.MET, reason="test: a short held", short_positions=1
+            )
+        return StartCondition(role=role, outcome=StartOutcome.NOT_MET, reason="test: no cash")
+
+    monkeypatch.setattr(session_module, "probe_start_condition", probe)
+    h.run_id = h.close_id
+
+
+def _metadata(h: Harness, key: str, run_id: Any = None) -> list[Any]:
+    """One run's metadata values (default: the sell run, the scripted session's)."""
+    return [e[key] for e in h.events(RunEventType.METADATA, run_id or h.run_id) if key in e]
 
 
 def test_eligible_account_is_recorded_redacted_and_other_accounts_never_persist(
@@ -733,7 +791,7 @@ def _unresolved_order(h: Harness) -> Any:
         intent=None,
         broker_order=BrokerOrder(
             order_id=uuid.uuid4(),
-            account_scope_id=simulated_scope_id(h.run_id),
+            account_scope_id=simulated_scope_id(h.close_id),
             broker_order_id="ord-working-1",
             intent_id=None,
             first_observed_at=h.clock.now,
@@ -791,7 +849,7 @@ def test_working_orders_get_a_cleanup_turn_before_the_output_is_accepted(
     denied, read = turns
     assert denied.denied and denied.reason == CLEANUP_DENIAL
     assert not read.denied
-    assert set(scopes) == {simulated_scope_id(h.run_id)}
+    assert set(scopes) == {simulated_scope_id(h.close_id)}
     assert "orders_left_working" not in h.notifier.alert_kinds()
     (cleanup,) = [
         e["order_cleanup"] for e in h.events(RunEventType.METADATA) if "order_cleanup" in e
@@ -850,7 +908,9 @@ def test_wind_down_allows_only_order_reads_and_cancels(harness: Callable[..., Ha
     assert not read.denied
 
 
-def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness]) -> None:
+def test_position_notes_carry_forward_until_close(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """ADR-0018: earlier notes reach the prompt; this run's HOLD and question become notes."""
     import json
     from datetime import timedelta
@@ -866,6 +926,7 @@ def test_position_notes_carry_forward_until_close(harness: Callable[..., Harness
     from wheelta_robinhood_agent.ledger.positions import open_position, position_book, record_note
 
     h = harness(**LIVE)  # position notes are production memory (ADR-0039)
+    _close_agent_has_work(monkeypatch, h)
     scope = account_scope_id(h.settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER)
     earlier = h.clock.now - timedelta(hours=1)
     with h.conn() as c:
@@ -993,12 +1054,12 @@ def test_dry_run_order_tools_go_to_the_simulated_broker(
         "place_option_order": ToolCallStatus.SUCCEEDED,
     }
     (record,) = [r for r in orders if r.intent is not None]
-    assert record.intent.account_scope_id == simulated_scope_id(h.run_id)
+    assert record.intent.account_scope_id == simulated_scope_id(h.close_id)
     assert record.status is AttemptStatus.FILLED  # ADR-0046: a simulated order fills at once
     assert owned == ()  # nothing simulated leaks into the account's owned orders
     assert stored.record.order_venue is OrderVenue.SIMULATED
     assert stored.record.effective_execution_mode is ExecutionMode.OFF
-    metadata = h.events(RunEventType.METADATA)
+    metadata = h.events(RunEventType.METADATA, h.run_id)
     (tool_access,) = [e["tool_access"] for e in metadata if "tool_access" in e]
     assert tool_access["order_venue"] == "simulated"
     _assert_simulated_trace(h)
@@ -1254,12 +1315,21 @@ def test_unmapped_remote_result_never_reaches_the_model(harness: Callable[..., H
 
 def test_web_cache_hit_denies_an_identical_search(harness: Callable[..., Harness]) -> None:
     async def company(model: FakeModel) -> str:
-        first = await model.call("WebSearch", {"query": "AAPL earnings date"})
-        assert not first.denied
-        second = await model.call("WebSearch", {"query": "  aapl   EARNINGS date "})
+        first = await model.call(TAVILY_SEARCH, {"query": "AAPL earnings date"})
+        assert not first.denied and first.output["kind"] == "validated", first.output
+        assert first.output["data"]["results"][0]["url"] == "https://x.test"
+        second = await model.call(TAVILY_SEARCH, {"query": "  aapl   EARNINGS date "})
         assert second.denied and "web_cache_lookup" in (second.reason or "")
+        narrower = await model.call(
+            TAVILY_SEARCH, {"query": "AAPL earnings date", "max_results": 3}
+        )
+        assert not narrower.denied  # other arguments: another question, not a cache hit
         cached = await model.call("mcp__wra_local__web_cache_lookup", {"ticker": "AAPL"})
         assert cached.data["entries"][0]["query"] == "AAPL earnings date"
+        page = await model.call(TAVILY_EXTRACT, {"urls": ["https://x.test"], "query": "date"})
+        assert page.output["kind"] == "validated", page.output
+        builtin = await model.call("WebSearch", {"query": "AAPL"})
+        assert builtin.denied
         return mignon_report("Find the AAPL earnings date.")
 
     async def script(model: FakeModel) -> str | None:
@@ -1269,7 +1339,10 @@ def test_web_cache_hit_denies_an_identical_search(harness: Callable[..., Harness
 
     h = harness()
     assert h.run(script) == 0
-    assert [n for n, _ in h.world.calls].count("WebSearch") == 1
+    searches = [a for s, t, a in h.world.upstream_calls if (s, t) == ("tavily", "tavily_search")]
+    assert len(searches) == 2  # the repeat was denied before reaching Tavily
+    assert searches[0]["include_raw_content"] is False  # code-set arguments (ADR-0058)
+    assert ("tavily", "tavily_extract") in {(s, t) for s, t, _ in h.world.upstream_calls}
 
 
 # -- runtime stop ---------------------------------------------------------------------------------
@@ -1330,8 +1403,9 @@ def test_interrupted_slot_is_finalized_without_a_new_session(
     )
 
     h = harness()
+    h.run_id = h.close_id  # ADR-0057: the close run of the slot was interrupted
     with h.conn() as c:
-        slot = open_run_slot(c, AppEnv.LOCAL, slot_for(h.clock.now))
+        slot = open_run_slot(c, AppEnv.LOCAL, slot_for(h.clock.now), AgentRole.CLOSE)
         append_run_event(
             c,
             slot.run_id,
@@ -1474,7 +1548,7 @@ def test_roles_are_enforced_both_ways(harness: Callable[..., Harness]) -> None:
         return mignon_report("Nothing.")
 
     async def script(model: FakeModel) -> str | None:
-        web = await model.call("WebSearch", {"query": "AAPL"})
+        web = await model.call(TAVILY_SEARCH, {"query": "AAPL"})
         assert web.denied and "not available to the orchestrator" in (web.reason or "")
         general = await model.spawn("general-purpose", "Do anything.", nosy)
         assert general.denied and "Mignon type" in (general.reason or "")
@@ -1548,10 +1622,21 @@ def _summary_rows(h: Harness) -> list[ledger_evidence.StoredAlert]:
     return [r for r in rows if r.alert_kind == "run_summary_email"]
 
 
+def _sell_summary(h: Harness) -> Any:
+    """The tick's one email (ADR-0057) and its sell section: the close agent skipped."""
+    (tick,) = h.mailer.summaries
+    close, sell = tick.agents
+    assert close.agent is AgentRole.CLOSE and not close.session_started
+    assert close.status is RunStatus.SKIPPED_NO_OPEN_SHORTS
+    assert sell.agent is AgentRole.SELL
+    return sell
+
+
 def test_completed_session_sends_one_summary_email(harness: Callable[..., Harness]) -> None:
     h = harness()
     assert h.run() == 0, h.notifier.alert_kinds()
-    (summary,) = h.mailer.summaries
+    summary = _sell_summary(h)
+    assert summary.session_started
     assert summary.status is RunStatus.COMPLETED and summary.run_id == str(h.run_id)
     assert summary.effective_execution_mode is ExecutionMode.OFF
     assert summary.order_venue is OrderVenue.SIMULATED
@@ -1564,16 +1649,20 @@ def test_completed_session_sends_one_summary_email(harness: Callable[..., Harnes
     (row,) = _summary_rows(h)
     assert row.delivery_status is ledger_evidence.DeliveryStatus.SENT
     assert row.payload["provider_message_id"] == "em_1"
-    assert row.dedup_key == f"run-summary/{h.run_id}"
+    assert row.dedup_key == f"run-summary/{slot_for(h.clock.now).isoformat()}"
+    assert h.mailer.summaries[0].next_run_at is None
 
 
 def test_summary_email_reports_the_agents_next_run(harness: Callable[..., Harness]) -> None:
     h = harness(**LIVE)
     chosen = SESSION_TIME + timedelta(minutes=42)
     assert h.run(_next_run_script(chosen.isoformat().replace("+00:00", "Z"))) == 0
-    (summary,) = h.mailer.summaries
+    summary = _sell_summary(h)
     assert summary.next_run_at == chosen and summary.next_run_source == "agent"
     assert summary.next_run_rationale == "Scripted schedule."
+    # The tick's effective next run: the earliest agent choice (only the sell agent chose).
+    (tick,) = h.mailer.summaries
+    assert tick.next_run_at == chosen and tick.next_run_source == "agent"
 
 
 def test_failed_session_still_sends_a_summary_email(harness: Callable[..., Harness]) -> None:
@@ -1583,7 +1672,7 @@ def test_failed_session_still_sends_a_summary_email(harness: Callable[..., Harne
 
     h = harness()
     assert h.run(script) == 1
-    (summary,) = h.mailer.summaries
+    summary = _sell_summary(h)
     assert summary.status is RunStatus.FAILED and summary.reason == "invalid_agent_output"
     assert "invalid_agent_output" in summary.alerts
     assert any("Invalid agent output at" in d for d in summary.diagnostic_details)
@@ -1601,7 +1690,7 @@ def test_timed_out_session_sends_a_summary_email(harness: Callable[..., Harness]
 
     h = harness()
     assert h.run(script) == 2
-    (summary,) = h.mailer.summaries
+    summary = _sell_summary(h)
     assert summary.status is RunStatus.TIMED_OUT
 
 
@@ -1618,7 +1707,7 @@ def test_summary_includes_redacted_sdk_error_details(
     monkeypatch.setattr(FakeCli, "_result", failed_result)
     h = harness()
     assert h.run() == 1
-    (summary,) = h.mailer.summaries
+    summary = _sell_summary(h)
     assert summary.reason == "result error (error_during_execution)"
     assert any("Provider overloaded" in d for d in summary.diagnostic_details)
     assert ACCOUNT_NUMBER not in repr(summary.diagnostic_details)
@@ -1635,7 +1724,7 @@ def test_summary_context_failure_still_sends_outcome_and_decisions(
     )
     h = harness()
     assert h.run() == 0
-    (summary,) = h.mailer.summaries
+    summary = _sell_summary(h)
     assert summary.record is not None and summary.record.decisions
     assert summary.research_unavailable == "RuntimeError"
 
@@ -1766,7 +1855,9 @@ def test_another_account_number_is_still_denied(harness: Callable[..., Harness])
     h = harness()
     assert h.run(script) == 0, h.notifier.alert_kinds()
     sent = [a for _, t, a in h.world.upstream_calls if t == "get_portfolio"]
-    assert sent == [{"account_number": ACCOUNT_NUMBER}]
+    # The sell agent's trusted start-condition read (ADR-0057), then the agent's own read:
+    # both carry the configured account, never another.
+    assert sent == [{"account_number": ACCOUNT_NUMBER}] * 2
 
 
 def test_trace_script_prints_the_run_and_the_listing(
@@ -1787,11 +1878,15 @@ def test_trace_script_prints_the_run_and_the_listing(
     monkeypatch.setattr(trace_run, "load_settings", lambda: h.settings)
     assert trace_run.main(["--list"]) == 0
     listing = capsys.readouterr().out
-    assert str(h.run_id) in listing and "simulated" in listing
+    assert str(h.run_id) in listing and "simulated" in listing and " sell " in listing
+    assert str(h.close_id) not in listing  # the close run started no session
     assert trace_run.main([str(h.run_id)]) == 0
     assert "### OPEN_CSP AAPL" in capsys.readouterr().out
     assert trace_run.main(["--slot", slot_for(h.clock.now).isoformat(), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["run_id"] == str(h.run_id)
+    slot = slot_for(h.clock.now).isoformat()
+    assert trace_run.main(["--slot", slot, "--agent", "close", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] == str(h.close_id)
     assert trace_run.main(["--slot", "2020-01-01T00:00:00+00:00"]) == 1
     assert "no run at" in capsys.readouterr().err
 
@@ -1820,7 +1915,9 @@ def test_a_second_order_audits_against_state_that_includes_the_first(
     assert [f.outcome.value for f in v13] == ["violation"]  # 74,000 collateral on 30,000 cash
 
 
-def test_a_dry_run_adds_no_position_notes(harness: Callable[..., Harness]) -> None:
+def test_a_dry_run_adds_no_position_notes(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
     """ADR-0039: a dry run's HOLD on a real position is not recorded as its memory."""
     import json
 
@@ -1831,6 +1928,7 @@ def test_a_dry_run_adds_no_position_notes(harness: Callable[..., Harness]) -> No
     from wheelta_robinhood_agent.ledger.positions import open_position, position_book
 
     h = harness()
+    _close_agent_has_work(monkeypatch, h)
     scope = account_scope_id(h.settings.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER)
     earlier = h.clock.now - timedelta(hours=1)
     with h.conn() as c:
@@ -1920,3 +2018,312 @@ def test_the_wheelta_board_is_the_initial_scanner_and_board_candidates_are_compa
     wheelta = [c for c in trace.timeline if c.server == "wheelta"]
     assert [c.tool for c in wheelta] == ["wheelta_board_query"]
     assert wheelta[0].caller.startswith("mignon-market")
+
+
+# -- two agents per tick (ADR-0057) --------------------------------------------------------------
+
+
+def _both_agents_have_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trusted start probe reports work for both agents (the fake positions read is
+    always empty, so the probe itself is replaced)."""
+    from wheelta_robinhood_agent.agent import session as session_module
+    from wheelta_robinhood_agent.domain.start_conditions import StartCondition, StartOutcome
+
+    async def probe(role: AgentRole, *args: Any, **kwargs: Any) -> StartCondition:
+        return StartCondition(role=role, outcome=StartOutcome.MET, reason="test: work to do")
+
+    monkeypatch.setattr(session_module, "probe_start_condition", probe)
+
+
+def _is_close(model: FakeModel) -> bool:
+    return "You are the Buy-to-Close agent" in model.system_prompt
+
+
+def _no_decisions(next_run: dict[str, str] | None = None) -> str:
+    return json.dumps(
+        {
+            "decisions": [],
+            "cancellation_rationales": [],
+            "unresolved_questions": [],
+            "next_run": next_run,
+        }
+    )
+
+
+def test_the_close_agent_runs_first_then_the_sell_agent(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _both_agents_have_work(monkeypatch)
+    order: list[str] = []
+
+    async def script(model: FakeModel) -> str | None:
+        if _is_close(model):
+            order.append("close")
+            return _no_decisions()
+        order.append("sell")
+        assert '"status": "completed"' in model.system_prompt  # close_agent_outcome
+        return await dry_run_script(model)
+
+    h = harness()
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    assert order == ["close", "sell"] and len(h.clis) == 2
+    assert h.close_status() is RunStatus.COMPLETED and h.status() is RunStatus.COMPLETED
+    started = h.events(RunEventType.STARTED)
+    assert [e["agent"] for e in started] == ["close", "sell"]
+    prompts = [e["prompt_id"] for e in started]
+    assert prompts == ["wheel_close", "wheel_sell"]
+    (tick,) = h.mailer.summaries
+    assert [(a.agent, a.session_started) for a in tick.agents] == [
+        (AgentRole.CLOSE, True),
+        (AgentRole.SELL, True),
+    ]
+    (beat,) = h.notifier.heartbeats
+    assert beat.run_status is RunStatus.COMPLETED and beat.run_id == str(h.run_id)
+    assert beat.reason == "close=completed (completed); sell=completed (completed)"
+
+
+def test_a_failed_close_agent_does_not_block_the_sell_agent(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _both_agents_have_work(monkeypatch)
+
+    async def script(model: FakeModel) -> str | None:
+        if _is_close(model):
+            return "I would close the AAPL put."  # not JSON: invalid output, run failed
+        return await dry_run_script(model)
+
+    h = harness()
+    assert h.run(script) == 1  # the tick exits with the more severe code
+    assert h.close_status() is RunStatus.FAILED
+    assert h.status() is RunStatus.COMPLETED
+    (tick,) = h.mailer.summaries
+    close, sell = tick.agents
+    assert close.status is RunStatus.FAILED and close.reason == "invalid_agent_output"
+    assert sell.status is RunStatus.COMPLETED and sell.record is not None
+    (beat,) = h.notifier.heartbeats
+    assert beat.run_status is RunStatus.FAILED and beat.run_id == str(h.close_id)
+
+
+def test_a_stopped_close_agent_does_not_block_the_sell_agent(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner decision (ADR-0057): a SIGTERM during the close run still lets the sell run
+    start, with its own stop latch."""
+    _both_agents_have_work(monkeypatch)
+
+    async def script(model: FakeModel) -> str | None:
+        if _is_close(model):
+            signal.raise_signal(signal.SIGTERM)
+            for _ in range(200):
+                if model.interrupted:
+                    break
+                await asyncio.sleep(0.01)
+            return "{}"
+        return await dry_run_script(model)
+
+    previous = signal.getsignal(signal.SIGTERM)
+    h = harness()
+    assert h.run(script, install_signals=True) == 3
+    assert signal.getsignal(signal.SIGTERM) == previous
+    assert h.close_status() is RunStatus.STOPPED
+    assert h.status() is RunStatus.COMPLETED
+    assert len(h.clis) == 2
+
+
+def test_the_sell_agent_is_skipped_without_cash_or_coverable_shares(
+    harness: Callable[..., Harness],
+) -> None:
+    """The real probe (no patch): settled cash below the minimum and no shares."""
+    h = harness()
+    portfolio = h.world.handlers["robinhood"]["get_portfolio"]
+
+    def poor(args: dict[str, Any]) -> dict[str, Any]:
+        response = portfolio(args)
+        payload = json.loads(response["content"][0]["text"])
+        payload["settled_cash"] = "999.99"
+        return {"content": [{"type": "text", "text": json.dumps(payload)}]}
+
+    no_shares = json.dumps({"data": {"positions": []}})
+    h.world.handlers["robinhood"]["get_portfolio"] = poor
+    h.world.handlers["robinhood"]["get_equity_positions"] = lambda args: {
+        "content": [{"type": "text", "text": no_shares}]
+    }
+    assert h.run() == 0, h.notifier.alert_kinds()
+    assert h.clis == []
+    assert h.close_status() is RunStatus.SKIPPED_NO_OPEN_SHORTS
+    assert h.status() is RunStatus.SKIPPED_INSUFFICIENT_BALANCE
+    (condition,) = _metadata(h, "start_condition")
+    assert condition["outcome"] == "not_met" and condition["settled_cash_usd"] == "999.99"
+    assert condition["min_settled_cash_usd"] == "1000.00"
+    assert h.mailer.summaries == []  # no session started
+    (beat,) = h.notifier.heartbeats
+    assert beat.status.value == "success"
+
+
+def test_an_unreadable_start_condition_fails_closed(harness: Callable[..., Harness]) -> None:
+    h = harness()
+
+    def down(args: dict[str, Any]) -> dict[str, Any]:
+        raise FakeToolFailure("portfolio down")
+
+    h.world.handlers["robinhood"]["get_portfolio"] = down
+    assert h.run() == 1
+    assert h.clis == []
+    assert h.status() is RunStatus.FAILED
+    statuses = [e for e in h.events(RunEventType.STATUS, h.run_id) if e and "reason" in e]
+    assert statuses[-1]["reason"] == "start_condition_unavailable"
+    assert "start_condition_unavailable" in h.notifier.alert_kinds()
+
+
+def test_the_sell_agent_rechecks_the_market_session(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The close run ends after the close bell: the sell run is skipped, not started."""
+    _both_agents_have_work(monkeypatch)
+    near_close = datetime.fromisoformat("2026-09-23T19:55:00+00:00")  # 15:55 New York
+
+    async def script(model: FakeModel) -> str | None:
+        assert _is_close(model)
+        h.clock.advance(600)  # past 16:00 New York
+        return _no_decisions()
+
+    h = harness(at=near_close, **LIVE)
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    assert len(h.clis) == 1
+    assert h.close_status() is RunStatus.COMPLETED
+    assert h.status() is RunStatus.SKIPPED_MARKET_CLOSED
+
+
+def test_the_earliest_next_run_of_the_two_agents_wins(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wheelta_robinhood_agent.ledger.runs import latest_next_run_not_before
+
+    _both_agents_have_work(monkeypatch)
+    sooner = SESSION_TIME + timedelta(minutes=20)
+    later = SESSION_TIME + timedelta(minutes=50)
+
+    def at(t: datetime) -> dict[str, str]:
+        return {"at": t.isoformat().replace("+00:00", "Z"), "rationale": "Scripted."}
+
+    async def script(model: FakeModel) -> str | None:
+        if _is_close(model):
+            return _no_decisions(at(sooner))
+        candidate_ref, facts_ref = await research(model)
+        return decision_json(candidate_ref, facts_ref, next_run=at(later))
+
+    h = harness(**LIVE)
+    assert h.run(script) == 0, h.notifier.alert_kinds()
+    assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == [
+        "fallback",
+        "agent",
+        "agent",
+    ]
+    with h.conn() as c:
+        assert latest_next_run_not_before(c, AppEnv.PRODUCTION) == sooner
+    (tick,) = h.mailer.summaries
+    assert tick.next_run_at == sooner and tick.next_run_source == "agent"
+
+
+# -- two agents in a simulated dry run (ADR-0057, ADR-0038) ---------------------------------------
+
+
+def _spy_leg_order(side: str, effect: str) -> dict[str, Any]:
+    from e2e_fakes import SPY_INSTRUMENT_ID
+
+    return {
+        "account_number": AGENTIC_ACCOUNT_PLACEHOLDER,
+        "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": side, "position_effect": effect}],
+        "quantity": "1",
+        "price": "11.90",
+        "type": "limit",
+        "time_in_force": "gfd",
+    }
+
+
+def test_a_simulated_dry_run_tick_gates_each_agents_order_sides(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The local `--run-now` path: the close agent may not open a new position, the sell
+    agent may not buy to close, and the sell agent's simulated order lands in the tick's
+    simulated scope (the close run's id); both runs complete and audit clean."""
+    from wheelta_robinhood_agent.agent.simulated_broker import simulated_scope_id
+    from wheelta_robinhood_agent.domain.role_gate import ROLE_DENIAL_PREFIX
+    from wheelta_robinhood_agent.ledger.orders import run_order_records
+
+    _both_agents_have_work(monkeypatch)
+    denials: dict[str, str] = {}
+    linked = linked_order_script(lambda: h.clock.advance(1), _order_refs)
+
+    async def script(model: FakeModel) -> str | None:
+        place = "mcp__robinhood__place_option_order"
+        if _is_close(model):
+            turn = await model.call(place, _spy_leg_order("sell", "open"))
+            assert turn.denied, turn
+            denials["close"] = turn.reason or ""
+            return _no_decisions()
+        turn = await model.call(place, _spy_leg_order("buy", "close"))
+        assert turn.denied, turn
+        denials["sell"] = turn.reason or ""
+        return await linked(model)
+
+    h = harness()
+    h.world = simulated_world(h.clock.now)
+    assert h.run(script, mappers=SIMULATED_MAPPERS) == 0, h.notifier.alert_kinds()
+    assert denials["close"].startswith(ROLE_DENIAL_PREFIX)
+    assert "only sells to open" in denials["sell"]
+    assert h.close_status() is RunStatus.COMPLETED and h.status() is RunStatus.COMPLETED
+    with h.conn() as c:
+        (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
+        findings = ledger_evidence.audit_findings_for_run(c, h.run_id)
+    (decision,) = stored.record.decisions
+    ((attempt,),) = [leg.attempts for leg in decision.legs]
+    assert attempt.status is AttemptStatus.FILLED
+    # The denied buy-to-close was never sent: it stays visible, unassociated, not dispatched.
+    (denied,) = stored.record.unassociated_actions
+    assert denied.attempt is not None and denied.attempt.status is AttemptStatus.NOT_PLACED
+    assert [c.value for c in denied.attempt.reason_codes] == ["not_dispatched"]
+    assert stored.record.findings == ()  # the never-sent place is not an assembly finding
+    # The fixture's SPY put breaks the cash and concentration limits (V1.3, V7, as in the
+    # single-agent simulated tests); nothing else is a violation, the denial included.
+    violations = {
+        (f.check_id.value, f.sub_item) for f in findings if f.outcome.value == "violation"
+    }
+    assert violations <= {("V1", "3"), ("V7", "3"), ("V7", "4")}, violations
+    assert not [
+        f for f in findings if f.outcome.value == "violation" and f.check_id.value == "V4"
+    ], [
+        (f.check_id.value, f.sub_item, f.detail) for f in findings if f.outcome.value == "violation"
+    ]
+    with h.conn() as c:
+        (record,) = [r for r in run_order_records(c, h.run_id) if r.intent is not None]
+        assert record.intent.account_scope_id == simulated_scope_id(h.close_id)
+        assert run_order_records(c, h.close_id) == ()  # the denied open was never sent
+    upstream = [tool for _, tool, _ in h.world.upstream_calls]
+    assert not {t for t in upstream if t.endswith("_option_order")}, upstream
+    (tick,) = h.mailer.summaries
+    assert [a.order_venue for a in tick.agents] == [OrderVenue.SIMULATED] * 2
+
+
+def test_a_long_close_run_leaves_the_sell_agent_no_session(
+    harness: Callable[..., Harness], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The close run used the tick budget: the sell run is timed out before its session."""
+    _both_agents_have_work(monkeypatch)
+
+    async def script(model: FakeModel) -> str | None:
+        assert _is_close(model)
+        h.clock.advance(h.settings.RUN_TIMEOUT_SECONDS - 200)  # past the close deadline too
+        for _ in range(200):
+            if model.interrupted:
+                break
+            await asyncio.sleep(0.01)
+        return None
+
+    h = harness()
+    assert h.run(script) == 2
+    assert h.close_status() is RunStatus.TIMED_OUT
+    assert h.status() is RunStatus.TIMED_OUT
+    assert len(h.clis) == 1
+    statuses = [e for e in h.events(RunEventType.STATUS, h.run_id) if e and "reason" in e]
+    assert statuses[-1]["reason"] == "no_budget_left"

@@ -28,9 +28,9 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 14
+version = 15
 status = "signed_off"
-adr = "ADR-0054" # v14: looser board comparison, catalyst, cap, earnings, screening age, weeklies
+adr = "ADR-0057" # v15: [sessions], the Buy-to-Close and Sell Options agents' start conditions
 signed_off_by = "medsriha (account owner)"
 signed_off_on = "2026-09-30"
 
@@ -348,6 +348,21 @@ notes = [
 ]
 fallback_next_run_minutes = 60
 max_next_run_gap_hours = 48
+
+# ---------------------------------------------------------------------------------------------
+# Sessions (ADR-0057). Each due tick runs the Buy-to-Close agent, then the Sell Options agent.
+# Trusted code checks each start condition from live Robinhood reads before the model
+# connects. Owner, 2026-09-30: a sell run needs $1,000 of settled cash, or 100 shares of one
+# symbol not already covered by a short call.
+# ---------------------------------------------------------------------------------------------
+
+[sessions]
+notes = [
+  "Each due run is two sessions in order: the Buy-to-Close agent manages existing short options (close, roll, or hold), then the Sell Options agent opens new cash-secured puts and covered calls.",
+  "The Buy-to-Close agent starts only when the account holds at least one short option. The Sell Options agent starts after it ends (completed, skipped, failed, timed out, or stopped), during the regular session, and only when settled cash is at least sell_min_settled_cash_usd or the account holds 100 shares of one symbol not already covered by short calls.",
+  "Code checks these conditions before each session; a session that starts may assume only that its condition held at that check. Re-read account state before every order.",
+]
+sell_min_settled_cash_usd = "1000.00"
 
 # ---------------------------------------------------------------------------------------------
 # Data quality (docs/DATA_QUALITY.md explains the pipeline these values feed)

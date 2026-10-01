@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import psycopg
 import pytest
 
-from wheelta_robinhood_agent.domain.enums import AppEnv, RunStatus
+from wheelta_robinhood_agent.domain.enums import AgentRole, AppEnv, RunStatus
 from wheelta_robinhood_agent.domain.events import RunEventType
 from wheelta_robinhood_agent.domain.run_identity import run_id_for
 from wheelta_robinhood_agent.ledger.errors import DedupConflict, LedgerError
@@ -179,7 +179,7 @@ def _schedule(conn: Conn, run_id: uuid.UUID, not_before: object, key: str) -> No
         RunEventType.SCHEDULE,
         observed_at=T0,
         dedup_key=key,
-        payload={"not_before": not_before},
+        payload={"not_before": not_before, "source": key.removeprefix("schedule:")},
     )
 
 
@@ -195,6 +195,31 @@ def test_latest_next_run_is_newest_slot_then_sequence(conn: Conn) -> None:
     _schedule(conn, later.run_id, (SLOT + timedelta(minutes=20)).isoformat(), "schedule:agent")
     assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(minutes=20)
     assert latest_next_run_not_before(conn, AppEnv.PRODUCTION) is None
+
+
+def test_earliest_agent_choice_of_a_tick_wins(conn: Conn) -> None:
+    """ADR-0057: the close and sell runs of a slot may each choose; the earlier time wins,
+    over the slot's fallback, whatever order they were recorded in."""
+    close = open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.CLOSE)
+    sell = open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.SELL)
+    assert close.run_id != sell.run_id
+    _schedule(conn, close.run_id, (SLOT + timedelta(hours=1)).isoformat(), "schedule:fallback")
+    assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(hours=1)
+    _schedule(conn, close.run_id, (SLOT + timedelta(hours=2)).isoformat(), "schedule:agent")
+    assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(hours=2)
+    _schedule(conn, sell.run_id, (SLOT + timedelta(minutes=30)).isoformat(), "schedule:agent")
+    assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(minutes=30)
+
+
+def test_runs_of_a_slot_are_classified_per_agent(conn: Conn) -> None:
+    close = open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.CLOSE)
+    assert close.state is SlotState.NEW and close.agent is AgentRole.CLOSE
+    _status(conn, close.run_id, RunStatus.SKIPPED_NO_OPEN_SHORTS, T0)
+    assert open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.CLOSE).state is SlotState.COMPLETED
+    assert open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.SELL).state is SlotState.NEW
+    assert open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.SELL).state is SlotState.INTERRUPTED
+    row = conn.execute("SELECT agent FROM runs WHERE run_id = %s", (close.run_id,)).fetchone()
+    assert row == ("close",)
 
 
 def test_skipped_not_due_is_a_final_status(conn: Conn) -> None:

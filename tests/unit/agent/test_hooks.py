@@ -37,6 +37,8 @@ from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.enums import ExecutionMode, OrderVenue, ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
+from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
+from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 from wheelta_robinhood_agent.observability.redaction import Redactor
 
 NOW = datetime(2026, 9, 25, 15, 0, tzinfo=UTC)
@@ -416,18 +418,14 @@ def test_tier_r_allowed_with_no_decision_and_recorded_before_dispatch() -> None:
     assert req["tier"] is ToolTier.R and req["requested_at"] == NOW
 
 
-@pytest.mark.parametrize("tool", ["WebSearch", "WebFetch"])
-def test_web_builtins_allowed(tool: str) -> None:
-    s = session()
-    out = s.pre(tool, {"query": "AAPL earnings"}, **COMPANY)
-    assert_allowed(s, out)
-    assert s.rec.event("requested")["server"] == "builtin"
-
-
-@pytest.mark.parametrize("tool", ["Bash", "Read", "Write", "Task", "SendMessage", "Skill", ""])
+@pytest.mark.parametrize(
+    "tool",
+    ["Bash", "Read", "Write", "Task", "SendMessage", "Skill", "WebSearch", "WebFetch", ""],
+)
 def test_other_builtins_denied(tool: str) -> None:
+    """ADR-0058: the built-in web tools are denied like any other built-in, Mignons too."""
     s = session()
-    assert_denied(s, s.pre(tool, {"command": "ls"}), "built-in tool not permitted")
+    assert_denied(s, s.pre(tool, {"command": "ls"}, **COMPANY), "built-in tool not permitted")
     assert s.rec.event("requested")["tier"] is None
 
 
@@ -1007,25 +1005,6 @@ def test_post_for_denied_call_has_no_state() -> None:
     assert out["continue_"] is False
 
 
-def test_post_builtin_records_but_does_not_replace() -> None:
-    s = session()
-    s.pre("WebSearch", {"query": "q"}, **COMPANY)
-    out = s.post("WebSearch", {"results": ["r"]})
-    assert out == {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
-    _, payload = s.rec.results[s.rec.event("delivered")["delivered_result_ref"]]
-    assert isinstance(payload, dict) and payload["replaced"] is False
-    assert payload["tool_output"] == {"results": ["r"]}
-
-
-def test_post_builtin_invalid_stops_session() -> None:
-    s = session(validator=FakeValidator("invalid"))
-    s.pre("WebFetch", {"url": "https://example.com"}, **COMPANY)
-    out = s.post("WebFetch", {"text": "x"})
-    assert out["continue_"] is False
-    assert "updatedToolOutput" not in out["hookSpecificOutput"]
-    assert s.deps.run_control.stop_requested
-
-
 # ---- PostToolUseFailure --------------------------------------------------------------------
 
 
@@ -1070,7 +1049,61 @@ def test_failure_recording_failure_stops() -> None:
     assert out["continue_"] is False and s.deps.run_control.stop_requested
 
 
-# ---- optional web-search cache hooks -------------------------------------------------------
+# ---- Tavily web research (ADR-0058) and the web-search cache (ADR-0016) -----------------------
+
+
+TAVILY_SEARCH = "mcp__tavily__tavily_search"
+TAVILY_EXTRACT = "mcp__tavily__tavily_extract"
+WEB_REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, TAVILY_REGISTRY)
+SEARCH_SENT = {
+    "query": "AAPL",
+    "max_results": 5,
+    "include_images": False,
+    "include_image_descriptions": False,
+    "include_raw_content": False,
+    "include_favicon": False,
+}
+
+
+def web_session(**overrides: Any) -> Session:
+    return session(registries=WEB_REGISTRIES, **overrides)
+
+
+def test_tavily_search_input_is_narrowed_by_code() -> None:
+    s = web_session()
+    out = s.pre(TAVILY_SEARCH, {"query": "AAPL", "include_images": False}, **COMPANY)
+    assert out["hookSpecificOutput"]["updatedInput"] == SEARCH_SENT
+    assert "permissionDecision" not in out["hookSpecificOutput"]
+    assert s.rec.event("dispatched")["effective_arguments_redacted"] == SEARCH_SENT
+    assert s.rec.event("requested")["tier"] is ToolTier.R
+
+
+@pytest.mark.parametrize(
+    ("args", "fragment"),
+    [
+        ({"query": "AAPL", "include_raw_content": True}, "does not accept"),
+        ({"query": "AAPL", "topic": "news"}, "does not accept"),
+        ({"query": "AAPL", "max_results": 50}, "max_results"),
+        ({"query": ""}, "query"),
+        ({"query": "AAPL", "include_domains": ["https://sec.gov/x"]}, "bare domains"),
+    ],
+)
+def test_tavily_search_outside_the_policy_is_denied(args: dict[str, Any], fragment: str) -> None:
+    s = web_session()
+    assert_denied(s, s.pre(TAVILY_SEARCH, args, **COMPANY), fragment)
+
+
+def test_tavily_is_denied_to_the_orchestrator_and_the_market_mignon() -> None:
+    s = web_session()
+    assert_denied(s, s.pre(TAVILY_SEARCH, {"query": "AAPL"}), "not available to the orchestrator")
+    market = {"agent_id": "a-m", "agent_type": f"mignon-market--{TEST_MODEL}"}
+    s2 = web_session()
+    assert_denied(s2, s2.pre(TAVILY_SEARCH, {"query": "AAPL"}, **market), "not available")
+
+
+def test_tavily_credit_heavy_tools_are_excluded() -> None:
+    s = web_session()
+    assert_denied(s, s.pre("mcp__tavily__tavily_research", {"input": "x"}, **COMPANY), "excluded")
 
 
 def test_web_precheck_denies_after_request_is_recorded() -> None:
@@ -1078,18 +1111,27 @@ def test_web_precheck_denies_after_request_is_recorded() -> None:
 
     def precheck(tool: str, tool_input: dict[str, Any]) -> str | None:
         seen.append((tool, tool_input))
-        return "identical search recorded; use the cache" if tool == "WebSearch" else None
+        return "identical search recorded; use the cache"
 
-    s = session(web_precheck=precheck)
-    assert_denied(s, s.pre("WebSearch", {"query": "AAPL"}, **COMPANY), "use the cache")
-    assert seen == [("WebSearch", {"query": "AAPL"})]
-    s2 = session(web_precheck=precheck)
-    assert_allowed(s2, s2.pre("WebFetch", {"url": "https://example.com"}, **COMPANY))
-    s3 = session(web_precheck=precheck)
+    s = web_session(web_precheck=precheck)
+    assert_denied(s, s.pre(TAVILY_SEARCH, {"query": "AAPL"}, **COMPANY), "use the cache")
+    # The cache is keyed by what code sends, not by what the Mignon wrote.
+    assert seen == [("tavily_search", SEARCH_SENT)]
+    s2 = web_session(web_precheck=precheck)
+    assert_allowed_with_input(
+        s2, s2.pre(TAVILY_EXTRACT, {"urls": ["https://example.com/a"]}, **COMPANY)
+    )
+    s3 = web_session(web_precheck=precheck)
     assert_allowed(s3, s3.pre(RH + "get_option_quotes"))
-    # ADR-0056: never consulted for WebFetch (a page is citable only by the Mignon that
-    # fetched it) or for MCP tools.
+    # ADR-0056: never consulted for an extract (a page is citable only by the Mignon that
+    # extracted it) or for other MCP tools.
     assert len(seen) == 1
+
+
+def assert_allowed_with_input(s: Session, out: Any) -> None:
+    assert denied_reason(out) is None, out
+    assert "updatedInput" in out["hookSpecificOutput"]
+    assert s.rec.names() == ["requested", "dispatched"]
 
 
 def test_web_capture_receives_validated_envelope_and_its_failure_is_tolerated() -> None:
@@ -1098,35 +1140,37 @@ def test_web_capture_receives_validated_envelope_and_its_failure_is_tolerated() 
     def capture(call_id: uuid.UUID, tool: str, args: dict[str, Any], result: JsonValue) -> None:
         captured.append((call_id, tool, args, result))
 
-    s = session(web_capture=capture)
-    s.pre("WebSearch", {"query": "AAPL"}, **COMPANY)
-    s.post("WebSearch", {"results": []})
+    s = web_session(web_capture=capture)
+    s.pre(TAVILY_SEARCH, {"query": "AAPL"}, **COMPANY)
+    s.post(TAVILY_SEARCH, {"results": []})
     assert len(captured) == 1
     call_id, tool, args, result = captured[0]
-    assert tool == "WebSearch" and args == {"query": "AAPL"}
+    assert tool == "tavily_search" and args == SEARCH_SENT
     assert call_id == uuid.uuid5(uuid.NAMESPACE_URL, "toolu_1")  # FakeRecorder.requested
     assert isinstance(result, dict) and result["kind"] == "validated"
 
     def broken(*_: Any) -> None:
         raise RuntimeError("cache down")
 
-    s2 = session(web_capture=broken)
-    s2.pre("WebSearch", {"query": "AAPL"}, **COMPANY)
-    out = s2.post("WebSearch", {"results": []})
+    s2 = web_session(web_capture=broken)
+    s2.pre(TAVILY_SEARCH, {"query": "AAPL"}, **COMPANY)
+    out = s2.post(TAVILY_SEARCH, {"results": []})
     assert "continue_" not in out and not s2.deps.run_control.stop_requested
     assert "delivered" in s2.rec.names()
     errors = [kw["payload"] for n, kw in s2.rec.events if n == "store_error"]
     assert errors == [{"web_capture_error": "RuntimeError"}]
 
 
-def test_web_capture_skipped_for_mcp_and_invalid_results() -> None:
+def test_web_capture_skipped_for_other_tools_and_invalid_results() -> None:
     captured: list[Any] = []
-    s = session(web_capture=lambda *a: captured.append(a))
+    s = web_session(web_capture=lambda *a: captured.append(a))
     s.pre(RH + "get_option_quotes")
     s.post(RH + "get_option_quotes", {})
-    s2 = session(web_capture=lambda *a: captured.append(a), validator=FakeValidator("invalid"))
-    s2.pre("WebSearch", {"query": "q"}, **COMPANY)
-    s2.post("WebSearch", {})
+    s.pre(TAVILY_EXTRACT, {"urls": ["https://example.com/a"]}, use_id="toolu_2", **COMPANY)
+    s.post(TAVILY_EXTRACT, {}, use_id="toolu_2")
+    s2 = web_session(web_capture=lambda *a: captured.append(a), validator=FakeValidator("invalid"))
+    s2.pre(TAVILY_SEARCH, {"query": "q"}, **COMPANY)
+    s2.post(TAVILY_SEARCH, {})
     assert captured == []
 
 

@@ -15,7 +15,13 @@ from typing import Any
 import psycopg
 from pydantic import JsonValue
 
-from wheelta_robinhood_agent.domain.enums import AppEnv, ExecutionMode, OrderVenue, RunStatus
+from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
+    AppEnv,
+    ExecutionMode,
+    OrderVenue,
+    RunStatus,
+)
 from wheelta_robinhood_agent.domain.events import RunEventType
 from wheelta_robinhood_agent.domain.run import AuditFinding
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
@@ -111,11 +117,38 @@ def load_decision_trace(conn: Conn, run_id: uuid.UUID) -> DecisionTrace:
     return build_decision_trace(load_trace_input(conn, run_id))
 
 
-def run_id_at(conn: Conn, environment: AppEnv, slot: datetime) -> uuid.UUID:
-    """The run recorded for (environment, slot). Raises UnknownEntity if none."""
-    row = conn.execute(
-        "SELECT run_id FROM runs WHERE environment = %s AND slot = %s", (environment.value, slot)
-    ).fetchone()
+# A run started a session when it has tool calls or an assembled record. Without an agent,
+# the slot's run that did so is preferred, the sell run first (ADR-0057).
+_RUN_AT_SLOT_SQL = (
+    "SELECT r.run_id FROM runs r WHERE r.environment = %s AND r.slot = %s ORDER BY "
+    "(EXISTS (SELECT 1 FROM tool_calls t WHERE t.run_id = r.run_id) OR EXISTS "
+    "(SELECT 1 FROM assembled_run_records rr WHERE rr.run_id = r.run_id)) DESC, "
+    "CASE r.agent WHEN 'sell' THEN 0 WHEN 'close' THEN 1 ELSE 2 END LIMIT 1"
+)
+_LIST_RUNS_SQL = (
+    "SELECT r.run_id, r.agent FROM runs r WHERE r.environment = %s AND "
+    "(EXISTS (SELECT 1 FROM tool_calls t WHERE t.run_id = r.run_id) OR EXISTS "
+    "(SELECT 1 FROM assembled_run_records rr WHERE rr.run_id = r.run_id)) "
+    "ORDER BY r.slot DESC, CASE r.agent WHEN 'sell' THEN 0 ELSE 1 END LIMIT %s"
+)
+
+
+def run_id_at(
+    conn: Conn, environment: AppEnv, slot: datetime, agent: AgentRole | None = None
+) -> uuid.UUID:
+    """The run recorded for (environment, slot, agent). Without `agent` (ADR-0057: a tick has
+    a close and a sell run), the slot's last run that started a session (sell before close),
+    else its last run. Raises UnknownEntity if none."""
+    if agent is not None:
+        row = conn.execute(
+            "SELECT run_id FROM runs WHERE environment = %s AND slot = %s AND agent = %s",
+            (environment.value, slot, agent.value),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            _RUN_AT_SLOT_SQL,
+            (environment.value, slot),
+        ).fetchone()
     if row is None or not isinstance(row[0], uuid.UUID):
         raise UnknownEntity(f"no run at {environment.value} {slot.isoformat()}")
     return row[0]
@@ -127,6 +160,7 @@ class RunListing:
 
     run_id: uuid.UUID
     slot: datetime
+    agent: AgentRole
     status: RunStatus | None
     effective_execution_mode: ExecutionMode | None
     order_venue: OrderVenue | None
@@ -141,14 +175,11 @@ def list_runs(conn: Conn, environment: AppEnv, limit: int = 20) -> tuple[RunList
     """The newest `limit` runs of the environment that started a session (have tool calls or
     a run record), newest first."""
     rows = conn.execute(
-        "SELECT r.run_id FROM runs r WHERE r.environment = %s AND (EXISTS "
-        "(SELECT 1 FROM tool_calls t WHERE t.run_id = r.run_id) OR EXISTS "
-        "(SELECT 1 FROM assembled_run_records rr WHERE rr.run_id = r.run_id)) "
-        "ORDER BY r.slot DESC LIMIT %s",
+        _LIST_RUNS_SQL,
         (environment.value, limit),
     ).fetchall()
     out: list[RunListing] = []
-    for (run_id,) in rows:
+    for run_id, agent in rows:
         if not isinstance(run_id, uuid.UUID):
             continue
         trace = load_decision_trace(conn, run_id)
@@ -157,6 +188,7 @@ def list_runs(conn: Conn, environment: AppEnv, limit: int = 20) -> tuple[RunList
             RunListing(
                 run_id=run_id,
                 slot=trace.slot,
+                agent=AgentRole(str(agent)),
                 status=trace.status,
                 effective_execution_mode=trace.effective_execution_mode,
                 order_venue=trace.order_venue,

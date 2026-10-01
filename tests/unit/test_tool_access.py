@@ -4,7 +4,6 @@ import pytest
 
 from wheelta_robinhood_agent.agent.mignons import ROLE_TOOLS, Role
 from wheelta_robinhood_agent.agent.tool_access import (
-    ALLOWED_BUILTINS,
     DISALLOWED_BUILTINS,
     SESSION_BUILTINS,
     build_tool_access,
@@ -16,6 +15,7 @@ from wheelta_robinhood_agent.integrations.robinhood.registry import (
     LIVE_ORDER_TOOLS,
     ROBINHOOD_REGISTRY,
 )
+from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 
 REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
@@ -91,4 +91,21 @@ def test_without_mignons_only_the_orchestrator_tools_remain(mode: ExecutionMode)
         effective_mode=mode, workspace_writes=True, registries=REGISTRIES, mignons=False
     )
     assert set(access.allowed_tools) <= ROLE_TOOLS[Role.ORCHESTRATOR]
-    assert {"Agent", *ALLOWED_BUILTINS} <= set(access.disallowed_tools)
+    assert {"Agent", "WebSearch", "WebFetch"} <= set(access.disallowed_tools)
+
+
+@pytest.mark.parametrize("mode", list(ExecutionMode))
+def test_web_research_is_tavily_for_mignons_only(mode: ExecutionMode) -> None:
+    """ADR-0058: the built-in web tools are disabled; Tavily search/extract are allowed for
+    the company and macro Mignons, and its credit-heavy tools never are."""
+    access = build_tool_access(
+        effective_mode=mode, workspace_writes=True, registries=(*REGISTRIES, TAVILY_REGISTRY)
+    )
+    assert {"WebSearch", "WebFetch"} <= set(access.disallowed_tools)
+    web = {"mcp__tavily__tavily_search", "mcp__tavily__tavily_extract"}
+    assert web <= set(access.allowed_tools)
+    excluded = {f"mcp__tavily__tavily_{t}" for t in ("crawl", "map", "research")}
+    assert excluded <= set(access.disallowed_tools)
+    assert not web & ROLE_TOOLS[Role.ORCHESTRATOR]
+    assert not web & ROLE_TOOLS[Role.MARKET]
+    assert web <= ROLE_TOOLS[Role.COMPANY] and web <= ROLE_TOOLS[Role.MACRO]

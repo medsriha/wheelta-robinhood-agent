@@ -33,6 +33,7 @@ from pydantic import SecretStr
 
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
+from wheelta_robinhood_agent.integrations.websearch.registry import SERVER_NAME as TAVILY
 from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as WHEELTA
 from wheelta_robinhood_agent.observability.redaction import is_account_key
 
@@ -121,10 +122,11 @@ ROBINHOOD_ACCOUNT_SCOPE: Mapping[str, AccountScopeSpec] = MappingProxyType(
     }
 )
 
-# Servers whose tools are never account-scoped: Wheelta is read-only market data (§10); the
-# local server's tools read only this run's already account-scoped ledger evidence and take
-# no account argument (web_cache_lookup, get_decision_facts).
-_UNSCOPED_SERVERS = frozenset({WHEELTA, LOCAL_SERVER_NAME})
+# Servers whose tools are never account-scoped: Wheelta is read-only market data (§10); Tavily
+# is public web search (ADR-0058); the local server's tools read only this run's already
+# account-scoped ledger evidence and take no account argument (web_cache_lookup,
+# get_decision_facts).
+_UNSCOPED_SERVERS = frozenset({WHEELTA, TAVILY, LOCAL_SERVER_NAME})
 
 
 def account_scope_for(

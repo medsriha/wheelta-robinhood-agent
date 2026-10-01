@@ -4,7 +4,7 @@ CLAUDE.md §8 (three-layer tool access), §9 (Tier S rules), §14, §18, §24; d
 "Delivery and failure contract"; ADR-0009 (board filter append).
 
 - `PreToolUse` records `requested` for every call before any decision, then denies (fail
-  closed) an unregistered tool, a built-in other than WebSearch/WebFetch, an EXCLUDED tool, a
+  closed) an unregistered tool, a built-in other than `Agent`, an EXCLUDED tool, a
   denied Tier X tool, an order tool outside live mode, Tier S with workspace writes off, any
   Tier S/X call after the kill switch or the RunControl stop latch, a call outside the
   Agentic account scope, and a Tier S call that fails ownership (prefix AND ledger-recorded
@@ -15,6 +15,12 @@ CLAUDE.md §8 (three-layer tool access), §9 (Tier S rules), §14, §18, §24; d
   over its sell-to-open legs (DTE, delta, cushion, annualized yield) and is denied, with the
   failed checks and values as the reason the agent receives, when any check fails or cannot
   be computed. No gate configured denies every placement (fail closed).
+- Tavily web research (ADR-0058): `tavily_search`/`tavily_extract` arguments are narrowed to
+  `integrations/websearch/inputs.py` `effective_input` and sent as `updatedInput` (a call
+  outside it is denied with the reason). A search with a fresh identical cache entry is
+  denied (ADR-0016); an extract of a URL that returned no content this run, or that the same
+  Mignon already extracted, is denied (ADR-0056). Only URLs an extract returned content for
+  are citable by that Mignon.
 - `PostToolUse` validates the raw result through the injected validator, persists it, and
   replaces the model-visible output (`updatedToolOutput`) with the persisted envelope.
 - `PostToolUseFailure` records the failure. Tier S/X failures are `unknown`, never retried.
@@ -95,7 +101,6 @@ from wheelta_robinhood_agent.agent.proxy_dispatch import (
 )
 from wheelta_robinhood_agent.agent.recorder import ResultKind, ToolEventRecorder
 from wheelta_robinhood_agent.agent.run_control import RunControl
-from wheelta_robinhood_agent.agent.tool_access import ALLOWED_BUILTINS
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
 from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules
 from wheelta_robinhood_agent.config.settings import Settings
@@ -120,11 +125,24 @@ from wheelta_robinhood_agent.domain.mignon_report import (
     web_sourced_indices,
 )
 from wheelta_robinhood_agent.domain.run import StopReason
+from wheelta_robinhood_agent.domain.web_cache import normalize_url
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry, ToolSpec
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     PLACE_ORDER_TOOL,
     ROBINHOOD_REGISTRY,
 )
+from wheelta_robinhood_agent.integrations.websearch.inputs import (
+    TavilyInputError,
+    effective_input,
+)
+from wheelta_robinhood_agent.integrations.websearch.registry import (
+    EXTRACT_TOOL,
+    SEARCH_TOOL,
+)
+from wheelta_robinhood_agent.integrations.websearch.registry import (
+    SERVER_NAME as TAVILY,
+)
+from wheelta_robinhood_agent.integrations.websearch.results import extracted_urls
 from wheelta_robinhood_agent.integrations.wheelta.board_filters import (
     FILTERS_ARG,
     BoardFilterError,
@@ -377,10 +395,10 @@ class HookDeps:
         default_factory=lambda: ROBINHOOD_WORKSPACE_TARGETS
     )
     hook_timeout_seconds: float = DEFAULT_HOOK_TIMEOUT_SECONDS
-    # Optional web-search cache (agent/web_cache.py), WebSearch/WebFetch only.
-    # `web_precheck(tool_name, tool_input)` returns a deny reason (e.g. an identical fresh
-    # search is recorded) or None. `web_capture(tool_call_id, tool_name, tool_input,
-    # validated_envelope)` stores a validated result; its failure never fails the session.
+    # Optional web-search cache (agent/web_cache.py), `tavily_search` only (ADR-0058).
+    # `web_precheck(tool_name, effective_input)` returns a deny reason (an identical fresh
+    # search is recorded) or None. `web_capture(tool_call_id, tool_name, effective_input,
+    # delivered_envelope)` stores a validated result; its failure never fails the session.
     web_precheck: WebPrecheck | None = None
     web_capture: WebCapture | None = None
     # Servers withheld this run (not connected, discovery failed, unverified, or result
@@ -474,11 +492,9 @@ class _Denied(Exception):
 
 
 def _resolve(name: str, registries: tuple[ToolRegistry, ...]) -> _Resolved:
-    """Map an SDK tool name to server/tool/tier. WebSearch/WebFetch are research (Tier R),
-    `Agent` is delegation (Tier D); any other built-in (the `Task` alias included) and any
-    unregistered MCP tool has no tier."""
-    if name in ALLOWED_BUILTINS:
-        return _Resolved(BUILTIN_SERVER, name, ToolTier.R, None, True)
+    """Map an SDK tool name to server/tool/tier. `Agent` is delegation (Tier D); any other
+    built-in (WebSearch, WebFetch, the `Task` alias) and any unregistered MCP tool has no
+    tier."""
     if name == DELEGATION_TOOL:
         return _Resolved(BUILTIN_SERVER, name, ToolTier.D, None, True)
     parts = name.split("__", 2)
@@ -548,35 +564,26 @@ def _refs_in(value: object, out: set[str]) -> None:
             _refs_in(item, out)
 
 
-WEB_FETCH_TOOL: Final = "WebFetch"
 REFUSED_FETCH_DENIAL: Final = (
-    "this URL was refused (HTTP error) or timed out earlier in this run; it is not fetched "
-    "again. Look for the same facts from the company, a regulator, or another tier-1 or "
-    "tier-2 source"
+    "{urls}: returned no content or failed earlier in this run, so not extracted again. Look "
+    "for the same facts from the company, a regulator, or another tier-1 or tier-2 source"
 )
 REPEAT_FETCH_DENIAL: Final = (
-    "you already fetched this URL in this task; use that result and cite the URL as fetched"
+    "you already extracted {urls} in this task; use that result and cite the URL as returned"
 )
 
 
-def _fetch_url(tool_input: Mapping[str, Any]) -> str | None:
-    url = tool_input.get("url")
-    return url if isinstance(url, str) and url else None
+def _extract_urls(tool_input: Mapping[str, Any]) -> tuple[str, ...]:
+    urls = tool_input.get("urls")
+    return tuple(u for u in urls if isinstance(u, str)) if isinstance(urls, list) else ()
 
 
-def _fetch_http_error(tool: str, response: object) -> str | None:
-    """Why a WebFetch result holds no page, or None (ADR-0056).
-
-    The pinned CLI's WebFetch result carries the HTTP status as `code` (a 403 comes back as a
-    normal result with `bytes` 0). A status outside 2xx, or a `code` that is not an integer, is
-    a failed fetch. A result without `code` is judged as before (it has no status to check).
-    """
-    if tool != WEB_FETCH_TOOL or not isinstance(response, Mapping) or "code" not in response:
-        return None
-    code = response.get("code")
-    if isinstance(code, int) and not isinstance(code, bool) and 200 <= code < 300:
-        return None
-    return f"WebFetch returned HTTP {code}: no page was retrieved"
+def _url_key(url: str) -> str:
+    """A URL compared as the web cache compares it (scheme/host case, fragment dropped)."""
+    try:
+        return normalize_url(url)
+    except ValueError:
+        return url
 
 
 def _mentions(text: str, ref: str) -> bool:
@@ -705,7 +712,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     mignon_refs: dict[str, set[str]] = {}
     mignon_urls: dict[str, set[str]] = {}
     run_refs: set[str] = set()
-    # ADR-0056: URLs a WebFetch was refused (non-2xx) or failed on (timeout) this session.
+    # ADR-0056/0058: URLs (`_url_key`) a tavily_extract returned no content for, or failed on.
     refused_urls: set[str] = set()
     # ADR-0047: reports under repair, by Mignon `agent_id`.
     drafts: dict[str, _MignonDraft] = {}
@@ -792,6 +799,34 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         if len(active) >= limits.max_concurrent:
             raise _Denied(f"mignons.max_concurrent={limits.max_concurrent} reached")
 
+    def check_web(
+        tool: str, tool_input: Mapping[str, Any], data: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """The effective Tavily input (ADR-0058), or `_Denied`.
+
+        A page is citable only by the Mignon that extracted it, so another Mignon extracts it
+        again (no cache denial); a repeat by the same Mignon, or a URL that returned no
+        content or failed this run, is denied (ADR-0056)."""
+        try:
+            effective = effective_input(tool, tool_input)
+        except TavilyInputError as exc:
+            raise _Denied(str(exc)) from None
+        if tool == EXTRACT_TOOL:
+            urls = _extract_urls(effective)
+            refused = [u for u in urls if _url_key(u) in refused_urls]
+            if refused:
+                raise _Denied(REFUSED_FETCH_DENIAL.format(urls=", ".join(refused)))
+            caller = data.get("agent_id")
+            seen = mignon_urls.get(caller, set()) if isinstance(caller, str) else set()
+            repeated = [u for u in urls if u in seen]
+            if repeated:
+                raise _Denied(REPEAT_FETCH_DENIAL.format(urls=", ".join(repeated)))
+        elif tool == SEARCH_TOOL and deps.web_precheck is not None:
+            web_reason = deps.web_precheck(tool, effective)
+            if web_reason is not None:
+                raise _Denied(web_reason)
+        return effective
+
     def decide(
         resolved: _Resolved, tool_input: dict[str, Any], data: Mapping[str, Any]
     ) -> tuple[ToolTier, dict[str, Any], tuple[JsonValue, ...], dict[str, Any] | None]:
@@ -828,24 +863,6 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             raise _Denied(f"{resolved.qualified} is not available to the {role.value}")
         if tier is ToolTier.D:
             check_spawn(tool_input)
-        if resolved.tool == WEB_FETCH_TOOL:
-            # ADR-0056: a fetch is citable only by the Mignon that made it, so a page fetched
-            # elsewhere is fetched again (no cache denial); a repeat by the same Mignon, or a
-            # URL already refused or timed out this run, is denied.
-            url = _fetch_url(tool_input)
-            caller = data.get("agent_id")
-            if url is not None and url in refused_urls:
-                raise _Denied(REFUSED_FETCH_DENIAL)
-            if (
-                url is not None
-                and isinstance(caller, str)
-                and url in mignon_urls.get(caller, set())
-            ):
-                raise _Denied(REPEAT_FETCH_DENIAL)
-        elif resolved.tool in ALLOWED_BUILTINS and deps.web_precheck is not None:
-            web_reason = deps.web_precheck(resolved.tool, tool_input)
-            if web_reason is not None:
-                raise _Denied(web_reason)
         if tier is ToolTier.S and not deps.workspace_writes:
             raise _Denied("workspace writes are disabled")
         if tier in (ToolTier.S, ToolTier.X, ToolTier.D):
@@ -868,6 +885,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             pretrade_reason = deps.pretrade_gate(tool_input)
             if pretrade_reason is not None:
                 raise _Denied(pretrade_reason)
+        if resolved.server == TAVILY:
+            return tier, check_web(resolved.tool, tool_input, data), (), None
         if resolved.server == WHEELTA and resolved.tool == BOARD_QUERY_TOOL:
             try:
                 updated = append_rules_filters(tool_input, deps.rules)
@@ -1081,27 +1100,10 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 )
             payload = envelope.model_dump(mode="json")
             valid = envelope.kind is EnvelopeKind.VALIDATED
-            # ADR-0056: a fetch the server refused (HTTP 403, 404, 5xx...) delivered no page.
-            # It is still shown to the model (a built-in result cannot be replaced) but is
-            # recorded as failed, never cached, and never counts as a fetched URL.
-            http_error = _fetch_http_error(call.tool, data.get("tool_response")) if valid else None
-            usable = valid and http_error is None
             ref = deps.recorder.store_result(
-                call.tool_call_id, ResultKind.VALIDATED if usable else ResultKind.ERROR, payload
+                call.tool_call_id, ResultKind.VALIDATED if valid else ResultKind.ERROR, payload
             )
-            if http_error is not None:
-                url = _fetch_url(call.effective_input)
-                if url is not None:
-                    refused_urls.add(url)
-                deps.recorder.outcome(
-                    call.tool_call_id,
-                    ToolCallStatus.FAILED,
-                    observed_at=now,
-                    dedup_key=_RESULT_DEDUP_KEY,
-                    reason=http_error,
-                    error_ref=ref,
-                )
-            elif valid:
+            if valid:
                 deps.recorder.outcome(
                     call.tool_call_id,
                     ToolCallStatus.SUCCEEDED,
@@ -1118,16 +1120,6 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                     reason=f"result {envelope.kind.value}",
                     error_ref=ref,
                 )
-            if usable and call.builtin and deps.web_capture is not None:
-                try:
-                    deps.web_capture(call.tool_call_id, call.tool, call.effective_input, payload)
-                except Exception as exc:
-                    # The cache is an optimization: record the error, keep delivering.
-                    deps.recorder.store_result(
-                        call.tool_call_id,
-                        ResultKind.ERROR,
-                        {"web_capture_error": type(exc).__name__},
-                    )
             context_text = filters_context(call)
             # Built-in outputs must match the tool's own schema, so a replacement would be
             # rejected (types.py PostToolUseHookSpecificOutput); they are recorded, not replaced.
@@ -1152,8 +1144,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             deps.recorder.delivered(
                 call.tool_call_id, delivered_result_ref=delivered_ref, observed_at=now
             )
-            if usable:
-                note_delivered(call, view)
+            # Both check the envelope's kind: a failed extract still refuses its URLs.
+            note_delivered(call, view)
+            capture_web(call, view)
         except Exception as exc:
             stop(now)
             reason = f"result validation or recording failed ({type(exc).__name__})"
@@ -1214,6 +1207,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
             deps.recorder.delivered(call.tool_call_id, delivered_result_ref=ref, observed_at=now)
             note_delivered(call, delivered_payload(delivered))
+            capture_web(call, delivered_payload(delivered))
         except Exception as exc:
             stop(now)
             reason = f"proxied delivery check or recording failed ({type(exc).__name__})"
@@ -1250,18 +1244,45 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         return out
 
     def note_delivered(call: _Call, envelope: object) -> None:
-        """Remember the refs a validated result delivered, per Mignon, and its fetched URL."""
+        """Remember the refs a validated result delivered, per Mignon, and the URLs an
+        extract returned content for (citable by that Mignon) or not (refused this run)."""
+        is_extract = call.server == TAVILY and call.tool == EXTRACT_TOOL
         if not isinstance(envelope, Mapping) or envelope.get("kind") != EnvelopeKind.VALIDATED:
+            if is_extract:
+                # A failed extract (cap, timeout, schema): its URLs are not retried this run.
+                refused_urls.update(_url_key(u) for u in _extract_urls(call.effective_input))
             return
         refs: set[str] = set()
         _refs_in(envelope.get("data"), refs)
         run_refs.update(refs)
+        if is_extract:
+            fetched, failed = extracted_urls(envelope.get("data"))
+            refused_urls.update(_url_key(u) for u in failed)
+            if call.agent_id is not None:
+                keys = {_url_key(u) for u in fetched}
+                # Tavily may return a URL in another spelling; the requested one is citable too.
+                requested = (u for u in _extract_urls(call.effective_input) if _url_key(u) in keys)
+                mignon_urls.setdefault(call.agent_id, set()).update((*fetched, *requested))
         if call.agent_id is None:
             return
         mignon_refs.setdefault(call.agent_id, set()).update(refs)
-        url = call.effective_input.get("url")
-        if call.tool == "WebFetch" and isinstance(url, str):
-            mignon_urls.setdefault(call.agent_id, set()).add(url)
+
+    def capture_web(call: _Call, envelope: object) -> None:
+        """Record a validated `tavily_search` result in the web cache (ADR-0016). The cache is
+        an optimization: a failure is recorded and delivery continues."""
+        if deps.web_capture is None or not (call.server == TAVILY and call.tool == SEARCH_TOOL):
+            return
+        if not isinstance(envelope, Mapping) or envelope.get("kind") != EnvelopeKind.VALIDATED:
+            return
+        try:
+            deps.web_capture(
+                call.tool_call_id, call.tool, call.effective_input, cast(JsonValue, envelope)
+            )
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                deps.recorder.store_result(
+                    call.tool_call_id, ResultKind.ERROR, {"web_capture_error": type(exc).__name__}
+                )
 
     def agent_post(
         call: _Call, use_id: str, tool_response: object, now: datetime
@@ -1526,11 +1547,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         if call.tier is ToolTier.D:
             active.discard(cast(str, use_id))
-        if call.builtin and call.tool == WEB_FETCH_TOOL:
-            # ADR-0056: a timed-out or refused fetch is not retried this run.
-            failed_url = _fetch_url(call.effective_input)
-            if failed_url is not None:
-                refused_urls.add(failed_url)
+        if call.server == TAVILY and call.tool == EXTRACT_TOOL:
+            # ADR-0056: a timed-out or failed extract is not retried this run.
+            refused_urls.update(_url_key(u) for u in _extract_urls(call.effective_input))
         status = unresolved_status(call.tier)
         error_text = deps.redactor.redact_text(str(data.get("error", "")))
         interrupted = data.get("is_interrupt") is True

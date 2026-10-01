@@ -123,6 +123,11 @@ class FakeModel:
         # The user message this turn answers: the start message, or an output repair request.
         self.message = message
 
+    @property
+    def system_prompt(self) -> str:
+        """The orchestrator's rendered prompt (ADR-0057: tells the close agent from sell)."""
+        return str(self._cli.options.system_prompt or "")
+
     async def call(self, name: str, tool_input: dict[str, Any]) -> ToolTurn:
         return await self._cli.tool_call(name, tool_input, self.agent)
 
@@ -531,11 +536,6 @@ class FakeCli(Transport):
 
     async def _execute(self, name: str, tool_input: dict[str, Any]) -> Any:
         self.world.calls.append((name, tool_input))
-        if name == "WebSearch":
-            query = str(tool_input.get("query"))
-            return {"query": query, "results": self.world.web_results.get(query, [])}
-        if name == "WebFetch":
-            return {"url": tool_input.get("url"), "content": "fetched page"}
         _, server, tool = name.split("__", 2)
         if server in self._sdk_servers():
             params = {

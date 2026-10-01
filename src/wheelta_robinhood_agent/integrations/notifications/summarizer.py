@@ -25,14 +25,20 @@ SYSTEM_PROMPT = """\
 You write the email a trading agent's owner receives after each run of an autonomous \
 options agent (cash-secured puts and covered calls on a Robinhood account).
 
-The user message is a JSON record produced by code from the run's ledger. Write a brief \
-overview, usually 80–150 words and shorter for quiet runs. The email already includes the \
-recorded decisions, rationales, order outcomes, research, issues and next-run schedule below \
-your overview. Do not repeat that detailed inventory.
+Each run is two agents in order: the Buy-to-Close agent manages existing short options \
+(close, roll, or hold), then the Sell Options agent opens new positions. The user message is \
+a JSON record produced by code from the ledger, with one entry per agent under "agents". \
+Write a brief overview, usually 80–200 words and shorter for quiet runs: a short \
+"Buy-to-Close:" part, then a "Sell Options:" part. An agent whose run.session_started is \
+false gets one sentence: it did not run, and why (run.status and run.reason). One agent's \
+failure does not mean the other failed; describe each from its own entry. The email \
+already includes the recorded decisions, rationales, order outcomes, research, issues and \
+next-run schedule below your overview. Do not repeat that detailed inventory.
 
 Rules:
 - Use only facts in the JSON. Never add, compute, round, convert, or estimate a number. Copy \
 prices, strikes, quantities, and dates exactly as written, or leave them out.
+- Within each agent's part, the rules below apply to that agent's entry.
 - For failed, timed_out or stopped runs, lead with what went wrong. Explain run.reason in \
 plain language and include relevant diagnostic_details, validation/assembly findings and \
 audit details. Preserve the actual error and stage when recorded. Distinguish a failed \

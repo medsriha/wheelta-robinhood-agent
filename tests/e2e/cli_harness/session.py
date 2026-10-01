@@ -2,7 +2,7 @@
 
 Real: `claude-agent-sdk` 0.2.160 with its bundled CLI, `ClaudeSDKClient`, our `build_hooks`
 (tool access layer 3, recording, result boundary), `build_agent_options` (strict MCP config,
-`setting_sources=[]`, dontAsk, WebSearch/WebFetch only), `BoundaryValidator`, the Robinhood
+`setting_sources=[]`, dontAsk, `Agent` the only built-in), `BoundaryValidator`, the Robinhood
 registry and account-scope table, and `RunControl`. Doubles: the recorder (in memory, can be
 told to fail or stall), optionally the validator/clock, the model endpoint and the MCP server.
 

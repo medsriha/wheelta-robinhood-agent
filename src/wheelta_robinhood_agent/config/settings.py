@@ -9,7 +9,7 @@ import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from pydantic import (
     AnyHttpUrl,
@@ -31,6 +31,9 @@ PHASE_EXECUTION_CEILING = ExecutionMode.LIVE
 
 # The run budget stays below the hourly fallback cadence (ADR-0028). The cron ticks every 5
 # minutes; Railway skips ticks that overlap a running run, and the lock backs that up.
+# ADR-0057: orchestrator FINALIZE_RESERVE_SECONDS (60) + agent ORDER_WIND_DOWN_SECONDS (180);
+# config may not import those layers, so the sum is restated here (tested against both).
+_MIN_AGENT_BUDGET_SECONDS: Final = 240
 _CRON_INTERVAL_SECONDS = 3600
 # Model aliases the Agent SDK/CLI would resolve to a moving target; settings pin exact IDs.
 # An exact model ID: lowercase alphanumerics and dots in hyphen-separated parts (it must fit
@@ -78,7 +81,10 @@ class Settings(BaseSettings):
 
     APP_ENV: AppEnv = AppEnv.LOCAL
     LOG_LEVEL: LogLevel = LogLevel.INFO
-    RUN_TIMEOUT_SECONDS: PositiveInt = 2400  # ADR-0053
+    RUN_TIMEOUT_SECONDS: PositiveInt = 2400  # ADR-0053; ADR-0057: the whole tick, both agents
+    # ADR-0057: the Buy-to-Close agent's share of the tick budget; the Sell Options agent gets
+    # what remains. Must be below RUN_TIMEOUT_SECONDS.
+    CLOSE_AGENT_TIMEOUT_SECONDS: PositiveInt = 900
 
     # Safety controls. Unknown EXECUTION_MODE values are treated as off (CLAUDE.md §18); the
     # raw requested value is kept for the run's config snapshot.
@@ -113,6 +119,11 @@ class Settings(BaseSettings):
     WHEELTA_MCP_URL: AnyHttpUrl = AnyHttpUrl("https://mcp.wheelta.com/mcp")
     WHEELTA_MCP_TOKEN: SecretStr
 
+    # ADR-0058: Tavily web search for research Mignons, through the validating proxy. Without a
+    # key the source is disabled and Mignons have no web tools; the run continues.
+    TAVILY_MCP_URL: AnyHttpUrl = AnyHttpUrl("https://mcp.tavily.com/mcp/")
+    TAVILY_API_KEY: SecretStr | None = None
+
     DATABASE_URL: SecretStr
 
     HEARTBEAT_URL: SecretStr | None = None
@@ -143,6 +154,7 @@ class Settings(BaseSettings):
         "RESEND_API_KEY",
         "RUN_SUMMARY_EMAIL_TO",
         "RUN_SUMMARY_MODEL",
+        "TAVILY_API_KEY",
         mode="before",
     )
     @classmethod
@@ -180,6 +192,22 @@ class Settings(BaseSettings):
         if value is not None and not _EMAIL_ADDRESS_PATTERN.fullmatch(value.get_secret_value()):
             raise ValueError("must be a single email address")
         return value
+
+    @model_validator(mode="after")
+    def _close_agent_budget_within_run(self) -> "Settings":
+        """ADR-0057: each agent's share of the tick budget must leave working time after the
+        finalization reserve and the order wind-down (60 s + 180 s, ADR-0050), or its
+        session would start in wind-down and could not trade."""
+        if self.CLOSE_AGENT_TIMEOUT_SECONDS <= _MIN_AGENT_BUDGET_SECONDS:
+            raise ValueError(
+                f"CLOSE_AGENT_TIMEOUT_SECONDS must exceed {_MIN_AGENT_BUDGET_SECONDS} s"
+            )
+        if self.RUN_TIMEOUT_SECONDS - self.CLOSE_AGENT_TIMEOUT_SECONDS <= _MIN_AGENT_BUDGET_SECONDS:
+            raise ValueError(
+                "CLOSE_AGENT_TIMEOUT_SECONDS must be below RUN_TIMEOUT_SECONDS by more than "
+                f"{_MIN_AGENT_BUDGET_SECONDS} s (the Sell Options agent's share)"
+            )
+        return self
 
     @model_validator(mode="after")
     def _run_summary_email_is_complete(self) -> "Settings":
@@ -325,6 +353,7 @@ class Settings(BaseSettings):
             "app_env": self.APP_ENV.value,
             "log_level": self.LOG_LEVEL.value,
             "run_timeout_seconds": self.RUN_TIMEOUT_SECONDS,
+            "close_agent_timeout_seconds": self.CLOSE_AGENT_TIMEOUT_SECONDS,
             "execution_mode_raw": self.EXECUTION_MODE,
             "requested_execution_mode": self.requested_execution_mode.value,
             "effective_execution_mode": self.effective_execution_mode.value,
@@ -347,6 +376,8 @@ class Settings(BaseSettings):
             "workspace_writes_enabled": self.workspace_writes_enabled,
             "robinhood_workspace_prefix": self.ROBINHOOD_WORKSPACE_PREFIX,
             "wheelta_mcp_url": str(self.WHEELTA_MCP_URL),
+            "tavily_mcp_url": str(self.TAVILY_MCP_URL),
+            "tavily_key_present": self.TAVILY_API_KEY is not None,
             "heartbeat_configured": self.HEARTBEAT_URL is not None,
             "alerts_configured": self.ALERT_WEBHOOK_URL is not None,
             "run_summary_email_enabled": self.RUN_SUMMARY_EMAIL_ENABLED,

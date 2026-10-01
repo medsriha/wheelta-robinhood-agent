@@ -1,4 +1,5 @@
-"""Run-summary email over Resend and the Anthropic Messages API (ADR-0029).
+"""Run-summary email over Resend and the Anthropic Messages API (ADR-0029; one per tick,
+ADR-0057).
 
 httpx.MockTransport routes by host: no sockets.
 """
@@ -13,7 +14,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from wheelta_robinhood_agent.domain.enums import AppEnv, ExecutionMode, RunStatus
+from wheelta_robinhood_agent.domain.enums import AgentRole, AppEnv, ExecutionMode, RunStatus
 from wheelta_robinhood_agent.integrations.notifications.email import (
     EmailDeliveryStatus,
     EmailMessage,
@@ -32,6 +33,7 @@ from wheelta_robinhood_agent.observability.run_summary import (
     PROSE_UNAVAILABLE,
     ConsideredOption,
     RunSummaryInput,
+    SlotSummaryInput,
 )
 
 T0 = datetime(2026, 9, 28, 14, 5, tzinfo=UTC)
@@ -44,11 +46,13 @@ SUMMARY = RunSummaryInput(
     slot=T0,
     status=RunStatus.COMPLETED,
     reason="completed",
+    agent=AgentRole.CLOSE,
     requested_execution_mode=ExecutionMode.OFF,
     effective_execution_mode=ExecutionMode.OFF,
     record=None,
     audit_status="completed",
 )
+KEY = f"run-summary/local/{T0.isoformat()}"
 REDACTOR = Redactor(secrets=(SecretStr(RESEND_KEY), SecretStr(ANTHROPIC_KEY)))
 
 
@@ -97,11 +101,19 @@ def _config(**kw: Any) -> RunSummaryEmailConfig:
     return RunSummaryEmailConfig(**base)
 
 
+def _tick(*agents: RunSummaryInput) -> SlotSummaryInput:
+    return SlotSummaryInput(environment=AppEnv.LOCAL, slot=T0, agents=agents)
+
+
 def _send(router: Router, *, summary: RunSummaryInput = SUMMARY, **kw: Any) -> Any:
+    return _send_tick(router, _tick(summary), **kw)
+
+
+def _send_tick(router: Router, tick: SlotSummaryInput, **kw: Any) -> Any:
     client = httpx.Client(transport=httpx.MockTransport(router))
     sleeps: list[float] = []
     result = send_run_summary(
-        summary, config=_config(**kw), client=client, redactor=REDACTOR, sleep=sleeps.append
+        tick, config=_config(**kw), client=client, redactor=REDACTOR, sleep=sleeps.append
     )
     return result, sleeps
 
@@ -116,14 +128,16 @@ def test_sends_prose_and_facts_with_an_idempotency_key() -> None:
     assert llm.headers["anthropic-version"] == ANTHROPIC_VERSION
     body = json.loads(llm.content)
     assert body["model"] == "claude-test-model"
-    assert json.loads(body["messages"][0]["content"])["run"]["run_id"] == "run-1"
+    facts = json.loads(body["messages"][0]["content"])
+    assert facts["agents"][0]["run"]["run_id"] == "run-1"
+    assert facts["agents"][0]["agent"] == "Buy-to-Close agent"
     assert "tools" not in body
     (mail,) = router.requests["api.resend.com"]
     assert mail.headers["authorization"] == f"Bearer {RESEND_KEY}"
-    assert mail.headers["idempotency-key"] == "run-summary/local/run-1"
+    assert mail.headers["idempotency-key"] == KEY
     sent = json.loads(mail.content)
     assert sent["to"] == [RECIPIENT] and sent["from"] == "Wheelta Agent <agent@wheelta.com>"
-    assert sent["subject"].startswith("[Wheelta agent] completed · dry run")
+    assert sent["subject"].startswith("[Wheelta agent] dry run · close: completed, no trades")
     assert sent["text"].startswith("Nothing traded; the agent held.")
     assert "Recorded facts (authoritative)" in sent["text"] and "<pre" in sent["html"]
 
@@ -167,12 +181,54 @@ def test_failure_context_reaches_writer_and_delivered_fallback_without_secrets()
     assert result.status is EmailDeliveryStatus.SENT and not result.prose_written
     request_body = json.loads(router.requests["api.anthropic.com"][0].content)
     facts = json.loads(request_body["messages"][0]["content"])
-    assert "PermissionError" in facts["diagnostic_details"][0]
-    assert facts["candidates"][0]["selection"] == "unknown"
+    assert "PermissionError" in facts["agents"][0]["diagnostic_details"][0]
+    assert facts["agents"][0]["candidates"][0]["selection"] == "unknown"
     sent = json.loads(router.requests["api.resend.com"][0].content)
     assert "PermissionError" in sent["text"] and "PermissionError" in sent["html"]
     assert "AAPL  261016P00190000" in sent["text"]
     assert ANTHROPIC_KEY not in repr(facts) and ANTHROPIC_KEY not in repr(sent)
+
+
+def test_one_email_covers_both_agents_in_order() -> None:
+    """ADR-0057: a skipped close agent gets one line; the sell agent its full section."""
+    close = SUMMARY.model_copy(
+        update={
+            "run_id": "close-1",
+            "status": RunStatus.SKIPPED_NO_OPEN_SHORTS,
+            "reason": "no open short option positions",
+            "session_started": False,
+            "audit_status": None,
+        }
+    )
+    sell = SUMMARY.model_copy(update={"run_id": "sell-1", "agent": AgentRole.SELL})
+    tick = _tick(close, sell).model_copy(
+        update={"next_run_at": T0.replace(hour=15), "next_run_source": "agent"}
+    )
+    router = Router()
+    result, _ = _send_tick(router, tick)
+    assert result.status is EmailDeliveryStatus.SENT
+    facts = json.loads(
+        json.loads(router.requests["api.anthropic.com"][0].content)["messages"][0]["content"]
+    )
+    assert [a["agent"] for a in facts["agents"]] == ["Buy-to-Close agent", "Sell Options agent"]
+    assert facts["agents"][0]["run"]["session_started"] is False
+    assert facts["agents"][1]["run"]["session_started"] is True
+    assert facts["tick"]["next_run_source"] == "agent"
+    sent = json.loads(router.requests["api.resend.com"][0].content)
+    assert sent["subject"].startswith(
+        "[Wheelta agent] dry run · close: skipped_no_open_shorts · sell: completed, no trades"
+    )
+    text = sent["text"]
+    assert text.index("== Buy-to-Close agent ==") < text.index("== Sell Options agent ==")
+    assert "Status: skipped_no_open_shorts (no open short option positions)" in text
+    assert "No session started." in text
+    assert "Next run of both agents not before: 2026-09-28T15:05:00+00:00 (agent)" in text
+
+
+def test_a_tick_summary_needs_one_slot() -> None:
+    other = SUMMARY.model_copy(update={"slot": T0.replace(minute=10)})
+    with pytest.raises(ValueError, match="slot"):
+        _tick(SUMMARY, other)
 
 
 def test_disabled_or_unconfigured_skips_without_any_request() -> None:
@@ -195,7 +251,7 @@ def test_resend_5xx_and_429_retry_with_the_same_key() -> None:
     assert result.status is EmailDeliveryStatus.SENT and result.attempts == 3
     assert sleeps[1] == 2.0
     keys = {r.headers["idempotency-key"] for r in router.requests["api.resend.com"]}
-    assert keys == {"run-summary/local/run-1"}
+    assert keys == {KEY}
 
 
 def test_resend_4xx_is_not_retried_and_fails_without_raising() -> None:

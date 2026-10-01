@@ -9,15 +9,22 @@ JSON numbers anywhere are rejected. `next_run.at` (v6, ADR-0028) is an RFC 3339 
 explicit offset, parsed to a UTC datetime; it is a scheduling request, never a financial fact.
 One ```json (or bare ```) fence enclosing the whole response is removed first (ADR-0035).
 
+ADR-0057: each agent role may use only its own actions (`ROLE_ACTIONS`): the Buy-to-Close
+agent CLOSE/ROLL/HOLD, the Sell Options agent OPEN_CSP/OPEN_CC. Given `allowed_actions`, the
+parser reports any other action as an `action_not_allowed` issue (so the session's repair
+turns apply).
+
 Context-dependent semantic validation (reference resolution, action/leg compatibility) is
 a separate, later step and is not performed here.
 """
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Annotated, Final, Literal, Self
 
 from pydantic import (
@@ -30,9 +37,19 @@ from pydantic import (
 )
 
 from wheelta_robinhood_agent.domain.base import DomainModel, require_unique
-from wheelta_robinhood_agent.domain.enums import DecisionAction
+from wheelta_robinhood_agent.domain.enums import AgentRole, DecisionAction
 
 SCHEMA_VERSION: Final = 6
+# ADR-0057: the actions each agent role may decide. WHEEL is the legacy single agent.
+ROLE_ACTIONS: Final[Mapping[AgentRole, frozenset[DecisionAction]]] = MappingProxyType(
+    {
+        AgentRole.WHEEL: frozenset(DecisionAction),
+        AgentRole.CLOSE: frozenset(
+            {DecisionAction.CLOSE, DecisionAction.ROLL, DecisionAction.HOLD}
+        ),
+        AgentRole.SELL: frozenset({DecisionAction.OPEN_CSP, DecisionAction.OPEN_CC}),
+    }
+)
 LIMIT_PRICE_PATTERN: Final = r"^(0|[1-9][0-9]*)(\.[0-9]+)?$"
 _LIMIT_PRICE_RE = re.compile(LIMIT_PRICE_PATTERN)
 NEXT_RUN_AT_PATTERN: Final = (
@@ -282,7 +299,9 @@ def validation_issues(exc: ValidationError) -> tuple[ParseIssue, ...]:
     )
 
 
-def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
+def parse_agent_decision_output(
+    raw: str | bytes, allowed_actions: frozenset[DecisionAction] | None = None
+) -> DecisionOutputParseResult:
     """Parse the model's final response into AgentDecisionOutput v6.
 
     Never raises on bad model output: returns `DecisionOutputParseFailure` with the raw text
@@ -290,7 +309,8 @@ def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
     `decisions`), so prose or a code fence around it is dropped. The object itself is strict:
     duplicate keys, JSON numbers, NaN/Infinity, invalid UTF-8, unknown fields, and type
     mismatches are all failures (INTERFACES.md: forbid extra fields recursively; preserve the
-    raw response on failure).
+    raw response on failure). With `allowed_actions` (ADR-0057), a decision whose action is
+    not in it is a failure too.
     """
     loaded = load_strict_json(extract_json_object(raw, "decisions"))
     if isinstance(loaded, ParseIssue):
@@ -309,4 +329,18 @@ def parse_agent_decision_output(raw: str | bytes) -> DecisionOutputParseResult:
         return _failure(text, *validation_issues(exc))
     except RecursionError as exc:
         return _failure(text, ParseIssue(loc="", message=str(exc), kind="too_deep"))
+    if allowed_actions is not None:
+        allowed = ", ".join(sorted(a.value for a in allowed_actions))
+        issues = [
+            ParseIssue(
+                loc=f"decisions.{index}.action",
+                message=f"{decision.action.value} is not an action of this agent (allowed: "
+                f"{allowed})",
+                kind="action_not_allowed",
+            )
+            for index, decision in enumerate(output.decisions)
+            if decision.action not in allowed_actions
+        ]
+        if issues:
+            return _failure(text, *issues)
     return DecisionOutputParsed(ok=True, output=output)

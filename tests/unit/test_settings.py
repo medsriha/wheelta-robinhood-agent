@@ -139,6 +139,31 @@ def test_run_timeout_must_be_below_cron_interval(env: pytest.MonkeyPatch, value:
         load_settings()
 
 
+def test_close_agent_budget_must_leave_time_for_the_sell_agent(env: pytest.MonkeyPatch) -> None:
+    """ADR-0057: the close agent's share is below the whole-tick budget."""
+    assert load_settings().CLOSE_AGENT_TIMEOUT_SECONDS == 900
+    assert load_settings().config_snapshot()["close_agent_timeout_seconds"] == 900
+    env.setenv("RUN_TIMEOUT_SECONDS", "900")
+    with pytest.raises(SettingsError, match="CLOSE_AGENT_TIMEOUT_SECONDS"):
+        load_settings()
+    env.setenv("RUN_TIMEOUT_SECONDS", "1140")  # leaves the sell agent exactly 240 s
+    with pytest.raises(SettingsError, match="CLOSE_AGENT_TIMEOUT_SECONDS"):
+        load_settings()
+    env.setenv("RUN_TIMEOUT_SECONDS", "2400")
+    env.setenv("CLOSE_AGENT_TIMEOUT_SECONDS", "240")
+    with pytest.raises(SettingsError, match="must exceed 240"):
+        load_settings()
+
+
+def test_minimum_agent_budget_matches_the_reserve_and_wind_down() -> None:
+    from wheelta_robinhood_agent.agent.order_cleanup import ORDER_WIND_DOWN_SECONDS
+    from wheelta_robinhood_agent.config import settings as settings_module
+    from wheelta_robinhood_agent.orchestrator.main import FINALIZE_RESERVE_SECONDS
+
+    expected = FINALIZE_RESERVE_SECONDS + ORDER_WIND_DOWN_SECONDS
+    assert settings_module._MIN_AGENT_BUDGET_SECONDS == expected
+
+
 @pytest.mark.parametrize("name", ["EXECUTION_ARMED", "KILL_SWITCH"])
 def test_malformed_safety_bool_fails(env: pytest.MonkeyPatch, name: str) -> None:
     env.setenv(name, "maybe")

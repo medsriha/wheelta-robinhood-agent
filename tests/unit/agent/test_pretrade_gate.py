@@ -223,3 +223,68 @@ def test_a_working_close_is_recognised_whatever_the_case() -> None:
     g, _ = concurrent_gate((record.model_copy(update={"intent": intent}),))
     reason = g({**order(btc()), "quantity": "1"})
     assert reason is not None and "Only buy-to-close" not in reason
+
+
+# ---- agent role (ADR-0057) ------------------------------------------------------------------
+
+
+def _filled_close(quantity: int, filled: int) -> Any:
+    """A buy-to-close of this run on an XYZ put (inst-old), with `filled` contracts filled."""
+    from wheelta_robinhood_agent.domain.orders import FillObservationKind, FillRecord
+
+    base = _unresolved_close("inst-old")
+    intent = base.intent.model_copy(
+        update={"occ_symbol": OccSymbol.parse("XYZ   260930P00075000"), "quantity": quantity}
+    )
+    fills = (
+        (
+            FillRecord(
+                fill_id=UUID(int=20),
+                order_id=base.broker_order.order_id,
+                kind=FillObservationKind.EXECUTION,
+                broker_execution_id="exec-1",
+                quantity=filled,
+                price=D("0.50"),
+                executed_at=T0,
+                observed_at=T0,
+                source_tool_call_id=TC,
+            ),
+        )
+        if filled
+        else ()
+    )
+    return base.model_copy(update={"intent": intent, "fills": fills})
+
+
+def role_gate(role: Any, run_orders: tuple[Any, ...] = ()) -> PretradeGate:
+    return PretradeGate(
+        evidence=Loads(evidence()),
+        rules=RULES,
+        clock=lambda: T0,
+        role=role,
+        run_orders=lambda: run_orders,
+    )
+
+
+def test_the_sell_agent_cannot_buy_to_close() -> None:
+    from wheelta_robinhood_agent.domain.enums import AgentRole
+    from wheelta_robinhood_agent.domain.role_gate import ROLE_DENIAL_PREFIX
+
+    reason = role_gate(AgentRole.SELL)(order(btc()))
+    assert reason is not None and reason.startswith(ROLE_DENIAL_PREFIX)
+    assert role_gate(AgentRole.SELL)(order(sto())) is None
+
+
+def test_the_close_agent_opens_only_a_filled_roll_replacement() -> None:
+    from wheelta_robinhood_agent.domain.enums import AgentRole
+    from wheelta_robinhood_agent.domain.role_gate import ROLE_DENIAL_PREFIX
+
+    assert role_gate(AgentRole.CLOSE)(order(btc())) is None
+    new = role_gate(AgentRole.CLOSE)({**order(sto()), "quantity": "1"})
+    assert new is not None and new.startswith(ROLE_DENIAL_PREFIX)
+    unfilled = role_gate(AgentRole.CLOSE, (_filled_close(1, 0),))({**order(sto()), "quantity": "1"})
+    assert unfilled is not None and "allow 0" in unfilled
+    filled = role_gate(AgentRole.CLOSE, (_filled_close(1, 1),))
+    assert filled({**order(sto()), "quantity": "1"}) is None
+    over = filled({**order(sto()), "quantity": "2"})
+    assert over is not None and "allow 1" in over
