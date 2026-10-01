@@ -7,8 +7,8 @@ Layer 3 (the PreToolUse hook) re-checks every call. The prompt never decides any
 
 from pydantic import BaseModel, ConfigDict
 
-from wheelta_robinhood_agent.agent.mignons import DELEGATION_TOOL, ROLE_TOOLS, Role
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, OrderVenue, ToolTier
+from wheelta_robinhood_agent.agent.mignons import DELEGATION_TOOL, Role, role_tools
+from wheelta_robinhood_agent.domain.enums import AgentRole, ExecutionMode, OrderVenue, ToolTier
 from wheelta_robinhood_agent.domain.gating import check_venue, executes_orders, order_venue
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 
@@ -56,6 +56,7 @@ def build_tool_access(
     registries: tuple[ToolRegistry, ...],
     mignons: bool = True,
     venue: OrderVenue | None = None,
+    agent: AgentRole = AgentRole.WHEEL,
 ) -> ToolAccess:
     """Compute allowed and disallowed tools.
 
@@ -67,13 +68,14 @@ def build_tool_access(
       (a proxied dry run, ADR-0038); otherwise disallowed so the model never sees them.
       `venue` defaults to the mode's venue without a simulator (live: broker, off: none).
     - Every other Tier X tool and every EXCLUDED tool: disallowed in every mode.
-    By role (ADR-0025, agent/mignons.py): a tool is allowed only if some role may use it.
+    By role (ADR-0025, agent/mignons.py): a tool is allowed only if some role may use it in
+    `agent`'s session (ADR-0059: the orchestrator's tools depend on the agent).
     With `mignons` False (their limits are not integers) only the orchestrator's tools count,
     and `Agent` is disallowed.
     A tool absent from every registry is in neither list; `dontAsk` and the hook deny it.
     """
     roles = tuple(Role) if mignons else (Role.ORCHESTRATOR,)
-    usable = frozenset().union(*(ROLE_TOOLS[r] for r in roles))
+    usable = frozenset().union(*(role_tools(r, agent) for r in roles))
     if not mignons:
         usable -= {DELEGATION_TOOL}
     allowed: set[str] = {b for b in SESSION_BUILTINS if b in usable}

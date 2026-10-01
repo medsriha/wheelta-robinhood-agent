@@ -2,14 +2,14 @@ import itertools
 
 import pytest
 
-from wheelta_robinhood_agent.agent.mignons import ROLE_TOOLS, Role
+from wheelta_robinhood_agent.agent.mignons import AGENT_ORCHESTRATOR_TOOLS, ROLE_TOOLS, Role
 from wheelta_robinhood_agent.agent.tool_access import (
     DISALLOWED_BUILTINS,
     SESSION_BUILTINS,
     build_tool_access,
 )
 from wheelta_robinhood_agent.config.settings import PHASE_EXECUTION_CEILING
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolTier
+from wheelta_robinhood_agent.domain.enums import AgentRole, ExecutionMode, ToolTier
 from wheelta_robinhood_agent.domain.gating import effective_execution_mode
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     LIVE_ORDER_TOOLS,
@@ -109,3 +109,38 @@ def test_web_research_is_tavily_for_mignons_only(mode: ExecutionMode) -> None:
     assert not web & ROLE_TOOLS[Role.ORCHESTRATOR]
     assert not web & ROLE_TOOLS[Role.MARKET]
     assert web <= ROLE_TOOLS[Role.COMPANY] and web <= ROLE_TOOLS[Role.MACRO]
+
+
+SCAN_TOOLS = {
+    f"mcp__robinhood__{t}"
+    for t in ("get_scans", "create_scan", "update_scan_filters", "update_scan_config")
+}
+
+
+def test_close_agent_sees_no_scan_tools_but_keeps_orders() -> None:
+    """ADR-0059: the Buy-to-Close session does not list scan tools; the model never sees them."""
+    access = build_tool_access(
+        effective_mode=ExecutionMode.LIVE,
+        workspace_writes=True,
+        registries=REGISTRIES,
+        agent=AgentRole.CLOSE,
+    )
+    assert not SCAN_TOOLS & set(access.allowed_tools)
+    assert SCAN_TOOLS <= set(access.disallowed_tools)
+    assert ORDER_TOOLS <= set(access.allowed_tools)
+    # A Mignon's scanner stays: run_scan is the market Mignon's, not the orchestrator's.
+    assert "mcp__robinhood__run_scan" in access.allowed_tools
+
+
+@pytest.mark.parametrize("agent", [AgentRole.SELL, AgentRole.WHEEL])
+def test_sell_and_legacy_agents_keep_scan_tools(agent: AgentRole) -> None:
+    access = build_tool_access(
+        effective_mode=ExecutionMode.LIVE, workspace_writes=True, registries=REGISTRIES, agent=agent
+    )
+    assert SCAN_TOOLS <= set(access.allowed_tools)
+
+
+def test_agent_orchestrator_sets_are_within_the_orchestrator_role() -> None:
+    for agent in AgentRole:
+        assert AGENT_ORCHESTRATOR_TOOLS[agent] <= ROLE_TOOLS[Role.ORCHESTRATOR]
+    assert ROLE_TOOLS[Role.ORCHESTRATOR] - AGENT_ORCHESTRATOR_TOOLS[AgentRole.CLOSE] == SCAN_TOOLS

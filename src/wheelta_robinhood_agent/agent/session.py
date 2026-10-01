@@ -88,9 +88,9 @@ from wheelta_robinhood_agent.agent.mignons import (
     DELEGATION_TOOL,
     MIGNON_DESCRIPTIONS,
     MODEL_GUIDANCE,
-    ROLE_TOOLS,
     Role,
     mignon_limits,
+    role_tools,
 )
 from wheelta_robinhood_agent.agent.options import build_agent_options
 from wheelta_robinhood_agent.agent.order_cleanup import (
@@ -264,6 +264,8 @@ class SessionPlan:
     required_unavailable: tuple[str, ...]
     # Served in-process through the validating proxy (ADR-0023).
     proxied: tuple[McpHttpServer, ...] = ()
+    # ADR-0059: whose session this plan is; it decides the orchestrator's tools.
+    agent: AgentRole = AgentRole.WHEEL
 
     @property
     def may_start(self) -> bool:
@@ -296,6 +298,7 @@ def plan_session(
     proxy_accepted: bool = PROXY_RESULT_BOUNDARY_ACCEPTED,
     local_registry: ToolRegistry = LOCAL_REGISTRY,
     mignons: bool = True,
+    agent: AgentRole = AgentRole.WHEEL,
 ) -> SessionPlan:
     """Decide the exposed servers and tools before connecting (fail closed).
 
@@ -341,6 +344,7 @@ def plan_session(
         registries=registries,
         mignons=mignons,
         venue=venue,
+        agent=agent,
     )
     allowed = set(base.allowed_tools)
     disallowed = set(base.disallowed_tools)
@@ -369,6 +373,7 @@ def plan_session(
         withheld=withheld,
         required_unavailable=required,
         proxied=tuple(proxied),
+        agent=agent,
     )
 
 
@@ -391,7 +396,7 @@ _TOOL_PURPOSES: Final[dict[str, str]] = {
 
 def _role_rows(plan: SessionPlan, role: Role) -> list[str]:
     """Table rows for the role's tools allowed this run (`Agent` first, then registries)."""
-    allowed = set(plan.tool_access.allowed_tools) & ROLE_TOOLS[role]
+    allowed = set(plan.tool_access.allowed_tools) & role_tools(role, plan.agent)
     rows = []
     if DELEGATION_TOOL in allowed:
         rows.append(f"| `{DELEGATION_TOOL}` | D | {_TOOL_PURPOSES[DELEGATION_TOOL]} |")
@@ -505,6 +510,13 @@ class SessionDeps:
     # The tick's simulated broker state (simulated venue only; None: a fresh one).
     simulated_state: SimulatedState | None = None
 
+    def __post_init__(self) -> None:
+        # ADR-0059: the plan's tools were chosen for one agent; never run another on them.
+        if self.plan.agent is not self.role:
+            raise SessionPlanError(
+                f"session plan is for the {self.plan.agent.value} agent, not {self.role.value}"
+            )
+
 
 @dataclass
 class SessionResult:
@@ -608,6 +620,7 @@ def build_session_options(
         redactor=deps.redactor,
         clock=deps.clock,
         registries=deps.plan.registries,
+        agent=deps.plan.agent,
         account_scope_table=deps.account_scope_table,
         web_precheck=precheck,
         web_capture=capture,

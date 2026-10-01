@@ -29,6 +29,7 @@ from wheelta_robinhood_agent.agent.tool_access import ToolAccess
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME, WEB_CACHE_TOOL_NAME
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     ExecutionMode,
     MignonType,
     OrderVenue,
@@ -58,6 +59,7 @@ def _plan(
     rh: Any = RH,
     rh_registry: Any = RH_VERIFIED,
     proxy_accepted: bool = False,
+    agent: AgentRole = AgentRole.WHEEL,
 ) -> Any:
     return plan_session(
         effective_mode=ExecutionMode.OFF,
@@ -69,6 +71,7 @@ def _plan(
         observed_at=NOW,
         remote_boundary_accepted=accepted,
         proxy_accepted=proxy_accepted,
+        agent=agent,
     )
 
 
@@ -361,6 +364,18 @@ def test_login_scoped_workspace_reads_are_offered() -> None:
     assert "mcp__robinhood__run_scan" in available_tools_table(plan, Role.MARKET)
 
 
+def test_close_agent_table_omits_scan_tools() -> None:
+    """ADR-0059: the Buy-to-Close prompt lists no scan tool; watchlists and alerts stay."""
+    plan = _plan(agent=AgentRole.CLOSE)
+    assert plan.agent is AgentRole.CLOSE
+    table = available_tools_table(plan)
+    assert "get_scans" not in table and "create_scan" not in table
+    assert "`mcp__robinhood__get_watchlists`" in table
+    assert "`mcp__robinhood__create_alert`" in table
+    assert "mcp__robinhood__run_scan" in available_tools_table(plan, Role.MARKET)
+    assert "`mcp__robinhood__get_scans`" in available_tools_table(_plan(agent=AgentRole.SELL))
+
+
 def test_mignon_table_lists_only_its_role() -> None:
     plan = _plan()
     table = available_tools_table(plan, Role.COMPANY)
@@ -417,3 +432,16 @@ def test_disabled_mignons_leave_the_table_without_a_roster() -> None:
     )
     table = available_tools_table(plan)
     assert "Agent" not in table and "Mignon `" not in table
+
+
+def test_session_refuses_a_plan_made_for_another_agent() -> None:
+    """ADR-0059: the plan's tools were chosen for one agent; a mismatch fails closed."""
+    from types import SimpleNamespace
+
+    from wheelta_robinhood_agent.agent.session import SessionDeps
+
+    mismatched = SimpleNamespace(role=AgentRole.SELL, plan=SimpleNamespace(agent=AgentRole.CLOSE))
+    with pytest.raises(SessionPlanError, match="close agent, not sell"):
+        SessionDeps.__post_init__(mismatched)  # type: ignore[arg-type]
+    matched = SimpleNamespace(role=AgentRole.CLOSE, plan=SimpleNamespace(agent=AgentRole.CLOSE))
+    SessionDeps.__post_init__(matched)  # type: ignore[arg-type]

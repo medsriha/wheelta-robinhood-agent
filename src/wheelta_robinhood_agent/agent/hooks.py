@@ -33,11 +33,12 @@ already handled.
 
 Orchestrator and Mignons (ADR-0025, agent/mignons.py): every call is attributed by the hook
 input's `agent_id`/`agent_type` (absent on the orchestrator's main thread) and allowed only if
-its tool is in that role's `ROLE_TOOLS`. `Agent` (Tier D) is the orchestrator's alone and is
-gated on the Mignon type, its inputs, the kill switch/stop latch, and `rules.mignons` per-run
-and concurrent counts. PostToolUse(Agent) parses the Mignon's final text as a MignonReport,
-resolves its refs/URLs against what that Mignon was delivered, records it, and replaces the
-Agent result with a validated or missing envelope (`mignon_report_output`).
+its tool is in that role's set for this agent's session (`role_tools`, ADR-0059). `Agent`
+(Tier D) is the orchestrator's alone and is gated on the Mignon type, its inputs, the kill
+switch/stop latch, and `rules.mignons` per-run and concurrent counts. PostToolUse(Agent)
+parses the Mignon's final text as a MignonReport, resolves its refs/URLs against what that
+Mignon was delivered, records it, and replaces the Agent result with a validated or missing
+envelope (`mignon_report_output`).
 
 Mignon repair (ADR-0047): `SubagentStop` reads the Mignon's final text from its transcript and
 checks it. If only findings have issues, it blocks the stop with the issues by finding index,
@@ -86,10 +87,10 @@ from wheelta_robinhood_agent.agent.account_scope import (
 from wheelta_robinhood_agent.agent.mignons import (
     AGENT_INPUT_KEYS,
     DELEGATION_TOOL,
-    ROLE_TOOLS,
     MignonLimits,
     Role,
     role_of,
+    role_tools,
 )
 from wheelta_robinhood_agent.agent.model_view import model_view
 from wheelta_robinhood_agent.agent.proxy_dispatch import (
@@ -106,6 +107,7 @@ from wheelta_robinhood_agent.config.rules import RuleMarker, TradingRules
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.decision_output import ParseIssue, load_strict_json
 from wheelta_robinhood_agent.domain.enums import (
+    AgentRole,
     ExecutionMode,
     OrderVenue,
     ToolCallStatus,
@@ -388,6 +390,8 @@ class HookDeps:
     redactor: Redactor
     clock: Callable[[], datetime]
     registries: tuple[ToolRegistry, ...] = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
+    # ADR-0059: whose session this is; it decides the orchestrator's tools (`role_tools`).
+    agent: AgentRole = AgentRole.WHEEL
     account_scope_table: Mapping[str, AccountScopeSpec] = field(
         default_factory=lambda: ROBINHOOD_ACCOUNT_SCOPE
     )
@@ -859,7 +863,7 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         role = caller_role(data)
         if tier is ToolTier.D and role is not Role.ORCHESTRATOR:
             raise _Denied("Mignons cannot spawn Mignons")
-        if resolved.qualified not in ROLE_TOOLS[role]:
+        if resolved.qualified not in role_tools(role, deps.agent):
             raise _Denied(f"{resolved.qualified} is not available to the {role.value}")
         if tier is ToolTier.D:
             check_spawn(tool_input)

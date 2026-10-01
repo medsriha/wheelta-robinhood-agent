@@ -37,7 +37,7 @@ from wheelta_robinhood_agent.agent.hooks import EnvelopeKind, last_assistant_tex
 from wheelta_robinhood_agent.agent.local_server import LOCAL_REGISTRY
 from wheelta_robinhood_agent.agent.mignons import MignonLimits
 from wheelta_robinhood_agent.agent.result_boundary import BoundaryValidator
-from wheelta_robinhood_agent.domain.enums import ExecutionMode, ToolCallStatus, ToolTier
+from wheelta_robinhood_agent.domain.enums import AgentRole, ExecutionMode, ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 from wheelta_robinhood_agent.integrations.websearch.registry import TAVILY_REGISTRY
@@ -160,6 +160,29 @@ def test_mignon_never_gets_order_or_workspace_tools_even_live() -> None:
     s2 = session()
     out = s2.pre(RH + "create_watchlist", {"name": "WRA · x"}, **MARKET)
     assert_denied(s2, out, "not available to the mignon-market")
+
+
+@pytest.mark.parametrize("tool", ["get_scans", "create_scan", "update_scan_filters"])
+def test_close_agent_orchestrator_has_no_scan_tools(tool: str) -> None:
+    """ADR-0059: scans feed discovery, the Sell Options agent's work."""
+    s = session(agent=AgentRole.CLOSE)
+    assert_denied(s, s.pre(RH + tool, {"title": "WRA · x"}), "not available to the orchestrator")
+
+
+@pytest.mark.parametrize("agent", [AgentRole.SELL, AgentRole.WHEEL])
+def test_sell_and_legacy_orchestrators_keep_scan_tools(agent: AgentRole) -> None:
+    s = session(agent=agent, account_scope_table={**SCOPE, "get_scans": NOT_SCOPED})
+    reason = denied_reason(s.pre(RH + "get_scans", {}))
+    assert reason is None or "not available" not in reason, reason
+
+
+def test_close_agent_keeps_order_tools_and_mignons_keep_their_tools() -> None:
+    """ADR-0059: a roll places and cancels; Mignon sets do not depend on the agent."""
+    s = session(agent=AgentRole.CLOSE, effective_mode=ExecutionMode.LIVE)
+    reason = denied_reason(s.pre(PLACE, {"account_number": ACCOUNT}))
+    assert reason is None or "not available" not in reason, reason
+    reason = denied_reason(s.pre(BOARD, {}, **MARKET))
+    assert reason is None or "not available" not in reason, reason
 
 
 def test_mignon_types_have_their_own_tools() -> None:

@@ -6,8 +6,9 @@ spawns **Mignons** through the built-in `Agent` tool (Tier D). Mignons research 
 a typed `MignonReport` (domain/mignon_report.py). Web pages are read only by Mignons, so the
 session that holds order tools never ingests fetched web content directly.
 
-`ROLE_TOOLS` is the static allowlist per role, in qualified tool names. Access is enforced in
-three layers (CLAUDE.md §8):
+`ROLE_TOOLS` is the static allowlist per role, in qualified tool names. The orchestrator's
+entry is the union over agents; `role_tools` narrows it to one agent's task (ADR-0059,
+`AGENT_ORCHESTRATOR_TOOLS`). Access is enforced in three layers (CLAUDE.md §8):
 
 1. visibility: each Mignon's `AgentDefinition.tools` (the CLI hides every other tool from it,
    verified 2026-09-27 against CLI 2.1.283);
@@ -47,7 +48,7 @@ from claude_agent_sdk.types import AgentDefinition
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME, WEB_CACHE_TOOL_NAME
 from wheelta_robinhood_agent.config.rules import TradingRules
 from wheelta_robinhood_agent.config.settings import MODEL_ID_PATTERN
-from wheelta_robinhood_agent.domain.enums import MignonType
+from wheelta_robinhood_agent.domain.enums import AgentRole, MignonType
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
 from wheelta_robinhood_agent.integrations.websearch.registry import (
     EXTRACT_TOOL,
@@ -201,6 +202,28 @@ ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
         ),
     }
 )
+
+# ADR-0059: the orchestrator's tools per agent (ADR-0057), so each session sees only what its
+# task needs. Saved scans feed candidate discovery, which is the Sell Options agent's work; the
+# Buy-to-Close agent keeps every other tool, because a roll's replacement goes through the same
+# `orders.open_checks` as a new open. WHEEL (legacy runs) keeps the union.
+_SCAN_TOOLS: Final = frozenset(
+    _rh("get_scans", "create_scan", "update_scan_filters", "update_scan_config")
+)
+AGENT_ORCHESTRATOR_TOOLS: Mapping[AgentRole, frozenset[str]] = MappingProxyType(
+    {
+        AgentRole.WHEEL: ROLE_TOOLS[Role.ORCHESTRATOR],
+        AgentRole.CLOSE: ROLE_TOOLS[Role.ORCHESTRATOR] - _SCAN_TOOLS,
+        AgentRole.SELL: ROLE_TOOLS[Role.ORCHESTRATOR],
+    }
+)
+
+
+def role_tools(role: Role, agent: AgentRole = AgentRole.WHEEL) -> frozenset[str]:
+    """The tools `role` may call in `agent`'s session: the agent's orchestrator set
+    (ADR-0059), or the Mignon role's set, which is the same for every agent."""
+    return AGENT_ORCHESTRATOR_TOOLS[agent] if role is Role.ORCHESTRATOR else ROLE_TOOLS[role]
+
 
 MIGNON_DESCRIPTIONS: Mapping[MignonType, str] = MappingProxyType(
     {

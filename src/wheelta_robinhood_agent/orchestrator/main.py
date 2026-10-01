@@ -1159,6 +1159,7 @@ class _Run:
                 self.deps.remote_boundary_accepted or self.settings.remote_result_risk_accepted
             ),
             mignons=mignon_limits(self.rules.rules) is not None,
+            agent=self.role,
         )
         self.order_venue = plan.order_venue
         self.event(
