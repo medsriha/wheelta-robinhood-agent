@@ -225,6 +225,7 @@ from wheelta_robinhood_agent.orchestrator.robinhood_credential import (
     resolve_robinhood_credential,
 )
 from wheelta_robinhood_agent.orchestrator.schedule import (
+    BINDING_SOURCES,
     NextRun,
     ScheduleSource,
     calendar_window,
@@ -232,6 +233,7 @@ from wheelta_robinhood_agent.orchestrator.schedule import (
     is_due,
     latest_next_run,
     next_run,
+    unfilled_orders,
 )
 from wheelta_robinhood_agent.orchestrator.signals import (
     RunDeadline,
@@ -584,9 +586,7 @@ class _Tick:
 
     def _next_run(self, runs: Sequence["_Run"]) -> NextRun | None:
         """The tick's effective next run: the earliest agent request, else the fallback."""
-        chosen = [
-            r.next_run for r in runs if r.next_run and r.next_run.source is ScheduleSource.AGENT
-        ]
+        chosen = [r.next_run for r in runs if r.next_run and r.next_run.source in BINDING_SOURCES]
         if chosen:
             return min(chosen, key=lambda n: n.not_before)
         fallback = [r.next_run for r in runs if r.next_run is not None]
@@ -1058,17 +1058,53 @@ class _Run:
         maximum gap after the gate, then moved into the NYSE regular session. Raises
         CalendarOutOfRange/ValueError if it cannot be placed, and SessionPlanError before the
         gate has passed."""
-        if self.gate_at is None:
-            raise SessionPlanError("a next run is recorded only after the schedule gate")
-        latest = latest_next_run(self.gate_at, self.rules.rules.scheduling.max_next_run_gap_hours)
-        start, end = calendar_window(min(requested_at, latest))
-        scheduled = next_run(
-            requested_at, source, self.deps.calendar_factory(start, end), latest_at=latest
-        )
+        scheduled = self._place_next_run(requested_at, source)
         self.event(RunEventType.SCHEDULE, scheduled.event_payload(), key=f"schedule:{source.value}")
         self.next_run = scheduled
         self.log.bind(stage="schedule").info("next run scheduled", extra=scheduled.event_payload())
         return scheduled
+
+    def _place_next_run(self, requested_at: datetime, source: ScheduleSource) -> NextRun:
+        """`requested_at` placed as `record_next_run` would, without recording it."""
+        if self.gate_at is None:
+            raise SessionPlanError("a next run is recorded only after the schedule gate")
+        latest = latest_next_run(self.gate_at, self.rules.rules.scheduling.max_next_run_gap_hours)
+        start, end = calendar_window(min(requested_at, latest))
+        return next_run(
+            requested_at, source, self.deps.calendar_factory(start, end), latest_at=latest
+        )
+
+    def _apply_unfilled_order_cap(self) -> None:
+        """ADR-0065: when the last order this run placed on a contract and side did not fill
+        in full, record an `unfilled_order` schedule `unfilled_order_next_run_minutes` after
+        the gate, unless the agent's own request is already no later. The ledger gate takes
+        the earliest agent or unfilled-order time, so the cap also binds the other agent of
+        the tick. Live only (a dry run's schedule is never applied). Never raises: the run's
+        status does not depend on this; on failure the fallback or agent time stands."""
+        if self.settings.effective_execution_mode is ExecutionMode.OFF or self.gate_at is None:
+            return
+        try:
+            unfilled = unfilled_orders(
+                ledger_orders.run_order_records(self.conn, self.run_id), self.run_id
+            )
+            if not unfilled:
+                return
+            minutes = self.rules.rules.scheduling.unfilled_order_next_run_minutes
+            cap = self._place_next_run(
+                fallback_requested_at(self.gate_at, minutes), ScheduleSource.UNFILLED_ORDER
+            )
+            current = self.next_run
+            if (
+                current is not None
+                and current.source is ScheduleSource.AGENT
+                and current.not_before <= cap.not_before
+            ):
+                return
+            self.record_next_run(cap.requested_at, ScheduleSource.UNFILLED_ORDER)
+        except Exception as exc:  # noqa: BLE001 - scheduling must not change the run's outcome
+            self.log.warning(
+                "unfilled-order next run not recorded", extra={"error_type": type(exc).__name__}
+            )
 
     def _apply_agent_next_run(self, decisions: DecisionsInput) -> None:
         """A valid `next_run` replaces the fallback. A time that cannot be placed (no session
@@ -1521,6 +1557,7 @@ class _Run:
         self._log_decisions()
         # After assembly and audit, so nothing in the agent's schedule can keep them from running.
         self._apply_agent_next_run(decisions)
+        self._apply_unfilled_order_cap()
         status, reason = self._status(plan, session, decisions)
         if unavailable_reason is not None and reason == "required_source_unavailable":
             reason = unavailable_reason

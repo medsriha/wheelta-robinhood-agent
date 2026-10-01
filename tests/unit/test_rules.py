@@ -24,7 +24,7 @@ def _patch(old: str, new: str) -> bytes:
 
 def test_real_file_loads() -> None:
     loaded = load_rules()
-    assert loaded.version == loaded.rules.meta.version == 15
+    assert loaded.version == loaded.rules.meta.version == 16
     assert len(loaded.sha256) == 64
     r = loaded.rules
     assert r.limits.max_contracts_per_order == 10
@@ -34,7 +34,7 @@ def test_real_file_loads() -> None:
     assert isinstance(r.filters.min_abs_delta, Decimal)
     assert r.scope.leveraged_inverse_etfs_allowed is False
     assert [rule.id for rule in r.management.rules] == [1, 2, 3, 4, 5, 6, 7]
-    assert r.meta.signed_off_on == "2026-09-30" and r.meta.adr == "ADR-0057"
+    assert r.meta.signed_off_on == "2026-10-01" and r.meta.adr == "ADR-0065"
     assert r.sessions.sell_min_settled_cash_usd == Decimal("1000.00")
     assert r.selection.max_discovery_rounds == 3 and len(r.selection.discovery) == 5
     assert r.filters.min_annualized_yield_ratio == Decimal("0.25")
@@ -42,6 +42,7 @@ def test_real_file_loads() -> None:
     assert "(underlying price - strike) / underlying price" in r.definitions.cushion
     assert r.scheduling.fallback_next_run_minutes == 60
     assert r.scheduling.max_next_run_gap_hours == 48
+    assert r.scheduling.unfilled_order_next_run_minutes == 60
     assert r.mignons.max_per_run == 12 and r.mignons.max_concurrent == 4
     assert r.mignons.max_turns_per_mignon == 40
     assert r.limits.max_collateral_per_underlying_ratio == Decimal("0.30")
@@ -102,7 +103,7 @@ def test_tbd_loads_as_unset() -> None:
             'underlying_denylist = ["brk.b"]',
             "scope.underlying_denylist",
         ),
-        ("version = 15", 'version = "15"', "meta.version"),
+        ("version = 16", 'version = "16"', "meta.version"),
         (
             'sell_min_settled_cash_usd = "1000.00"',
             "sell_min_settled_cash_usd = 1000",
@@ -132,6 +133,16 @@ def test_tbd_loads_as_unset() -> None:
             "fallback_next_run_minutes = 60",
             "fallback_next_run_minutes = 2881",
             "fallback_next_run_minutes exceeds max_next_run_gap_hours",
+        ),
+        (
+            "unfilled_order_next_run_minutes = 60",
+            "unfilled_order_next_run_minutes = 0",
+            "scheduling.unfilled_order_next_run_minutes",
+        ),
+        (
+            "unfilled_order_next_run_minutes = 60",
+            "unfilled_order_next_run_minutes = 2881",
+            "unfilled_order_next_run_minutes exceeds max_next_run_gap_hours",
         ),
         ('time_in_force = "gfd"', "time_in_force = 1", "orders.time_in_force"),
     ],

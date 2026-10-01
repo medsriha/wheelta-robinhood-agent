@@ -14,14 +14,24 @@ Two bounds apply to the agent's choice (owner decisions, ADR-0028):
 2. The market calendar: a time outside the NYSE regular session (after capping) moves to the
    next session's open. So a cap that lands on a weekend or holiday runs at the next open.
 
+One cap does not depend on the agent (ADR-0065): when the last order a run placed on a
+contract and side did not fill in full (cancelled, rejected, expired, or unknown), code
+records `scheduling.unfilled_order_next_run_minutes` after the gate as an `unfilled_order`
+schedule. It competes with agent requests (the earliest wins), so an agent that misreads a
+cancelled order cannot push the next check past it.
+
 Pure: the caller supplies `now`, the requested time, and the calendar.
 """
 
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Final
 
+from wheelta_robinhood_agent.domain.enums import AttemptStatus
+from wheelta_robinhood_agent.domain.orders import OrderRecord
 from wheelta_robinhood_agent.orchestrator.market_session import (
     NYSE_TZ,
     CalendarOutOfRange,
@@ -38,6 +48,11 @@ class ScheduleSource(StrEnum):
 
     FALLBACK = "fallback"
     AGENT = "agent"
+    UNFILLED_ORDER = "unfilled_order"  # ADR-0065: code's cap after an order that did not fill
+
+
+# Sources that compete for the tick's next run: the earliest wins over any fallback.
+BINDING_SOURCES: Final = frozenset({ScheduleSource.AGENT, ScheduleSource.UNFILLED_ORDER})
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +156,31 @@ def next_run(
 def fallback_requested_at(gate_at: datetime, fallback_minutes: int) -> datetime:
     """The fallback request: `fallback_minutes` after the run passed the gate."""
     return gate_at.astimezone(UTC) + timedelta(minutes=fallback_minutes)
+
+
+def unfilled_orders(records: Sequence[OrderRecord], run_id: uuid.UUID) -> tuple[OrderRecord, ...]:
+    """The orders behind an `unfilled_order` cap (ADR-0065): for each contract and side this
+    run placed an order on, the last such order, when it did not fill in full.
+
+    Only the last placement per contract and side counts, so a cancel-and-replace price step
+    whose replacement filled is not an unfilled order. Filled in full means status FILLED, or
+    a known filled quantity at least the ordered quantity. Anything else (cancelled,
+    rejected, expired, still working, or unknown, including a placement with no broker order)
+    is unfilled.
+    """
+    placed = [(r.intent, r) for r in records if r.intent is not None and r.intent.run_id == run_id]
+    last: dict[tuple[str | None, str | None], OrderRecord] = {}
+    for intent, record in sorted(placed, key=lambda pair: pair[0].requested_at):
+        last[(intent.broker_instrument_id, intent.side_raw)] = record
+    return tuple(r for r in last.values() if not _filled_in_full(r))
+
+
+def _filled_in_full(record: OrderRecord) -> bool:
+    if record.status is AttemptStatus.FILLED:
+        return True
+    ordered = record.intent.quantity if record.intent is not None else None
+    filled = record.filled_quantity
+    return ordered is not None and filled is not None and filled >= ordered
 
 
 def latest_next_run(gate_at: datetime, max_gap_hours: int) -> datetime:

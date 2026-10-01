@@ -250,18 +250,21 @@ class Mignons(_Section):
 
 
 class Scheduling(_Section):
-    """Next-run scheduling (ADR-0028), applied by the orchestrator (orchestrator/schedule.py).
-    Both values are fixed positive counts: no marker, since every due run needs them. The
-    fallback must not exceed the maximum gap."""
+    """Next-run scheduling (ADR-0028, ADR-0065), applied by the orchestrator
+    (orchestrator/schedule.py). All values are fixed positive counts: no marker, since every
+    due run needs them. The fallback and the unfilled-order cap must not exceed the maximum
+    gap."""
 
     notes: Notes = ()
     fallback_next_run_minutes: StrictInt = Field(gt=0)
     max_next_run_gap_hours: StrictInt = Field(gt=0)
+    unfilled_order_next_run_minutes: StrictInt = Field(gt=0)
 
     @model_validator(mode="after")
-    def _fallback_within_max_gap(self) -> Self:
-        if self.fallback_next_run_minutes > self.max_next_run_gap_hours * 60:
-            raise ValueError("fallback_next_run_minutes exceeds max_next_run_gap_hours")
+    def _within_max_gap(self) -> Self:
+        for name in ("fallback_next_run_minutes", "unfilled_order_next_run_minutes"):
+            if getattr(self, name) > self.max_next_run_gap_hours * 60:
+                raise ValueError(f"{name} exceeds max_next_run_gap_hours")
         return self
 
 

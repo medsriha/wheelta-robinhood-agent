@@ -211,6 +211,18 @@ def test_earliest_agent_choice_of_a_tick_wins(conn: Conn) -> None:
     assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(minutes=30)
 
 
+def test_unfilled_order_cap_binds_the_other_agent(conn: Conn) -> None:
+    """ADR-0065: a close run's unfilled-order cap competes with agent choices, so the sell
+    agent's later time cannot push the next run past it."""
+    close = open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.CLOSE)
+    sell = open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.SELL)
+    _schedule(conn, close.run_id, (SLOT + timedelta(hours=1)).isoformat(), "schedule:fallback")
+    cap = (SLOT + timedelta(hours=1)).isoformat()
+    _schedule(conn, close.run_id, cap, "schedule:unfilled_order")
+    _schedule(conn, sell.run_id, (SLOT + timedelta(hours=24)).isoformat(), "schedule:agent")
+    assert latest_next_run_not_before(conn, AppEnv.LOCAL) == SLOT + timedelta(hours=1)
+
+
 def test_runs_of_a_slot_are_classified_per_agent(conn: Conn) -> None:
     close = open_run_slot(conn, AppEnv.LOCAL, SLOT, AgentRole.CLOSE)
     assert close.state is SlotState.NEW and close.agent is AgentRole.CLOSE

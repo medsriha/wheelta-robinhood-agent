@@ -346,6 +346,12 @@ def test_next_runs_are_short_and_the_agents_reason_is_kept() -> None:
     )
     assert "Asked to run next" not in fallback
     assert fallback.endswith("Next run: 2026-09-28 15:00 UTC (hourly fallback)")
+    capped = _text(
+        _input(_record()),
+        next_run_at=datetime(2026, 9, 28, 15, 0, tzinfo=UTC),
+        next_run_source="unfilled_order",
+    )
+    assert capped.endswith("Next run: 2026-09-28 15:00 UTC (an order did not fill)")
 
 
 def test_skipped_agent_gets_one_line() -> None:

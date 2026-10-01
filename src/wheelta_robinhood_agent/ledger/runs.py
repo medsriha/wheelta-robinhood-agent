@@ -184,9 +184,9 @@ def latest_next_run_not_before(
     a `schedule` event.
 
     Only the newest slot with a schedule event counts. Within it, the earliest agent-chosen
-    `not_before` wins (the close and sell agents may each request one); with none, the
-    slot's fallback (the latest fallback event) stands. Raises LedgerError on a malformed
-    payload.
+    or unfilled-order `not_before` wins (the close and sell agents may each request one, and
+    code caps a run whose order did not fill, ADR-0065); with none, the slot's fallback (the
+    latest fallback event) stands. Raises LedgerError on a malformed payload.
     """
     rows = conn.execute(
         "SELECT e.payload FROM run_events e JOIN runs r ON r.run_id = e.run_id "
@@ -203,19 +203,19 @@ def latest_next_run_not_before(
     ).fetchall()
     if not rows:
         return None
-    agent_times: list[datetime] = []
+    binding_times: list[datetime] = []
     fallback: datetime | None = None
     for (payload,) in rows:
         not_before = _not_before(payload)
-        if isinstance(payload, dict) and payload.get("source") == AGENT_SCHEDULE_SOURCE:
-            agent_times.append(not_before)
+        if isinstance(payload, dict) and payload.get("source") in BINDING_SCHEDULE_SOURCES:
+            binding_times.append(not_before)
         else:
             fallback = not_before
-    return min(agent_times) if agent_times else fallback
+    return min(binding_times) if binding_times else fallback
 
 
-# orchestrator/schedule.py ScheduleSource.AGENT (the ledger does not import the orchestrator).
-AGENT_SCHEDULE_SOURCE: Final = "agent"
+# orchestrator/schedule.py BINDING_SOURCES (the ledger does not import the orchestrator).
+BINDING_SCHEDULE_SOURCES: Final = frozenset({"agent", "unfilled_order"})
 
 
 def _not_before(payload: object) -> datetime:

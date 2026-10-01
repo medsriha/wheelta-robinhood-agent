@@ -537,7 +537,10 @@ def build_slot_subject(summary: SlotSummaryInput) -> str:
 def _tick_next_run(summary: SlotSummaryInput) -> str | None:
     if summary.next_run_at is None:
         return None
-    source = " (hourly fallback)" if summary.next_run_source == "fallback" else ""
+    source = {
+        "fallback": " (hourly fallback)",
+        "unfilled_order": " (an order did not fill)",
+    }.get(summary.next_run_source or "", "")
     return f"Next run: {_when(summary.next_run_at)}{source}"
 
 

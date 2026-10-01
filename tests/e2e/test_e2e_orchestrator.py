@@ -1736,6 +1736,130 @@ def test_summary_email_reports_the_agents_next_run(harness: Callable[..., Harnes
     assert tick.next_run_at == chosen and tick.next_run_source == "agent"
 
 
+def _cancelling_broker(h: Harness) -> None:
+    """Live fake broker for the SPY put: the review is clean, the placement confirms, and
+    every later order read shows the order cancelled with nothing filled."""
+    from e2e_fakes import SPY_INSTRUMENT_ID
+
+    def order(state: str, pending: str, cancelled: str) -> dict[str, Any]:
+        stamp = h.clock.now.isoformat()
+        return {
+            "id": "4b3c0f4e-1d2a-4e5f-9a8b-7c6d5e4f3a2b",
+            "chain_symbol": "SPY",
+            "state": state,
+            "type": "limit",
+            "trigger": "immediate",
+            "quantity": "1",
+            "processed_quantity": "0",
+            "pending_quantity": pending,
+            "canceled_quantity": cancelled,
+            "price": "11.90",
+            "trade_value_multiplier": "100.0000",
+            "time_in_force": "gfd",
+            "placed_agent": "agentic",
+            "created_at": SESSION_TIME.isoformat(),
+            "updated_at": stamp,
+            "legs": [
+                {
+                    "id": "1e1e1e1e-0000-4000-8000-000000000001",
+                    "option_id": SPY_INSTRUMENT_ID,
+                    "side": "sell",
+                    "position_effect": "open",
+                    "ratio_quantity": 1,
+                    "expiration_date": "2026-10-16",
+                    "strike_price": "740.0000",
+                    "option_type": "put",
+                    "executions": [],
+                }
+            ],
+        }
+
+    review = {
+        "type": "limit",
+        "quantity": "1",
+        "price": "11.90",
+        "time_in_force": "gfd",
+        "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": "sell", "position_effect": "open"}],
+        "order_checks": {},
+        "option_quotes": [],
+    }
+    placed: list[bool] = []
+
+    def text(data: dict[str, Any]) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": json.dumps({"data": data})}]}
+
+    def place(args: dict[str, Any]) -> dict[str, Any]:
+        placed.append(True)
+        return text({"order": order("confirmed", "1", "0")})
+
+    def orders(args: dict[str, Any]) -> dict[str, Any]:
+        return text({"orders": [order("cancelled", "0", "1")] if placed else []})
+
+    handlers = h.world.handlers["robinhood"]
+    handlers["review_option_order"] = lambda args: text(review)
+    handlers["place_option_order"] = place
+    handlers["get_option_orders"] = orders
+
+
+def test_a_cancelled_order_caps_the_agents_later_next_run(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0065: the broker cancels the agent's order and the agent still asks for tomorrow;
+    code schedules the hourly check instead, and the email says why."""
+    h = harness(**LIVE)
+    h.world = simulated_world(h.clock.now)
+    _cancelling_broker(h)
+    tomorrow = (SESSION_TIME + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    linked = linked_order_script(lambda: h.clock.advance(1), _order_refs)
+
+    async def script(model: FakeModel) -> str | None:
+        output = await linked(model)
+        assert output is not None
+        decided = json.loads(output)
+        decided["next_run"] = {"at": tomorrow, "rationale": "The put is sold."}
+        return json.dumps(decided)
+
+    h.run(script, mappers=SIMULATED_MAPPERS)
+    assert h.status() is RunStatus.COMPLETED, h.notifier.alert_kinds()
+    with h.conn() as c:
+        from wheelta_robinhood_agent.ledger.orders import run_order_records
+        from wheelta_robinhood_agent.ledger.runs import latest_next_run_not_before
+
+        (record,) = [r for r in run_order_records(c, h.run_id) if r.intent is not None]
+        assert record.status is AttemptStatus.CANCELLED
+        assert latest_next_run_not_before(c, AppEnv.PRODUCTION) == SESSION_TIME + timedelta(hours=1)
+    sources = [e["source"] for e in h.events(RunEventType.SCHEDULE)]
+    assert sources == ["fallback", "agent", "unfilled_order"], sources
+    (tick,) = h.mailer.summaries
+    assert tick.next_run_source == "unfilled_order"
+    assert tick.next_run_at == SESSION_TIME + timedelta(hours=1)
+
+
+def test_an_earlier_next_run_after_a_cancelled_order_stands(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0065: the cap only moves a later request forward; an earlier one is kept."""
+    h = harness(**LIVE)
+    h.world = simulated_world(h.clock.now)
+    _cancelling_broker(h)
+    sooner = SESSION_TIME + timedelta(minutes=20)
+    linked = linked_order_script(lambda: h.clock.advance(1), _order_refs)
+
+    async def script(model: FakeModel) -> str | None:
+        output = await linked(model)
+        assert output is not None
+        decided = json.loads(output)
+        at = sooner.isoformat().replace("+00:00", "Z")
+        decided["next_run"] = {"at": at, "rationale": "Re-check the put."}
+        return json.dumps(decided)
+
+    h.run(script, mappers=SIMULATED_MAPPERS)
+    assert h.status() is RunStatus.COMPLETED, h.notifier.alert_kinds()
+    assert [e["source"] for e in h.events(RunEventType.SCHEDULE)] == ["fallback", "agent"]
+    (tick,) = h.mailer.summaries
+    assert tick.next_run_source == "agent" and tick.next_run_at == sooner
+
+
 def test_failed_session_still_sends_a_summary_email(harness: Callable[..., Harness]) -> None:
     async def script(model: FakeModel) -> str:
         await research(model)
