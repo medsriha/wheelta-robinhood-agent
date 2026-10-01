@@ -38,6 +38,7 @@ from wheelta_robinhood_agent.ledger.orders import (
 from wheelta_robinhood_agent.ledger.positions import (
     FillRole,
     close_position,
+    entry_lineages,
     link_fill,
     open_position,
     position_book,
@@ -474,3 +475,80 @@ def test_note_dedup_key_is_namespaced(conn: Conn, run_id: uuid.UUID) -> None:
     position_id = _open_with_entry(conn, run_id)
     with pytest.raises(ValueError, match="note:"):
         record_note(conn, position_id, dedup_key="decision:0", note=_hold_note(run_id, "d:0"))
+
+
+def _fill_into_new_lineage(conn: Conn, run_id: uuid.UUID, broker_order_id: str) -> uuid.UUID:
+    """As broker_ledger does: a sell-to-open fill opens a lineage with no thesis yet."""
+    position_id = open_position(
+        conn,
+        run_id=run_id,
+        account_scope_id=ACCOUNT,
+        underlying="AAPL",
+        strategy=StrategyKind.CASH_SECURED_PUT,
+        instruments=[PUT_OCT],
+        observed_at=T0,
+    )
+    order = record_broker_order(
+        conn, run_id=run_id, account_scope_id=ACCOUNT, broker_order_id=broker_order_id
+    )
+    fill = _exec_fill(conn, run_id, order, f"X-{broker_order_id}", 1, "1.25")
+    link_fill(
+        conn, position_id, run_id=run_id, fill_event_id=fill, role=FillRole.ENTRY, observed_at=T0
+    )
+    return position_id
+
+
+def test_entry_lineages_map_filled_orders_only(conn: Conn, run_id: uuid.UUID) -> None:
+    position_id = _fill_into_new_lineage(conn, run_id, "OPEN-1")
+    record_broker_order(conn, run_id=run_id, account_scope_id=ACCOUNT, broker_order_id="OPEN-2")
+    assert entry_lineages(conn, ACCOUNT, ["OPEN-1", "OPEN-2", "OPEN-3"]) == {"OPEN-1": position_id}
+    assert entry_lineages(conn, "other-scope", ["OPEN-1"]) == {}
+    assert entry_lineages(conn, ACCOUNT, []) == {}
+
+
+def test_entry_note_is_pinned_and_supplies_the_thesis(conn: Conn, run_id: uuid.UUID) -> None:
+    """ADR-0055: the OPEN rationale stays in the book until close, past the notes cap."""
+    position_id = _fill_into_new_lineage(conn, run_id, "OPEN-9")
+    assert _entry(conn, position_id).thesis is None
+    opening = PositionNote(
+        run_id=run_id,
+        noted_at=T0,
+        kind=PositionNoteKind.DECISION,
+        action=DecisionAction.OPEN_CSP,
+        decision_ref="decision:0",
+        text="Quality name at a 6% cushion; earnings after expiry.",
+        thesis="Range-bound into earnings",
+        invalidation_conditions=("close below 170",),
+    )
+    record_note(conn, position_id, dedup_key=f"note:{run_id}:decision:0", note=opening)
+    for i in range(1, MAX_NOTES_PER_POSITION + 3):
+        record_note(
+            conn,
+            position_id,
+            dedup_key=f"note:{run_id}:decision:{i}",
+            note=_hold_note(run_id, f"d:{i}"),
+        )
+    entry = _entry(conn, position_id)
+    assert entry.entry_note == opening
+    assert entry.thesis == "Range-bound into earnings"
+    assert entry.invalidation_conditions == ("close below 170",)
+    assert len(entry.notes) == MAX_NOTES_PER_POSITION
+    assert entry.notes_omitted == 2
+    assert all(n.action is DecisionAction.HOLD for n in entry.notes)
+
+
+def test_opened_thesis_wins_over_the_entry_note(conn: Conn, run_id: uuid.UUID) -> None:
+    position_id = _open_with_entry(conn, run_id)
+    opening = PositionNote(
+        run_id=run_id,
+        noted_at=T0,
+        kind=PositionNoteKind.DECISION,
+        action=DecisionAction.OPEN_CSP,
+        decision_ref="decision:0",
+        text="Opened.",
+        thesis="Other thesis",
+    )
+    record_note(conn, position_id, dedup_key=f"note:{run_id}:decision:0", note=opening)
+    entry = _entry(conn, position_id)
+    assert entry.entry_note == opening
+    assert entry.thesis == "Range-bound into earnings"

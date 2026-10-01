@@ -7,7 +7,8 @@ imported without known history has null entry facts and an unknown (None) roll c
 
 Notes (ADR-0018) carry the agent's own earlier judgments about an active lineage (decision
 rationale, thesis, open questions) into later runs. They are context, never evidence, and
-leave the book with the lineage when it closes.
+leave the book with the lineage when it closes. The note of the decision that opened a lineage
+is its `entry_note` (ADR-0055): pinned, never pushed out by later notes.
 """
 
 from collections.abc import Iterable, Sequence
@@ -80,6 +81,10 @@ def count_rolls(events: Iterable[RollEvent]) -> int:
 MAX_NOTES_PER_POSITION: Final = 24
 
 
+# ADR-0055: actions whose note is a lineage's entry note.
+ENTRY_ACTIONS: Final = frozenset({DecisionAction.OPEN_CSP, DecisionAction.OPEN_CC})
+
+
 class PositionNoteKind(StrEnum):
     DECISION = "decision"
     QUESTION = "question"
@@ -89,7 +94,8 @@ class PositionNote(DomainModel):
     """One earlier-run judgment about a lineage, kept verbatim (ADR-0018).
 
     A `decision` note is a management decision (HOLD/CLOSE/ROLL) that targeted the lineage:
-    its rationale, plus the thesis and invalidation conditions a roll replacement supplied.
+    its rationale, plus the thesis and invalidation conditions a roll replacement supplied;
+    or the OPEN decision whose filled order created the lineage (ADR-0055).
     A `question` note is an unresolved research question that targeted the lineage. The text
     is the agent's judgment from `run_id`; it supplies no financial fact to a later run.
     """
@@ -140,6 +146,9 @@ class PositionBookEntry(DomainModel):
       option price units (per-share vs per-contract **unverified** until fixtures exist).
     - `notes` are the newest earlier-run notes, oldest first; `notes_omitted` counts older
       ones not shown (ADR-0018).
+    - `entry_note` is the OPEN decision that created the lineage, kept apart from `notes`
+      so the cap never drops it (ADR-0055). `thesis`/`invalidation_conditions` come from it
+      when the `opened` event carries none.
     """
 
     position_id: UUID
@@ -160,10 +169,13 @@ class PositionBookEntry(DomainModel):
     gaps: tuple[Gap, ...] = ()
     notes: tuple[PositionNote, ...] = ()
     notes_omitted: Count = 0
+    entry_note: PositionNote | None = None
 
     @model_validator(mode="after")
     def _check_entry(self) -> Self:
         require_unique(self.entry_fill_ids, "entry fill id")
+        if self.entry_note is not None and self.entry_note.action not in ENTRY_ACTIONS:
+            raise ValueError("an entry note is the OPEN decision that created the lineage")
         if len(self.notes) > MAX_NOTES_PER_POSITION:
             raise ValueError(f"at most {MAX_NOTES_PER_POSITION} notes per lineage")
         require_unique(tuple(e.roll_event_id for e in self.roll_events), "roll event id")

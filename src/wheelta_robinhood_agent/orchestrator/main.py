@@ -111,7 +111,7 @@ from wheelta_robinhood_agent.domain.enums import (
 )
 from wheelta_robinhood_agent.domain.events import RunEventType
 from wheelta_robinhood_agent.domain.gating import order_venue, prompt_execution_mode
-from wheelta_robinhood_agent.domain.position_notes import notes_from_run_record
+from wheelta_robinhood_agent.domain.position_notes import notes_from_run_record, opened_order_ids
 from wheelta_robinhood_agent.domain.positions import PositionBook
 from wheelta_robinhood_agent.domain.run import AuditStatus
 from wheelta_robinhood_agent.domain.run_identity import run_id_for, slot_for
@@ -1189,10 +1189,14 @@ class _Run:
     def _record_notes(self, record: RunRecord, book: PositionBook) -> None:
         """Carry this run's judgments on active lineages into later runs (ADR-0018).
 
+        An OPEN decision's note goes to the lineages its filled orders created (ADR-0055).
         Notes are context only, so a failure is logged and counted but does not fail the run.
         """
         try:
-            for item in notes_from_run_record(record, book):
+            lineages = ledger_positions.entry_lineages(
+                self.conn, self.scope_id, opened_order_ids(record)
+            )
+            for item in notes_from_run_record(record, book, lineages):
                 ledger_positions.record_note(
                     self.conn, item.position_id, dedup_key=item.dedup_key, note=item.note
                 )

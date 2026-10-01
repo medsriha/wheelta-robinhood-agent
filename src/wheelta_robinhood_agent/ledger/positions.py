@@ -16,7 +16,10 @@ the last N runs) and is rebuilt from `positions` identities plus `position_event
   current instruments and, with `corrects_event_id`, supersede an earlier event (e.g. a gap).
 - `note` keeps one earlier-run judgment (decision rationale/thesis or open question) about
   the lineage (ADR-0018). The book shows the newest `MAX_NOTES_PER_POSITION`; notes leave the
-  book with the lineage when it closes, and stay in the ledger.
+  book with the lineage when it closes, and stay in the ledger. The first OPEN decision note
+  is the entry note (ADR-0055): shown apart from that cap, and the source of the entry thesis
+  and invalidation conditions when `opened` has none (lineages are opened at fill time,
+  before the run's decisions are known).
 - `closed` ends the lineage; reopening is a new lineage.
 """
 
@@ -35,6 +38,7 @@ from wheelta_robinhood_agent.domain.enums import DataQuality, StrategyKind
 from wheelta_robinhood_agent.domain.events import PositionEventType
 from wheelta_robinhood_agent.domain.evidence import Gap
 from wheelta_robinhood_agent.domain.positions import (
+    ENTRY_ACTIONS,
     PositionBook,
     PositionBookEntry,
     PositionInstrument,
@@ -354,6 +358,28 @@ def record_note(
     )
 
 
+def entry_lineages(
+    conn: Conn, account_scope_id: str, broker_order_ids: Sequence[str]
+) -> dict[str, uuid.UUID]:
+    """The lineage each broker order's fills were linked to as entry fills (ADR-0055).
+
+    An order linked to more than one lineage is ambiguous and left out; nothing is guessed.
+    """
+    if not broker_order_ids:
+        return {}
+    found: dict[str, set[uuid.UUID]] = {}
+    for row in _rows(
+        conn,
+        "SELECT DISTINCT o.broker_order_id, e.entity_id FROM orders o "
+        "JOIN position_events e ON e.order_id = o.order_id "
+        "AND e.event_type = 'fill_linked' AND e.payload->>'role' = %s "
+        "WHERE o.account_scope_id = %s AND o.broker_order_id = ANY(%s)",
+        (FillRole.ENTRY.value, account_scope_id, list(broker_order_ids)),
+    ):
+        found.setdefault(row["broker_order_id"], set()).add(row["entity_id"])
+    return {order: next(iter(ids)) for order, ids in found.items() if len(ids) == 1}
+
+
 def close_position(
     conn: Conn,
     position_id: uuid.UUID,
@@ -459,6 +485,7 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
     share_lots: dict[str, None] = {}
     rolls: list[RollEvent] = []
     notes: list[PositionNote] = []
+    entry_note: PositionNote | None = None
     for e in live:
         kind, payload = e["event_type"], e["payload"]
         if kind == PositionEventType.FILL_LINKED and payload["role"] == FillRole.ENTRY:
@@ -482,7 +509,11 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
         elif kind == PositionEventType.GAP:
             gaps.append(Gap.model_validate(payload))
         elif kind == PositionEventType.NOTE:
-            notes.append(PositionNote.model_validate(payload))
+            note = PositionNote.model_validate(payload)
+            if entry_note is None and note.action in ENTRY_ACTIONS:
+                entry_note = note
+            else:
+                notes.append(note)
         if kind != PositionEventType.OPENED and "current_instruments" in payload:
             instruments = payload["current_instruments"]
 
@@ -513,6 +544,10 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
             gaps.append(credit_gap)
 
     shown_notes, omitted_notes = latest_notes(notes)
+    thesis = info["thesis"]
+    invalidation = tuple(info["invalidation_conditions"])
+    if thesis is None and not invalidation and entry_note is not None:
+        thesis, invalidation = entry_note.thesis, entry_note.invalidation_conditions
     history_unknown = not entry_fill_ids or any(g.field in HISTORY_GAP_FIELDS for g in gaps)
     return PositionBookEntry(
         position_id=position_id,
@@ -523,8 +558,8 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
         entry_fill_ids=tuple(entry_fill_ids),
         entry_date=entry_date,
         entry_weighted_credit=credit,
-        thesis=info["thesis"],
-        invalidation_conditions=tuple(info["invalidation_conditions"]),
+        thesis=thesis,
+        invalidation_conditions=invalidation,
         entry_event_refs=tuple(info["entry_event_refs"]),
         share_lot_refs=tuple(share_lots),
         roll_events=tuple(rolls),
@@ -533,6 +568,7 @@ def _entry(conn: Conn, position_id: uuid.UUID, events: list[Row]) -> PositionBoo
         gaps=tuple(gaps),
         notes=shown_notes,
         notes_omitted=omitted_notes,
+        entry_note=entry_note,
     )
 
 
@@ -591,6 +627,7 @@ __all__ = [
     "FillRole",
     "PositionEventType",
     "close_position",
+    "entry_lineages",
     "link_fill",
     "open_position",
     "position_book",

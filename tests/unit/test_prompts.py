@@ -32,10 +32,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v15_with_expected_placeholders() -> None:
+def test_active_prompt_is_v16_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 15
+    assert template.version == 16
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -68,7 +68,7 @@ def test_active_prompt_asks_for_next_run() -> None:
 def test_active_prompt_explains_position_notes() -> None:
     body = load_prompt().body
     assert "`notes`" in body
-    assert "They are not evidence." in body
+    assert "Neither is evidence." in body
 
 
 def test_metadata_header_is_not_rendered(tmp_path: Path) -> None:
@@ -183,3 +183,10 @@ def test_v13_allows_concurrent_closes_only() -> None:
     """ADR-0051: closes on different contracts may work together; opens stay sequential."""
     text = load_prompt().text
     assert "Closes on different contracts may be worked at the same time" in text
+
+
+def test_v16_weighs_the_entry_note_before_managing() -> None:
+    """ADR-0055: the opening rationale is shown per position and weighed before hold/close/roll."""
+    text = load_prompt().text
+    assert "7. Each position book entry carries `entry_note`" in text
+    assert "compare current\n   evidence with why you opened it" in text

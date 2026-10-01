@@ -9,13 +9,17 @@ from pydantic import ValidationError
 
 from wheelta_robinhood_agent.domain.enums import (
     AppEnv,
+    AttemptStatus,
     DataQuality,
     DecisionAction,
     ExecutionMode,
+    OptionRight,
+    OrderSide,
     StrategyKind,
 )
 from wheelta_robinhood_agent.domain.options import OccSymbol
-from wheelta_robinhood_agent.domain.position_notes import notes_from_run_record
+from wheelta_robinhood_agent.domain.orders import Attempt
+from wheelta_robinhood_agent.domain.position_notes import notes_from_run_record, opened_order_ids
 from wheelta_robinhood_agent.domain.positions import (
     MAX_NOTES_PER_POSITION,
     PositionBook,
@@ -29,6 +33,7 @@ from wheelta_robinhood_agent.domain.run_record import (
     RUN_RECORD_SCHEMA_VERSION,
     DecisionOutputStatus,
     DecisionRecord,
+    LegRecord,
     RunRecord,
     UnresolvedQuestionRecord,
 )
@@ -90,6 +95,37 @@ def _decision(ref: str, **kw: object) -> DecisionRecord:
     }
     base.update(kw)
     return DecisionRecord.model_validate(base)
+
+
+def _leg(side: OrderSide, *broker_order_ids: str | None) -> LegRecord:
+    attempts = tuple(
+        Attempt(
+            index=i,
+            place_tool_call_id=uuid4(),
+            proposal_ref=None,
+            requested_quantity=1,
+            order_type_raw="limit",
+            time_in_force_raw="gfd",
+            limit_price=Decimal("1.20"),
+            snapshot_ref=None,
+            status=AttemptStatus.FILLED if order_id else AttemptStatus.NOT_PLACED,
+            broker_order_id=order_id,
+            filled_quantity=1 if order_id else None,
+        )
+        for i, order_id in enumerate(broker_order_ids)
+    )
+    occ = OccSymbol.parse("MSFT  261016P00400000")
+    return LegRecord(
+        leg_ref=f"leg:{side.value}:{broker_order_ids[-1]}",
+        side=side,
+        occ_symbol=occ,
+        broker_instrument_id="inst-9",
+        right=OptionRight.PUT,
+        strike=occ.strike,
+        expiration=occ.expiration,
+        target_quantity=1,
+        attempts=attempts,
+    )
 
 
 def _record(**kw: object) -> RunRecord:
@@ -200,3 +236,60 @@ def test_notes_skip_lineages_not_in_the_book() -> None:
         ),
     )
     assert notes_from_run_record(record, PositionBook(as_of=T0, entries=())) == ()
+
+
+def test_entry_note_must_be_an_open_decision() -> None:
+    entry_note = _note(action=DecisionAction.OPEN_CSP, thesis="Durable business.")
+    assert _entry(entry_note=entry_note).entry_note == entry_note
+    with pytest.raises(ValidationError, match="OPEN decision"):
+        _entry(entry_note=_note())
+
+
+def test_open_decision_notes_the_lineages_its_fills_created() -> None:
+    """ADR-0055: an OPEN decision's rationale and thesis reach the lineage it opened."""
+    new = UUID(int=9)
+    stepped = UUID(int=10)
+    open_csp = _decision(
+        "decision:0",
+        action=DecisionAction.OPEN_CSP,
+        target_ref="candidate:1",
+        position_id=None,
+        rationale="Quality name at a 6% cushion; earnings after expiry.",
+        thesis="Cloud demand holds through expiry.",
+        invalidation_conditions=("Guidance cut.",),
+        legs=(_leg(OrderSide.SELL_TO_OPEN, None, "b-1", "b-2", "b-3"),),
+    )
+    unfilled = _decision(
+        "decision:1",
+        action=DecisionAction.OPEN_CC,
+        target_ref="candidate:2",
+        position_id=None,
+        thesis="x",
+        legs=(_leg(OrderSide.SELL_TO_OPEN, "b-4"),),
+    )
+    record = _record(decisions=(open_csp, unfilled))
+    assert opened_order_ids(record) == ("b-1", "b-2", "b-3", "b-4")
+
+    # b-1 and b-2 are price steps whose fills built two lineages; b-3 never filled.
+    lineages = {"b-1": new, "b-2": stepped}
+    notes = notes_from_run_record(record, PositionBook(as_of=T0, entries=()), lineages)
+    assert [(n.position_id, n.dedup_key) for n in notes] == [
+        (new, f"note:{RUN}:decision:0"),
+        (stepped, f"note:{RUN}:decision:0"),
+    ]
+    note = notes[0].note
+    assert note.action is DecisionAction.OPEN_CSP
+    assert note.text == "Quality name at a 6% cushion; earnings after expiry."
+    assert note.thesis == "Cloud demand holds through expiry."
+    assert note.invalidation_conditions == ("Guidance cut.",)
+    assert notes_from_run_record(record, PositionBook(as_of=T0, entries=())) == ()
+
+
+def test_opened_order_ids_ignore_closes_and_buy_legs() -> None:
+    roll = _decision(
+        "decision:0",
+        action=DecisionAction.ROLL,
+        replacement_ref="candidate:3",
+        legs=(_leg(OrderSide.BUY_TO_CLOSE, "b-5"), _leg(OrderSide.SELL_TO_OPEN, "b-6")),
+    )
+    assert opened_order_ids(_record(decisions=(roll,))) == ()

@@ -22,9 +22,10 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # (ADR-0048): code validates sell-to-open placements and returns failed checks as feedback.
 # v13 (ADR-0050): finish with no order working; order cleanup turns and wind-down. v14
 # (ADR-0052): execution_refs cite each order call's delivered `order_call_ref`. v15
-# (ADR-0053): discovery rounds and the rendered work deadline.
+# (ADR-0053): discovery rounds and the rendered work deadline. v16 (ADR-0055): each position's
+# entry_note is weighed before a hold, close, or roll.
 ACTIVE_PROMPT_ID = "wheel_agent"
-ACTIVE_PROMPT_VERSION = 15
+ACTIVE_PROMPT_VERSION = 16
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).
 MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {
