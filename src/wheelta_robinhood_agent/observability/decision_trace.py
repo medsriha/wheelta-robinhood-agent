@@ -61,7 +61,7 @@ class TraceCall(_Model):
 
     tool_call_id: uuid.UUID
     requested_at: datetime
-    caller: str  # "orchestrator" or the Mignon's agent_type
+    caller: str  # "orchestrator", the Mignon's agent_type, or "executor (order_work:<id>)"
     server: str
     tool: str
     tier: str | None
@@ -219,7 +219,11 @@ def _call(record: ToolCallRecord) -> TraceCall:
     return TraceCall(
         tool_call_id=identity.tool_call_id,
         requested_at=identity.requested_at,
-        caller=identity.agent_type or ORCHESTRATOR,
+        caller=(
+            f"executor (order_work:{identity.parent_tool_call_id})"
+            if identity.parent_tool_call_id is not None
+            else identity.agent_type or ORCHESTRATOR
+        ),
         server=identity.server,
         tool=identity.tool,
         tier=identity.tier.value if identity.tier is not None else None,

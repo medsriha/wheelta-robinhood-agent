@@ -276,7 +276,9 @@ class BrokerLedger:
             return
         side = leg.side_raw
         if side == OrderSide.SELL_TO_OPEN:
-            position_id = self._lineage_of_order(order_id)
+            # ADR-0066: the steps of one order walk build one position, so a later step's
+            # fill joins the lineage an earlier step of the same job opened.
+            position_id = self._lineage_of_order(order_id) or self._lineage_of_job(order_id)
             if position_id is None:
                 position_id = ledger_positions.open_position(
                     self.conn,
@@ -320,6 +322,26 @@ class BrokerLedger:
         row = self.conn.execute(
             "SELECT entity_id FROM position_events WHERE order_id = %s "
             "AND event_type = 'fill_linked' ORDER BY recorded_at LIMIT 1",
+            (order_id,),
+        ).fetchone()
+        return row[0] if row is not None and isinstance(row[0], uuid.UUID) else None
+
+    def _lineage_of_job(self, order_id: uuid.UUID) -> uuid.UUID | None:
+        """The lineage an earlier order of the same order-walk job opened (ADR-0066): orders
+        whose place calls share this order's `parent_tool_call_id`. None for a model order."""
+        row = self.conn.execute(
+            "SELECT pe.entity_id FROM position_events pe "
+            "JOIN order_events oe ON oe.entity_id = pe.order_id "
+            "AND oe.event_type = 'intent_linked' "
+            "JOIN order_intents oi ON oi.intent_id = oe.intent_id "
+            "JOIN tool_calls tc ON tc.tool_call_id = oi.place_tool_call_id "
+            "WHERE pe.event_type = 'fill_linked' AND tc.parent_tool_call_id = ("
+            "  SELECT tc2.parent_tool_call_id FROM order_events oe2 "
+            "  JOIN order_intents oi2 ON oi2.intent_id = oe2.intent_id "
+            "  JOIN tool_calls tc2 ON tc2.tool_call_id = oi2.place_tool_call_id "
+            "  WHERE oe2.entity_id = %s AND oe2.event_type = 'intent_linked' "
+            "  AND tc2.parent_tool_call_id IS NOT NULL LIMIT 1"
+            ") ORDER BY pe.recorded_at LIMIT 1",
             (order_id,),
         ).fetchone()
         return row[0] if row is not None and isinstance(row[0], uuid.UUID) else None

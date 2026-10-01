@@ -18,6 +18,7 @@ from wheelta_robinhood_agent.agent.options import (
     assert_safe_options,
     build_agent_options,
 )
+from wheelta_robinhood_agent.agent.order_walk import ORDER_WORK_REGISTRY, QUALIFIED_WORK_TOOL
 from wheelta_robinhood_agent.agent.tool_access import ToolAccess, build_tool_access
 from wheelta_robinhood_agent.domain.enums import ExecutionMode, MignonType
 from wheelta_robinhood_agent.domain.gating import effective_execution_mode
@@ -31,6 +32,10 @@ from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGIST
 
 REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, TAVILY_REGISTRY)
 ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
+RH_CANCEL = ROBINHOOD_REGISTRY.qualified("cancel_option_order")
+EXECUTOR_ONLY = {
+    ROBINHOOD_REGISTRY.qualified(n) for n in ("review_option_order", "place_option_order")
+}
 SCRATCH = Path("/private/tmp/wra-scratch")
 PROMPTS = {m: f"rendered {m.value} prompt" for m in MignonType}
 LIMITS = MignonLimits(max_per_run=8, max_concurrent=4, max_turns_per_mignon=40)
@@ -128,8 +133,17 @@ def test_order_tools_absent_in_off_and_unarmed(mode: ExecutionMode) -> None:
 
 
 def test_order_tools_allowed_only_in_armed_live() -> None:
-    o = _build(tool_access=_access(ExecutionMode.LIVE))
-    assert ORDER_TOOLS <= set(o.allowed_tools)
+    """ADR-0066: armed live exposes cancel and work_option_order; review and place are the
+    executor's and stay disallowed to the model."""
+    access = build_tool_access(
+        effective_mode=ExecutionMode.LIVE,
+        workspace_writes=True,
+        registries=(*REGISTRIES, ORDER_WORK_REGISTRY),
+    )
+    o = _build(tool_access=access)
+    assert {RH_CANCEL, QUALIFIED_WORK_TOOL} <= set(o.allowed_tools)
+    assert EXECUTOR_ONLY <= set(o.disallowed_tools)
+    assert not EXECUTOR_ONLY & set(o.allowed_tools)
     assert "mcp__robinhood__place_equity_order" in o.disallowed_tools
 
 

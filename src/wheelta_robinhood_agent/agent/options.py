@@ -11,7 +11,8 @@ Pure: builds configuration only, no I/O. The session:
 - loads no filesystem settings or CLAUDE.md (`setting_sources=[]`) and only the MCP servers
   given here (`strict_mcp_config=True`): remote HTTP servers (direct delivery, ADR-0019 local
   dry runs only) plus in-process SDK servers named in `LOCAL_SDK_SERVER_NAMES` (`wra_local`:
-  web_cache_lookup and get_decision_facts) or `PROXY_SDK_SERVER_NAMES` (the validating proxy
+  web_cache_lookup and get_decision_facts; `wra_orders`: the order-work tools, ADR-0066) or
+  `PROXY_SDK_SERVER_NAMES` (the validating proxy
   for `robinhood`, `wheelta`, and `tavily`, ADR-0023, ADR-0058). No other server type
   (stdio, SSE) is ever configured;
 - ADR-0063: with `mignon_mcp_servers`, each Mignon definition carries inline loopback HTTP
@@ -41,6 +42,7 @@ from claude_agent_sdk.types import (
     McpServerConfig,
 )
 
+from wheelta_robinhood_agent.agent.account_scope import ORDER_WORK_SERVER_NAME
 from wheelta_robinhood_agent.agent.mignons import (
     DELEGATION_TOOL,
     MignonLimits,
@@ -66,7 +68,8 @@ from wheelta_robinhood_agent.integrations.wheelta.registry import SERVER_NAME as
 
 PERMISSION_MODE: Final[Literal["dontAsk"]] = "dontAsk"
 # The only in-process SDK MCP servers a session may carry. Their tools are local Tier R code.
-LOCAL_SDK_SERVER_NAMES: Final = frozenset({LOCAL_SERVER_NAME})
+# ADR-0066: `wra_orders` (work_option_order, await_order_work) exists only with an order venue.
+LOCAL_SDK_SERVER_NAMES: Final = frozenset({LOCAL_SERVER_NAME, ORDER_WORK_SERVER_NAME})
 # In-process validating proxies (agent/proxy.py) for the remote sources, under their own names.
 PROXY_SDK_SERVER_NAMES: Final = frozenset({ROBINHOOD, WHEELTA, TAVILY})
 _REQUIRED_HOOK_EVENTS: tuple[HookEvent, ...] = ("PreToolUse", "PostToolUse", "PostToolUseFailure")

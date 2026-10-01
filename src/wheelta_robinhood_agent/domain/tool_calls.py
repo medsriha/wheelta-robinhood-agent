@@ -39,7 +39,8 @@ class ToolCallIdentity(DomainModel):
 
     `tier` is None for a tool absent from the registry; such a call is always denied.
     `agent_id`/`agent_type` name the Mignon that made the call (ADR-0025); both are None
-    for the orchestrator.
+    for the orchestrator. `parent_tool_call_id` is the `work_option_order` call whose
+    order-walk job made the call (ADR-0066); None for every model call. Never both.
     """
 
     tool_call_id: UUID
@@ -53,12 +54,20 @@ class ToolCallIdentity(DomainModel):
     arguments_redacted: RedactedArguments
     agent_id: NonEmptyStr | None = None
     agent_type: NonEmptyStr | None = None
+    parent_tool_call_id: UUID | None = None
 
     @model_validator(mode="after")
     def _check_agent(self) -> Self:
         if (self.agent_id is None) != (self.agent_type is None):
             raise ValueError("agent_id and agent_type are set together")
+        if self.parent_tool_call_id is not None and self.agent_id is not None:
+            raise ValueError("an executor call is never a Mignon's")
         return self
+
+    @property
+    def by_executor(self) -> bool:
+        """Whether code's order walk made the call (ADR-0066), not the model."""
+        return self.parent_tool_call_id is not None
 
 
 _TERMINAL_WITH_COMPLETION = frozenset(

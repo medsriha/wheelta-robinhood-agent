@@ -114,30 +114,26 @@ min_cushion_ratio = "0.04" # owner, 2026-09-29 (ADR-0048)
 # ---------------------------------------------------------------------------------------------
 
 [orders]
-execution_order = "Execute non-HOLD decisions in priority order: closes and rolls before new opens. Buy-to-close orders on different contracts (closes, and the close legs of rolls) may be worked at the same time. Place a sell-to-open (a new open or a roll's replacement) only when no other order of yours is working."
+execution_order = "Execute non-HOLD decisions in priority order: closes and rolls before new opens. Buy-to-close order work on different contracts (closes, and the close legs of rolls) may run at the same time. Start a sell-to-open (a new open or a roll's replacement) only when no other order work or order of yours is working."
 open_checks = "Apply selection.underlying_filters, selection.contract_filters, selection.sizing, selection.portfolio_caps, and circuit_breakers to each sell-to-open attempt, using fresh account state."
 close_checks = "For buy-to-close, verify contract identity, a fresh executable ask and valid bid/ask bounds, current short quantity at least the remaining close quantity, broker-reported funds sufficient for the debit, and no conflicting working order. Do not apply entry DTE, delta, yield, premium, event, or board-comparison filters. Missing facts needed to establish the close decision or execute it still block that close."
-limit_price_rule = "Price in your favor, then walk toward the market to get filled. Sell to open: start above the mid and step down toward the bid. Buy to close: start below the mid and step up toward the ask. Choose the starting price, step size, and wait per step from the live spread and quote (agent_discretion). Every price is on the contract's tick increment and inside orders.limit_price_bounds."
+limit_price_rule = "Price in your favor, then walk toward the market to get filled. You choose start_price and worst_price from the live spread and quote (agent_discretion); code walks between them (orders.walk). Sell to open: start above the mid; worst_price is the lowest you accept, not below the bid. Buy to close: start below the mid; worst_price is the highest you pay, not above the ask. Both are on the contract's tick and inside orders.limit_price_bounds; code checks every step against the live quote taken just before it."
 limit_price_bounds = "Within [bid, ask] of the quote taken immediately before the order."
 time_in_force = "gfd"
 working = [
-  "Work each order until it fills, one price step at a time per orders.limit_price_rule.",
-  "After placing a step, check it with get_option_orders. If it is still unfilled when you move on, cancel it with cancel_option_order and confirm the cancel with get_option_orders before placing the next step.",
-  "A partial fill is a position. After cancellation is confirmed, read the final filled quantity, including fills during cancellation. Work only the target quantity minus confirmed cumulative fills; never infer that a cancel request released the reservation.",
-  "Each step is a new order: redo procedure step 4 in full (re-quote, re-check, review, place, confirm) at the new price.",
-  "Never have more than one open order of yours on the same contract.",
-  "To work several closes at once, send the placements one at a time (wait for each result), then check them together with one get_option_orders read and step each on its own. Each price step still cancels and confirms that order before its next price.",
-  "Code checks a placement against your other working orders of this run: only buy-to-close orders on different contracts may work together, and only when the fresh account snapshot's available settled cash covers all their debits at their limit prices. A denied placement was never sent; place it after the working orders resolve.",
-  "Stop working an order and cancel its unfilled remainder when the next price would fall outside orders.limit_price_bounds, when the applicable orders.open_checks or orders.close_checks fails (QUOTE_MOVED), or when the decision no longer holds. Preserve any fills in the record.",
-  "Follow the prompt's stop-on-error protocol for every place or cancel error, timeout, or unknown outcome. Price walking never permits a retry of an uncertain action.",
-  "Do not leave an order working when you finish. Before returning your output, cancel every order of yours that is still working, confirm its terminal state with get_option_orders, and count the final fills. An order whose cancellation you already sent is only confirmed, never cancelled again.",
-  "Only an order you could not resolve (its cancel was uncertain, or an error ended placement and reads cannot confirm it) may remain after you finish; code reports it. The next run cancels it (procedure step 1) and decides again.",
+  "Work every order with work_option_order, then await_order_work until it ends. Code places and steps the order; never place or review an order yourself.",
+  "Code checks each step against your other order work and working orders of this run: only buy-to-close work on different contracts may run together, and only when the fresh account snapshot's available settled cash covers all their debits at their worst prices. A denied request started nothing; start it after the running work ends.",
+  "A partial fill is a position. Code works only the target quantity minus confirmed cumulative fills, and reports the final filled quantity, including fills during cancellation.",
+  "Code stops a job and cancels its unfilled remainder when the window ends, the next step's price falls outside orders.limit_price_bounds (QUOTE_MOVED), a pre-trade check fails, or the review raises an alert. Stop starting work for a decision that no longer holds.",
+  "Follow the prompt's stop-on-error protocol for every order-work job that ends unknown and every cancel error, timeout, or unknown outcome. Code starts no new order work after one.",
+  "No order work outlives your session: code waits for every job before your output is final, and each job cancels what is unfilled. Cancel yourself only an order of yours that no job holds (an earlier run's, or one a job could not resolve), and confirm it with get_option_orders. An order whose cancellation you already sent is only confirmed, never cancelled again.",
+  "Only an order that could not be resolved (its cancel was uncertain, or an error ended placement and reads cannot confirm it) may remain after you finish; code reports it. The next run cancels it (procedure step 1) and decides again.",
 ]
 
 [orders.walk]
 notes = [
   "Code works each order for you (work_option_order): it re-quotes, checks, reviews, places, waits, cancels, and confirms, one price step at a time from your start_price to your worst_price.",
-  "A trade works for at most window_seconds from its first placement, in at most max_steps price steps of step_wait_seconds each; whatever is unfilled then is cancelled.",
+  "A trade works for at most window_seconds from the moment code accepts your work_option_order, in at most max_steps price steps of step_wait_seconds each; whatever is unfilled then is cancelled.",
 ]
 window_seconds = 300 # owner, 2026-10-01 (ADR-0066)
 max_steps = 5

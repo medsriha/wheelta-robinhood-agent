@@ -25,6 +25,8 @@ from pydantic import (
     model_validator,
 )
 
+from wheelta_robinhood_agent.domain.order_walk import STEP_OVERHEAD_SECONDS, WalkTiming
+
 DEFAULT_RULES_PATH = Path(__file__).resolve().parent.parent / "rules" / "trading_rules.toml"
 
 _DECIMAL_RE = re.compile(r"^-?\d+(\.\d+)?$")
@@ -165,6 +167,20 @@ class OrderWalk(_Section):
     step_wait_seconds: StrictInt = Field(gt=0)
     poll_seconds: StrictInt = Field(gt=0)
     partial_fill: PartialFill
+
+    @model_validator(mode="after")
+    def _fits_window(self) -> Self:
+        self.timing()  # raises when the steps, with their overhead, exceed the window
+        return self
+
+    def timing(self) -> WalkTiming:
+        return WalkTiming(
+            window_seconds=self.window_seconds,
+            max_steps=self.max_steps,
+            step_wait_seconds=self.step_wait_seconds,
+            poll_seconds=self.poll_seconds,
+            step_overhead_seconds=STEP_OVERHEAD_SECONDS,
+        )
 
 
 class Orders(_Section):

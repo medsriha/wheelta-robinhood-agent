@@ -76,6 +76,15 @@ class EventIndex:
     def place(self, call_id: UUID) -> PlaceAction | None:
         return next((p for p in self.places if p.call.identity.tool_call_id == call_id), None)
 
+    def children_of(self, work_call_id: UUID) -> tuple[UUID, ...]:
+        """ADR-0066: the place and cancel calls an order-work job made, in request order."""
+        return tuple(
+            c.identity.tool_call_id
+            for c in self.calls_by_id.values()
+            if c.identity.parent_tool_call_id == work_call_id
+            and tool_name(c) in (PLACE_TOOL, CANCEL_TOOL)
+        )
+
 
 def _finding(code: str, detail: str, *call_ids: UUID) -> AssemblyFinding:
     return AssemblyFinding(code=code, detail=detail, tool_call_ids=tuple(call_ids))

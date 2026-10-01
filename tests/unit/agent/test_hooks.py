@@ -27,8 +27,9 @@ from wheelta_robinhood_agent.agent.hooks import (
     WorkspaceAction,
     WorkspaceKind,
     WorkspaceTargetSpec,
-    build_hooks,
+    build_hooks_with_gate,
 )
+from wheelta_robinhood_agent.agent.order_walk import Admitted, Refused
 from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import ResultKind
 from wheelta_robinhood_agent.agent.run_control import RunControl
@@ -75,6 +76,7 @@ SCOPE: dict[str, AccountScopeSpec] = {
     "create_scan": NOT_SCOPED,
     "get_option_quotes": NOT_SCOPED,
     "place_option_order": AccountScopeSpec.verified("account_number"),
+    "cancel_option_order": AccountScopeSpec.verified("account_number"),
     **{name: NOT_SCOPED for name in ROBINHOOD_WORKSPACE_TARGETS},
 }
 OWNED_LIST = OwnedWorkspaceObject(W, "wl-1", PREFIX + "Held")
@@ -200,7 +202,7 @@ def make_deps(**overrides: Any) -> HookDeps:
         account_scope_table=SCOPE,
         workspace_targets=TARGETS,
         mignon_models=(TEST_MODEL,),
-        pretrade_gate=lambda tool_input: None,
+        pretrade_gate=lambda tool_input, **_: None,
     )
     return dataclasses.replace(base, **overrides)
 
@@ -248,7 +250,7 @@ def failure_input(tool: str, use_id: str = "toolu_1", **extra: Any) -> Any:
 class Session:
     def __init__(self, deps: HookDeps) -> None:
         self.deps = deps
-        hooks = build_hooks(deps)
+        hooks, self.gate = build_hooks_with_gate(deps)
         self.pre_cb = hooks["PreToolUse"][0].hooks[0]
         self.post_cb = hooks["PostToolUse"][0].hooks[0]
         self.fail_cb = hooks["PostToolUseFailure"][0].hooks[0]
@@ -275,6 +277,62 @@ class Session:
 
 def session(**overrides: Any) -> Session:
     return Session(make_deps(**overrides))
+
+
+# ---- the order-walk executor's path (ADR-0066) ---------------------------------------------
+
+JOB = uuid.UUID(int=4242)
+PLACEHOLDER = "AGENTIC_ACCOUNT"
+STO_ORDER: dict[str, Any] = {
+    "account_number": PLACEHOLDER,
+    "legs": [
+        {"option_id": "inst-1", "side": "sell", "position_effect": "open", "ratio_quantity": 1}
+    ],
+    "quantity": "1",
+    "price": "1.00",
+    "type": "limit",
+    "time_in_force": "gfd",
+    "direction": "credit",
+}
+CANCEL_ARGS: dict[str, Any] = {"account_number": PLACEHOLDER, "order_id": "ord-1"}
+
+
+def executor_session(**overrides: Any) -> Session:
+    """A live session whose Robinhood server is proxied: the executor's only path."""
+    from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
+
+    base: dict[str, Any] = {
+        "effective_mode": ExecutionMode.LIVE,
+        "proxy_dispatch": ProxyDispatch(frozenset({"robinhood"})),
+        "account_scope_table": ROBINHOOD_ACCOUNT_SCOPE,
+    }
+    return session(**{**base, **overrides})
+
+
+def admit(s: Session, tool: str, args: Mapping[str, Any], **kw: Any) -> Admitted | Refused:
+    return s.gate.admit(tool, dict(args), job_id=JOB, **kw)
+
+
+def assert_admitted(s: Session, out: Admitted | Refused) -> Any:
+    """Recorded (intent attributed to the job), dispatched, and registered for the proxy as
+    an executor call; returns the registration."""
+    assert isinstance(out, Admitted), out
+    assert s.rec.names() == ["requested", "dispatched"]
+    assert s.rec.event("requested")["parent_tool_call_id"] == JOB
+    assert s.rec.event("requested")["sdk_tool_use_id"] == out.use_id
+    assert s.deps.proxy_dispatch is not None
+    call = s.deps.proxy_dispatch.claim(out.use_id)
+    assert call is not None and call.by_executor and call.tool_call_id == out.tool_call_id
+    return call
+
+
+def assert_refused(s: Session, out: Admitted | Refused, fragment: str) -> None:
+    assert isinstance(out, Refused), out
+    assert fragment in out.reason, out.reason
+    assert s.rec.names() == ["requested", "outcome"]
+    assert s.rec.event("requested")["parent_tool_call_id"] == JOB
+    assert s.rec.event("outcome")["status"] is ToolCallStatus.DENIED
+    assert s.rec.event("outcome")["reason"] == out.reason
 
 
 def denied_reason(out: Any) -> str | None:
@@ -459,20 +517,39 @@ def test_order_tools_denied_in_off_mode(tool: str) -> None:
     assert_denied(s, s.pre(RH + tool, {"account_number": ACCOUNT}), "not available in this run")
 
 
-@pytest.mark.parametrize(
-    "tool", ["review_option_order", "place_option_order", "cancel_option_order"]
-)
-def test_order_tools_allowed_on_the_simulated_venue_through_the_proxy(tool: str) -> None:
-    """ADR-0038: a proxied dry run hands order calls to the proxy's simulated broker."""
+def _simulated(**overrides: Any) -> Session:
     from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
 
-    s = session(
+    return session(
         effective_mode=ExecutionMode.OFF,
         order_venue=OrderVenue.SIMULATED,
         proxy_dispatch=ProxyDispatch(frozenset({"robinhood"})),
         account_scope_table=ROBINHOOD_ACCOUNT_SCOPE,
+        **overrides,
     )
-    assert_allowed(s, s.pre(RH + tool, {"account_number": ACCOUNT}))
+
+
+def test_model_cancel_allowed_on_the_simulated_venue_through_the_proxy() -> None:
+    """ADR-0038: a proxied dry run hands order calls to the proxy's simulated broker."""
+    s = _simulated()
+    assert_allowed(s, s.pre(RH + "cancel_option_order", {"account_number": ACCOUNT}))
+
+
+@pytest.mark.parametrize("tool", ["review_option_order", "place_option_order"])
+@pytest.mark.parametrize("mode", [ExecutionMode.OFF, ExecutionMode.LIVE])
+def test_model_review_and_place_are_denied_by_role(tool: str, mode: ExecutionMode) -> None:
+    """ADR-0066: only the order-walk executor reviews and places; the model never may."""
+    s = _simulated() if mode is ExecutionMode.OFF else executor_session()
+    assert_denied(
+        s, s.pre(RH + tool, {"account_number": ACCOUNT}), "not available to the orchestrator"
+    )
+
+
+@pytest.mark.parametrize("tool", ["review_option_order", "place_option_order"])
+def test_executor_review_and_place_allowed_on_the_simulated_venue(tool: str) -> None:
+    s = _simulated()
+    call = assert_admitted(s, admit(s, tool, STO_ORDER))
+    assert call.server == "robinhood" and call.tool == tool and call.tier is ToolTier.X
 
 
 def test_simulated_venue_needs_the_proxy() -> None:
@@ -503,26 +580,32 @@ def test_order_venue_must_match_the_mode(mode: ExecutionMode, venue: OrderVenue)
     assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "inconsistent")
 
 
-def test_order_tool_allowed_live_with_verified_account() -> None:
-    s = session(effective_mode=ExecutionMode.LIVE)
-    out = s.pre(PLACE, {"account_number": ACCOUNT, "limit_price": "1.25"})
-    assert_allowed(s, out)
-    assert out == {}
+def test_executor_place_allowed_live_with_the_placeholder_substituted_upstream() -> None:
+    s = executor_session()
+    call = assert_admitted(s, admit(s, "place_option_order", STO_ORDER))
+    assert call.effective_input == STO_ORDER  # what is recorded keeps the placeholder
+    assert call.upstream_input is not None
+    assert call.upstream_input["account_number"] == ACCOUNT  # ADR-0030: upstream only
+    assert ACCOUNT not in str(s.rec.events)
+    assert not call.after_stop_cancel
 
 
 def test_order_tool_live_needs_the_configured_account() -> None:
-    """ADR-0034: the shipped table scopes order tools to the configured account."""
-    from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
-
-    s = session(effective_mode=ExecutionMode.LIVE, account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
-    assert_denied(s, s.pre(PLACE, {}), "missing")
-    s = session(effective_mode=ExecutionMode.LIVE, account_scope_table=ROBINHOOD_ACCOUNT_SCOPE)
-    assert_denied(s, s.pre(PLACE, {"account_number": "9ZZ99995678"}), "does not match")
+    """ADR-0034: the shipped table scopes order tools to the configured account, on the
+    executor's path as on the model's."""
+    s = executor_session()
+    assert_refused(s, admit(s, "place_option_order", {"legs": []}), "missing")
+    s = executor_session()
+    wrong = {**STO_ORDER, "account_number": "9ZZ99995678"}
+    assert_refused(s, admit(s, "place_option_order", wrong), "does not match")
 
 
 def test_non_agentic_account_denied() -> None:
-    s = session(effective_mode=ExecutionMode.LIVE)
-    assert_denied(s, s.pre(PLACE, {"account_number": "9ZZ99995678"}), "does not match")
+    s = executor_session()
+    cancel = {"account_number": "9ZZ99995678", "order_id": "o-1"}
+    assert_denied(s, s.pre(RH + "cancel_option_order", cancel), "does not match")
+    s = executor_session()
+    assert_refused(s, admit(s, "cancel_option_order", cancel), "does not match")
 
 
 def test_account_argument_on_unscoped_read_denied() -> None:
@@ -552,7 +635,10 @@ def test_shipped_scope_table_confines_account_reads() -> None:
 
 @pytest.mark.parametrize(
     ("tool", "args"),
-    [(PLACE, {"account_number": ACCOUNT}), (RH + "create_watchlist", {"name": PREFIX + "x"})],
+    [
+        (RH + "cancel_option_order", {"account_number": ACCOUNT, "order_id": "o-1"}),
+        (RH + "create_watchlist", {"name": PREFIX + "x"}),
+    ],
 )
 def test_kill_switch_denies_tier_s_and_x(tool: str, args: dict[str, Any]) -> None:
     s = session(effective_mode=ExecutionMode.LIVE, kill_switch=True)
@@ -561,7 +647,10 @@ def test_kill_switch_denies_tier_s_and_x(tool: str, args: dict[str, Any]) -> Non
 
 @pytest.mark.parametrize(
     ("tool", "args"),
-    [(PLACE, {"account_number": ACCOUNT}), (RH + "create_watchlist", {"name": PREFIX + "x"})],
+    [
+        (RH + "cancel_option_order", {"account_number": ACCOUNT, "order_id": "o-1"}),
+        (RH + "create_watchlist", {"name": PREFIX + "x"}),
+    ],
 )
 def test_stop_latch_denies_tier_s_and_x_after_stop(tool: str, args: dict[str, Any]) -> None:
     s = session(effective_mode=ExecutionMode.LIVE)
@@ -569,6 +658,58 @@ def test_stop_latch_denies_tier_s_and_x_after_stop(tool: str, args: dict[str, An
     s.deps.run_control.request_stop(StopReason.SIGTERM, NOW)
     s.rec.events.clear()
     assert_denied(s, s.pre(tool, args, use_id="after"), "run stop requested")
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("place_option_order", STO_ORDER),
+        ("review_option_order", STO_ORDER),
+        ("cancel_option_order", CANCEL_ARGS),
+    ],
+)
+def test_kill_switch_denies_the_executor_too(tool: str, args: dict[str, Any]) -> None:
+    s = executor_session(kill_switch=True)
+    assert_refused(s, admit(s, tool, args), "kill switch engaged")
+    s = executor_session(kill_switch=True)
+    assert_refused(s, admit(s, tool, args, after_stop_cancel=True), "kill switch engaged")
+
+
+def test_stop_latch_denies_executor_orders_except_its_one_cancel() -> None:
+    """ADR-0066 open question 1 (b): after the latch the executor may send only the cancel
+    of its working step, flagged `after_stop_cancel`; nothing else of Tier X passes."""
+    s = executor_session()
+    s.deps.run_control.request_stop(StopReason.SIGTERM, NOW)
+    for tool, args in (
+        ("place_option_order", STO_ORDER),
+        ("review_option_order", STO_ORDER),
+        ("cancel_option_order", CANCEL_ARGS),
+    ):
+        s.rec.events.clear()
+        assert_refused(s, admit(s, tool, args), "run stop requested")
+    for tool in ("place_option_order", "review_option_order"):
+        s.rec.events.clear()
+        assert_refused(s, admit(s, tool, STO_ORDER, after_stop_cancel=True), "run stop requested")
+    s.rec.events.clear()
+    call = assert_admitted(s, admit(s, "cancel_option_order", CANCEL_ARGS, after_stop_cancel=True))
+    assert call.after_stop_cancel is True
+
+
+def test_the_model_never_gets_the_latch_cancel() -> None:
+    s = executor_session()
+    s.deps.run_control.request_stop(StopReason.DEADLINE, NOW)
+    assert_denied(
+        s,
+        s.pre(RH + "cancel_option_order", {"account_number": ACCOUNT, "order_id": "o-1"}),
+        "run stop requested",
+    )
+
+
+def test_executor_reads_pass_after_the_latch() -> None:
+    s = executor_session()
+    s.deps.run_control.request_stop(StopReason.DEADLINE, NOW)
+    call = assert_admitted(s, admit(s, "get_option_orders", CANCEL_ARGS))
+    assert call.tier is ToolTier.R and not call.after_stop_cancel
 
 
 def test_stop_latch_does_not_deny_reads() -> None:
@@ -584,7 +725,7 @@ def test_stop_latch_does_not_deny_reads() -> None:
     ("tool", "args"),
     [
         (RH + "get_option_quotes", {}),
-        (PLACE, {"account_number": ACCOUNT}),
+        (RH + "cancel_option_order", {"account_number": ACCOUNT, "order_id": "o-1"}),
         (RH + "create_watchlist", {"name": PREFIX + "x"}),
     ],
 )
@@ -595,6 +736,48 @@ def test_closed_output_gate_denies_every_tool(tool: str, args: dict[str, Any]) -
     gate.close("tools are disabled while the final output is corrected")
     s.rec.events.clear()
     assert_denied(s, s.pre(tool, args, use_id="after"), "final output is corrected")
+
+
+def test_the_output_gate_never_cuts_a_started_window_short() -> None:
+    """ADR-0066: the executor's calls skip the output gate (repair, wind-down, cleanup)."""
+    gate = OutputRepairGate()
+    gate.close("tools are disabled while the final output is corrected")
+    s = executor_session(output_gate=gate)
+    assert_admitted(s, admit(s, "place_option_order", STO_ORDER))
+
+
+@pytest.mark.parametrize("tool", ["get_option_positions", "place_equity_order", "create_scan"])
+def test_executor_may_use_only_executor_tools(tool: str) -> None:
+    s = executor_session()
+    out = admit(s, tool, {"account_number": PLACEHOLDER})
+    assert isinstance(out, Refused)
+    assert s.rec.event("outcome")["status"] is ToolCallStatus.DENIED
+
+
+def test_executor_non_executor_tool_reason() -> None:
+    s = executor_session()
+    assert_refused(
+        s, admit(s, "get_option_positions", {"account_number": PLACEHOLDER}), "order-executor tool"
+    )
+
+
+def test_executor_needs_the_robinhood_proxy() -> None:
+    s = executor_session(proxy_dispatch=ProxyDispatch(frozenset({"wheelta"})))
+    assert_refused(s, admit(s, "get_option_quotes", {"instrument_ids": ["x"]}), "validating proxy")
+    s = executor_session(proxy_dispatch=None)
+    assert_refused(s, admit(s, "get_option_quotes", {"instrument_ids": ["x"]}), "validating proxy")
+
+
+def test_executor_order_tools_denied_without_a_venue() -> None:
+    s = executor_session(effective_mode=ExecutionMode.OFF)
+    assert_refused(s, admit(s, "place_option_order", STO_ORDER), "not available in this run")
+
+
+def test_executor_recording_failure_refuses_and_stops() -> None:
+    s = executor_session(recorder=FakeRecorder(frozenset({"requested"})))
+    out = admit(s, "get_option_quotes", {"instrument_ids": ["x"]})
+    assert isinstance(out, Refused) and "recording failed" in out.reason
+    assert s.deps.run_control.stop_requested
 
 
 def test_restricted_gate_passes_only_permitted_tools() -> None:
@@ -831,7 +1014,7 @@ def test_recording_failure_denies_and_stops(stage: str) -> None:
 
 def test_arguments_are_redacted_before_recording() -> None:
     s = session(effective_mode=ExecutionMode.LIVE)
-    s.pre(PLACE, {"account_number": ACCOUNT})
+    s.pre(RH + "cancel_option_order", {"account_number": ACCOUNT})
     recorded = str(s.rec.events)
     assert ACCOUNT not in recorded and "5678" in recorded
 
@@ -839,51 +1022,47 @@ def test_arguments_are_redacted_before_recording() -> None:
 def test_hooks_check_no_trading_limit_beyond_pretrade_validation() -> None:
     # A contract count far above limits.max_contracts_per_order is not the hook's business:
     # only the injected pre-trade gate (ADR-0048) judges trading rules, and it passes here.
-    s = session(effective_mode=ExecutionMode.LIVE)
-    out = s.pre(PLACE, {"account_number": ACCOUNT, "quantity": 10_000})
-    assert_allowed(s, out)
+    s = executor_session()
+    assert_admitted(s, admit(s, "place_option_order", {**STO_ORDER, "quantity": "10000"}))
 
 
 # ---- pre-trade validation (ADR-0048) -------------------------------------------------------
 
 
 def test_pretrade_failure_denies_the_placement_with_the_feedback() -> None:
-    seen: list[Mapping[str, object]] = []
+    seen: list[tuple[Mapping[str, object], dict[str, Any]]] = []
 
-    def gate(tool_input: Mapping[str, object]) -> str | None:
-        seen.append(tool_input)
+    def gate(tool_input: Mapping[str, object], **kw: Any) -> str | None:
+        seen.append((tool_input, kw))
         return "Pre-trade validation failed (ADR-0048); cushion 0.0312 is below 0.04"
 
-    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=gate)
-    order = {"account_number": ACCOUNT, "legs": [{"option_id": "x"}]}
-    assert_denied(s, s.pre(PLACE, order), "cushion 0.0312 is below 0.04")
-    assert seen == [order]
+    s = executor_session(pretrade_gate=gate)
+    assert_refused(s, admit(s, "place_option_order", STO_ORDER), "cushion 0.0312 is below 0.04")
+    # The job's own working order and its own placement are not counted against it.
+    assert seen == [(STO_ORDER, {"job": JOB, "self_in_flight": False})]
     assert not s.deps.run_control.stop_requested  # a failed check is feedback, not a failure
 
 
 def test_pretrade_pass_allows_the_placement() -> None:
-    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=lambda tool_input: None)
-    assert_allowed(s, s.pre(PLACE, {"account_number": ACCOUNT}))
+    s = executor_session(pretrade_gate=lambda tool_input, **_: None)
+    assert_admitted(s, admit(s, "place_option_order", STO_ORDER))
 
 
 def test_no_pretrade_gate_denies_every_placement() -> None:
-    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=None)
-    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "pre-trade validation")
+    s = executor_session(pretrade_gate=None)
+    assert_refused(s, admit(s, "place_option_order", STO_ORDER), "pre-trade validation")
 
 
 @pytest.mark.parametrize("tool", ["review_option_order", "cancel_option_order"])
 def test_pretrade_gate_applies_to_placement_only(tool: str) -> None:
-    def gate(tool_input: Mapping[str, object]) -> str | None:
+    def gate(tool_input: Mapping[str, object], **_: Any) -> str | None:
         raise AssertionError("the gate is for place_option_order only")
 
-    from wheelta_robinhood_agent.agent.account_scope import ROBINHOOD_ACCOUNT_SCOPE
-
-    s = session(
-        effective_mode=ExecutionMode.LIVE,
-        pretrade_gate=gate,
-        account_scope_table=ROBINHOOD_ACCOUNT_SCOPE,
-    )
-    assert_allowed(s, s.pre(RH + tool, {"account_number": ACCOUNT, "order_id": "o-1"}))
+    s = executor_session(pretrade_gate=gate)
+    assert_admitted(s, admit(s, tool, {**STO_ORDER, "order_id": "o-1"}))
+    s = executor_session(pretrade_gate=gate)
+    if tool == "cancel_option_order":
+        assert_allowed(s, s.pre(RH + tool, {"account_number": ACCOUNT, "order_id": "o-1"}))
 
 
 def test_pretrade_gate_not_reached_when_an_earlier_check_denies() -> None:
@@ -895,13 +1074,14 @@ def test_pretrade_gate_not_reached_when_an_earlier_check_denies() -> None:
 
 
 def test_pretrade_gate_error_denies_and_stops() -> None:
-    def gate(tool_input: Mapping[str, object]) -> str | None:
+    def gate(tool_input: Mapping[str, object], **_: Any) -> str | None:
         raise RuntimeError("ledger down")
 
-    s = session(effective_mode=ExecutionMode.LIVE, pretrade_gate=gate)
-    out = s.pre(PLACE, {"account_number": ACCOUNT})
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert out["continue_"] is False and s.deps.run_control.stop_requested
+    s = executor_session(pretrade_gate=gate)
+    out = admit(s, "place_option_order", STO_ORDER)
+    assert isinstance(out, Refused) and "hook check failed" in out.reason
+    assert s.deps.run_control.stop_requested
+    assert s.rec.event("outcome")["status"] is ToolCallStatus.DENIED
 
 
 # ---- PostToolUse ---------------------------------------------------------------------------
@@ -942,7 +1122,7 @@ def test_post_board_query_attaches_filter_context() -> None:
     ("tool", "args", "status"),
     [
         (RH + "get_option_quotes", {}, ToolCallStatus.FAILED),
-        (PLACE, {"account_number": ACCOUNT}, ToolCallStatus.UNKNOWN),
+        (RH + "cancel_option_order", {"account_number": ACCOUNT}, ToolCallStatus.UNKNOWN),
     ],
 )
 def test_post_invalid_result_never_passes_raw_data(
@@ -968,10 +1148,11 @@ def test_post_invalid_result_never_passes_raw_data(
 
 @pytest.mark.parametrize("mode", ["raise", "mismatch"])
 def test_post_validator_failure_replaces_and_stops(mode: str) -> None:
+    cancel = RH + "cancel_option_order"
     s = session(effective_mode=ExecutionMode.LIVE, validator=FakeValidator(mode))
-    s.pre(PLACE, {"account_number": ACCOUNT})
+    s.pre(cancel, {"account_number": ACCOUNT})
     s.rec.events.clear()
-    out = s.post(PLACE, {"order": "raw"})
+    out = s.post(cancel, {"order": "raw"})
     assert out["continue_"] is False and out["stopReason"]
     delivered = wire(out["hookSpecificOutput"]["updatedToolOutput"])
     assert delivered["kind"] == "error" and "raw" not in str(delivered.get("data"))
@@ -1009,16 +1190,17 @@ def test_post_for_denied_call_has_no_state() -> None:
 
 
 def test_failure_tier_x_recorded_unknown_never_retried() -> None:
+    cancel = RH + "cancel_option_order"
     s = session(effective_mode=ExecutionMode.LIVE)
-    s.pre(PLACE, {"account_number": ACCOUNT})
+    s.pre(cancel, {"account_number": ACCOUNT})
     s.rec.events.clear()
-    out = s.fail(PLACE)
+    out = s.fail(cancel)
     assert s.rec.names() == ["store_error", "outcome"]
     assert s.rec.event("outcome")["status"] is ToolCallStatus.UNKNOWN
     assert "not retried" in out["hookSpecificOutput"]["additionalContext"]
     stored = s.rec.event("store_error")["payload"]
     assert "abcdefghijklmnop" not in str(stored)  # error text redacted before persistence
-    assert s.fail(PLACE)["continue_"] is False  # a second report has no dispatch state
+    assert s.fail(cancel)["continue_"] is False  # a second report has no dispatch state
 
 
 def test_failure_tier_s_recorded_unknown() -> None:
@@ -1043,9 +1225,10 @@ def test_failure_without_dispatch_stops() -> None:
 
 
 def test_failure_recording_failure_stops() -> None:
+    cancel = RH + "cancel_option_order"
     s = session(effective_mode=ExecutionMode.LIVE, recorder=FakeRecorder(frozenset({"outcome"})))
-    s.pre(PLACE, {"account_number": ACCOUNT})
-    out = s.fail(PLACE)
+    s.pre(cancel, {"account_number": ACCOUNT})
+    out = s.fail(cancel)
     assert out["continue_"] is False and s.deps.run_control.stop_requested
 
 

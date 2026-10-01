@@ -3,6 +3,11 @@ import itertools
 import pytest
 
 from wheelta_robinhood_agent.agent.mignons import AGENT_ORCHESTRATOR_TOOLS, ROLE_TOOLS, Role
+from wheelta_robinhood_agent.agent.order_walk import (
+    ORDER_WORK_REGISTRY,
+    QUALIFIED_AWAIT_TOOL,
+    QUALIFIED_WORK_TOOL,
+)
 from wheelta_robinhood_agent.agent.tool_access import (
     DISALLOWED_BUILTINS,
     SESSION_BUILTINS,
@@ -20,6 +25,9 @@ from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGIST
 
 REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY)
 ORDER_TOOLS = {f"mcp__robinhood__{n}" for n in LIVE_ORDER_TOOLS}
+# ADR-0066: code reviews and places; the model keeps cancel and starts order-work jobs.
+MODEL_ORDER_TOOLS = {"mcp__robinhood__cancel_option_order", QUALIFIED_WORK_TOOL}
+EXECUTOR_ONLY = {"mcp__robinhood__review_option_order", "mcp__robinhood__place_option_order"}
 DENIED_X = {
     ROBINHOOD_REGISTRY.qualified(t.name)
     for t in ROBINHOOD_REGISTRY.tools
@@ -41,12 +49,29 @@ def test_off_mode_never_exposes_order_tools(writes: bool) -> None:
     assert ORDER_TOOLS <= set(access.disallowed_tools)
 
 
-def test_live_mode_exposes_exactly_the_three_order_tools() -> None:
-    access = _access(ExecutionMode.LIVE)
-    x_allowed = (
-        {n for n in access.allowed_tools if n.startswith("mcp__robinhood__")} - TIER_R - TIER_S
+def test_live_mode_exposes_exactly_cancel_and_work_order() -> None:
+    """ADR-0066: with an order venue the model's Tier X tools are cancel_option_order and
+    work_option_order; review and place stay disallowed (only the executor calls them)."""
+    access = build_tool_access(
+        effective_mode=ExecutionMode.LIVE,
+        workspace_writes=True,
+        registries=(*REGISTRIES, ORDER_WORK_REGISTRY),
     )
-    assert x_allowed == ORDER_TOOLS
+    x_allowed = set(access.allowed_tools) - TIER_R - TIER_S - {QUALIFIED_AWAIT_TOOL}
+    x_allowed = {n for n in x_allowed if n.startswith("mcp__")}
+    assert x_allowed == MODEL_ORDER_TOOLS
+    assert EXECUTOR_ONLY <= set(access.disallowed_tools)
+    assert QUALIFIED_AWAIT_TOOL in access.allowed_tools
+
+
+def test_without_a_venue_no_order_tool_is_allowed() -> None:
+    access = build_tool_access(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=True,
+        registries=(*REGISTRIES, ORDER_WORK_REGISTRY),
+    )
+    assert not (ORDER_TOOLS | {QUALIFIED_WORK_TOOL}) & set(access.allowed_tools)
+    assert ORDER_TOOLS | {QUALIFIED_WORK_TOOL} <= set(access.disallowed_tools)
 
 
 @pytest.mark.parametrize(("mode", "writes"), list(itertools.product(ExecutionMode, [True, False])))
@@ -127,7 +152,8 @@ def test_close_agent_sees_no_scan_tools_but_keeps_orders() -> None:
     )
     assert not SCAN_TOOLS & set(access.allowed_tools)
     assert SCAN_TOOLS <= set(access.disallowed_tools)
-    assert ORDER_TOOLS <= set(access.allowed_tools)
+    assert "mcp__robinhood__cancel_option_order" in access.allowed_tools
+    assert not EXECUTOR_ONLY & set(access.allowed_tools)  # ADR-0066: code reviews and places
     # A Mignon's scanner stays: run_scan is the market Mignon's, not the orchestrator's.
     assert "mcp__robinhood__run_scan" in access.allowed_tools
 

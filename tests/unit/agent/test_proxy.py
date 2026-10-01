@@ -513,3 +513,118 @@ def test_a_read_result_carries_no_order_call_ref() -> None:
     r = rig()
     r.session.pre(QUOTES, {"symbols": ["AAPL"]})
     assert "order_call_ref" not in wire(r.call())
+
+
+# ---- the order-walk executor's entry (ADR-0066) -------------------------------------------------
+
+
+def _executor_rig(**deps: Any) -> Rig:
+    from wheelta_robinhood_agent.domain.enums import ExecutionMode
+
+    return rig(effective_mode=ExecutionMode.LIVE, **deps)
+
+
+def _admit(r: Rig, tool: str, args: dict[str, Any], **kw: Any) -> Any:
+    from test_hooks import JOB
+
+    from wheelta_robinhood_agent.agent.order_walk import Admitted
+
+    admitted = r.session.gate.admit(tool, dict(args), job_id=JOB, **kw)
+    assert isinstance(admitted, Admitted), admitted
+    return admitted
+
+
+EXEC_QUOTES = {"instrument_ids": ["inst-1"]}
+
+
+def test_execute_forwards_an_admitted_executor_call_once() -> None:
+    r = _executor_rig()
+    admitted = _admit(r, "get_option_quotes", EXEC_QUOTES)
+    done = anyio.run(r.proxy.execute, admitted.use_id)
+    assert done.status is ToolCallStatus.SUCCEEDED
+    assert done.payload["kind"] == "validated" and done.payload["data"] == {"normalized": True}
+    assert done.payload["tool_call_id"] == str(admitted.tool_call_id)
+    assert r.upstream.calls == [("get_option_quotes", EXEC_QUOTES, 50.0)]
+    assert r.dispatch.state(admitted.use_id) is CallState.COMPLETED
+    (outcome,) = outcomes(r)
+    assert outcome["status"] is ToolCallStatus.SUCCEEDED
+    assert outcome["dedup_key"] == PROXY_DEDUP_KEY
+    # A second execute of the same id has nothing to claim: refused, and the run stops.
+    with pytest.raises(ValueError, match="no admitted executor call"):
+        anyio.run(r.proxy.execute, admitted.use_id)
+    assert r.session.deps.run_control.stop_requested
+    assert len(r.upstream.calls) == 1
+
+
+def test_execute_refuses_a_cli_registration() -> None:
+    r = _executor_rig()
+    r.session.pre(QUOTES, {"symbols": ["AAPL"]})
+    with pytest.raises(ValueError):
+        anyio.run(r.proxy.execute, "toolu_1")
+    assert r.upstream.calls == [] and r.session.deps.run_control.stop_requested
+
+
+def test_the_cli_can_never_claim_an_executor_call() -> None:
+    r = _executor_rig()
+    admitted = _admit(r, "get_option_quotes", EXEC_QUOTES)
+    envelope = wire(r.call("get_option_quotes", EXEC_QUOTES, use_id=admitted.use_id))
+    assert envelope["kind"] == "error" and "executor call came from the CLI" in envelope["gaps"][0]
+    assert r.upstream.calls == [] and r.session.deps.run_control.stop_requested
+
+
+def test_execute_skips_the_delivery_size_limit() -> None:
+    """Nothing an executor call returns is delivered to the model (ADR-0066)."""
+    from test_hooks import FakeValidator
+
+    from wheelta_robinhood_agent.agent.proxy import MAX_DELIVERED_CHARS
+
+    class Big(FakeValidator):
+        def __call__(self, request: Any) -> Any:
+            outcome = super().__call__(request)
+            data = {"rows": ["x" * 100] * (MAX_DELIVERED_CHARS // 100 + 1)}
+            return outcome.model_copy(
+                update={"envelope": outcome.envelope.model_copy(update={"data": data})}
+            )
+
+    r = _executor_rig(validator=Big())
+    admitted = _admit(r, "get_option_quotes", EXEC_QUOTES)
+    done = anyio.run(r.proxy.execute, admitted.use_id)
+    assert done.status is ToolCallStatus.SUCCEEDED and done.payload["kind"] == "validated"
+
+
+def test_execute_narrows_the_upstream_deadline_only() -> None:
+    r = _executor_rig()
+    first = _admit(r, "get_option_quotes", EXEC_QUOTES)
+    anyio.run(lambda: r.proxy.execute(first.use_id, timeout_seconds=5.0))
+    second = _admit(r, "get_option_quotes", EXEC_QUOTES)
+    anyio.run(lambda: r.proxy.execute(second.use_id, timeout_seconds=99.0))
+    assert [c[2] for c in r.upstream.calls] == [5.0, 50.0]
+
+
+def test_after_the_latch_only_the_flagged_cancel_is_forwarded() -> None:
+    from test_hooks import CANCEL_ARGS
+
+    r = _executor_rig()
+    unflagged = _admit(r, "cancel_option_order", CANCEL_ARGS)  # admitted before the stop
+    r.session.deps.run_control.request_stop(StopReason.SIGTERM, NOW)
+    flagged = _admit(r, "cancel_option_order", CANCEL_ARGS, after_stop_cancel=True)
+    refused = anyio.run(r.proxy.execute, unflagged.use_id)
+    assert refused.status is ToolCallStatus.FAILED
+    assert "run stop requested" in refused.payload["gaps"][0]
+    assert r.upstream.calls == []
+    done = anyio.run(lambda: r.proxy.execute(flagged.use_id, timeout_seconds=30.0))
+    assert done.status is ToolCallStatus.SUCCEEDED
+    ((tool, sent, deadline),) = r.upstream.calls
+    assert tool == "cancel_option_order" and deadline == 30.0
+    assert sent["account_number"] != CANCEL_ARGS["account_number"]  # the configured number
+
+
+def test_execute_reports_an_upstream_failure_as_unknown_for_tier_x() -> None:
+    from test_hooks import CANCEL_ARGS
+
+    r = _executor_rig()
+    r.upstream.behavior = UpstreamTimeout("timed out")
+    admitted = _admit(r, "cancel_option_order", CANCEL_ARGS)
+    done = anyio.run(r.proxy.execute, admitted.use_id)
+    assert done.status is ToolCallStatus.UNKNOWN and done.payload["kind"] == "error"
+    assert outcomes(r)[0]["status"] is ToolCallStatus.UNKNOWN

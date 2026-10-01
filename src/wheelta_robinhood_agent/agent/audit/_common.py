@@ -121,6 +121,7 @@ class Findings:
         self._check = check
         self._hash = ctx.context_hash
         self._items: list[AuditFinding] = []
+        self._known = frozenset(c.identity.tool_call_id for c in ctx.tool_calls)
 
     def add(
         self,
@@ -142,6 +143,13 @@ class Findings:
             tool_call_ids = (*tool_call_ids, *attempt.tool_call_ids)
         index = attempt.index if attempt is not None and leg_ref is not None else None
         ids = tuple(dict.fromkeys(tool_call_ids))
+        # A finding cites only this run's calls: another run's call (e.g. an earlier run's
+        # cancel of an order this run observed) cannot be stored and would fail the audit.
+        known = self._known
+        foreign = tuple(i for i in ids if i not in known)
+        if foreign:
+            ids = tuple(i for i in ids if i in known)
+            detail = f"{detail} (another run's tool calls not cited: {len(foreign)})"
         seq = len(self._items)
         self._items.append(
             AuditFinding(

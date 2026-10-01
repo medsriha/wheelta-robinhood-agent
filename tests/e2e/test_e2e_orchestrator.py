@@ -96,7 +96,14 @@ from wheelta_robinhood_agent.orchestrator.market_session import (
 
 RULES = load_rules()
 TEMPLATES = load_agent_prompts()
-ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
+# ADR-0066: with an order venue the agent sees cancel and the order-work tools; review and
+# place are the executor's alone.
+ORDER_TOOLS = {
+    "mcp__robinhood__cancel_option_order",
+    "mcp__wra_orders__work_option_order",
+    "mcp__wra_orders__await_order_work",
+}
+EXECUTOR_ONLY = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS} - ORDER_TOOLS
 VERIFIED_RH = ROBINHOOD_REGISTRY.model_copy(update={"verified": True})
 TAVILY_SEARCH, TAVILY_EXTRACT = "mcp__tavily__tavily_search", "mcp__tavily__tavily_extract"
 Script = Callable[[FakeModel], Any]
@@ -550,6 +557,7 @@ def test_production_defaults_proxy_both_verified_sources(
         "wheelta": "sdk",
         "tavily": "sdk",
         "wra_local": "sdk",
+        "wra_orders": "sdk",  # ADR-0066: a proxied dry run has the simulated order venue
     }
     statuses = {e["server"]: e["status"] for e in h.events(RunEventType.SOURCE_STATUS)}
     assert statuses["robinhood"] == "connected"
@@ -1121,9 +1129,17 @@ def test_dry_run_order_tools_go_to_the_simulated_broker(
         (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
     by_tool = {r.identity.tool: r.status for r in calls if r.identity.tool.endswith("_order")}
     assert by_tool == {
+        "work_option_order": ToolCallStatus.SUCCEEDED,
         "review_option_order": ToolCallStatus.SUCCEEDED,
         "place_option_order": ToolCallStatus.SUCCEEDED,
     }
+    # ADR-0066: review and place are the executor's, attributed to the job's call.
+    (work,) = [r for r in calls if r.identity.tool == "work_option_order"]
+    executor = [
+        r for r in calls if r.identity.tool in ("review_option_order", "place_option_order")
+    ]
+    assert {r.identity.parent_tool_call_id for r in executor} == {work.identity.tool_call_id}
+    assert not EXECUTOR_ONLY & cli.visible_tools()
     (record,) = [r for r in orders if r.intent is not None]
     assert record.intent.account_scope_id == simulated_scope_id(h.close_id)
     assert record.status is AttemptStatus.FILLED  # ADR-0046: a simulated order fills at once
@@ -1160,23 +1176,26 @@ def test_pretrade_validation_denies_a_failing_order_with_feedback_and_the_agent_
     assert "passed: dte 23, cushion 0.0406" in failing
     with h.conn() as c:
         calls = tool_call_records(c, h.run_id)
-    places = [r for r in calls if r.identity.tool == "place_option_order"]
-    assert [r.status for r in places] == [
+    works = [r for r in calls if r.identity.tool == "work_option_order"]
+    assert [r.status for r in works] == [
         ToolCallStatus.DENIED,
         ToolCallStatus.DENIED,
         ToolCallStatus.SUCCEEDED,
     ]
+    places = [r for r in calls if r.identity.tool == "place_option_order"]
+    assert [r.status for r in places] == [ToolCallStatus.SUCCEEDED]  # by the executor
     upstream = [tool for _, tool, _ in h.world.upstream_calls]
     assert not {t for t in upstream if t.endswith("_option_order")}, upstream
 
 
-def _order_refs(review: ToolTurn, placed: ToolTurn) -> list[str]:
-    return [review.output["order_call_ref"], placed.output["order_call_ref"]]
+def _order_refs(started: ToolTurn) -> list[str]:
+    """ADR-0066: the job's `work_ref`, which stands for every call its walk made."""
+    return [started.data["order_work"]["work_ref"]]
 
 
-def _bare_ids(review: ToolTurn, placed: ToolTurn) -> list[str]:
+def _bare_ids(started: ToolTurn) -> list[str]:
     """What the agent cited in the dry run of 2026-09-30: bare tool call IDs."""
-    return [review.output["tool_call_id"], placed.output["tool_call_id"]]
+    return [started.output["tool_call_id"]]
 
 
 def _linked_record(h: Harness) -> Any:
@@ -1219,17 +1238,17 @@ def test_unresolved_order_refs_get_a_reference_turn_and_are_corrected(
     cited: dict[str, list[str]] = {}
     turns: list[ToolTurn] = []
 
-    def remember(review: ToolTurn, placed: ToolTurn) -> list[str]:
-        cited["refs"] = _order_refs(review, placed)
-        return _bare_ids(review, placed)
+    def remember(started: ToolTurn) -> list[str]:
+        cited["refs"] = _order_refs(started)
+        return _bare_ids(started)
 
     async def followup(model: FakeModel) -> str:
         message = model.message or ""
         assert f"reference check 1 of {MAX_REFERENCE_REPAIRS}" in message
         assert "[unknown_reference]" in message
-        assert f"place call {cited['refs'][1]}" in message and "it matches decisions[0]" in message
+        assert f"order work {cited['refs'][0]} is associated with no decision" in message
         turns.append(await model.call("mcp__robinhood__get_portfolio", {}))
-        return first[0].replace(bare[0], cited["refs"][0]).replace(bare[1], cited["refs"][1])
+        return first[0].replace(bare[0], cited["refs"][0])
 
     first: list[str] = []
     bare: list[str] = []
@@ -1314,8 +1333,9 @@ def _assert_simulated_trace(h: Harness) -> None:
     (leg,) = decision.legs
     assert leg.facts is not None and leg.facts.initial_quantity == 2
     # The SPY place, which the output did not select, with its calls.
-    unlinked = {u.kind: [c.tool for c in u.calls] for u in trace.unassociated}
-    assert unlinked == {"place": ["review_option_order", "place_option_order"]}
+    # ADR-0066: the executor's calls share the fake clock's instant, so compare as a set.
+    unlinked = {u.kind: sorted(c.tool for c in u.calls) for u in trace.unassociated}
+    assert unlinked == {"place": ["place_option_order", "review_option_order"]}
     # The audit sees the simulated order (ADR-0038): the script placed a 740 put on 30,000 of
     # cash. It was quoted, so pre-trade validation (ADR-0048) let it through and its price has
     # provenance (no V2.1); pre-trade validation checks no cash. Its time in force matches the
@@ -1326,7 +1346,8 @@ def _assert_simulated_trace(h: Harness) -> None:
     assert place.broker_order_id is not None and place.status == "filled"
     assert not trace.run_findings.violations
     callers = {c.caller for c in trace.timeline}
-    assert callers == {"orchestrator", MARKET}
+    executor = {c for c in callers if c.startswith("executor (order_work:")}
+    assert len(executor) == 1 and callers - executor == {"orchestrator", MARKET}
     assert trace.mignon_spawns == 1
     assert trace.next_run is None  # the scripted output requests no next run
     text = render_trace_markdown(trace)
@@ -2423,17 +2444,11 @@ def test_the_earliest_next_run_of_the_two_agents_wins(
 # -- two agents in a simulated dry run (ADR-0057, ADR-0038) ---------------------------------------
 
 
-def _spy_leg_order(side: str, effect: str) -> dict[str, Any]:
-    from e2e_fakes import SPY_INSTRUMENT_ID
+def _spy_work(side: str) -> dict[str, Any]:
+    """ADR-0066: a `work_option_order` request for the SPY put on `side`."""
+    from e2e_fakes import spy_work
 
-    return {
-        "account_number": AGENTIC_ACCOUNT_PLACEHOLDER,
-        "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": side, "position_effect": effect}],
-        "quantity": "1",
-        "price": "11.90",
-        "type": "limit",
-        "time_in_force": "gfd",
-    }
+    return {**spy_work("11.90"), "side": side}
 
 
 def test_a_simulated_dry_run_tick_gates_each_agents_order_sides(
@@ -2451,13 +2466,13 @@ def test_a_simulated_dry_run_tick_gates_each_agents_order_sides(
     linked = linked_order_script(lambda: h.clock.advance(1), _order_refs)
 
     async def script(model: FakeModel) -> str | None:
-        place = "mcp__robinhood__place_option_order"
+        work = "mcp__wra_orders__work_option_order"
         if _is_close(model):
-            turn = await model.call(place, _spy_leg_order("sell", "open"))
+            turn = await model.call(work, _spy_work("sell_to_open"))
             assert turn.denied, turn
             denials["close"] = turn.reason or ""
             return _no_decisions()
-        turn = await model.call(place, _spy_leg_order("buy", "close"))
+        turn = await model.call(work, _spy_work("buy_to_close"))
         assert turn.denied, turn
         denials["sell"] = turn.reason or ""
         return await linked(model)
@@ -2474,11 +2489,9 @@ def test_a_simulated_dry_run_tick_gates_each_agents_order_sides(
     (decision,) = stored.record.decisions
     ((attempt,),) = [leg.attempts for leg in decision.legs]
     assert attempt.status is AttemptStatus.FILLED
-    # The denied buy-to-close was never sent: it stays visible, unassociated, not dispatched.
-    (denied,) = stored.record.unassociated_actions
-    assert denied.attempt is not None and denied.attempt.status is AttemptStatus.NOT_PLACED
-    assert [c.value for c in denied.attempt.reason_codes] == ["not_dispatched"]
-    assert stored.record.findings == ()  # the never-sent place is not an assembly finding
+    # ADR-0066: the denied buy-to-close work started no job, so no place call exists at all.
+    assert stored.record.unassociated_actions == ()
+    assert stored.record.findings == ()
     # The fixture's SPY put breaks the cash and concentration limits (V1.3, V7, as in the
     # single-agent simulated tests); nothing else is a violation, the denial included.
     violations = {

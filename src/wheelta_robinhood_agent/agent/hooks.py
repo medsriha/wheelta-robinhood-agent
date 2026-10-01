@@ -93,6 +93,16 @@ from wheelta_robinhood_agent.agent.mignons import (
     role_tools,
 )
 from wheelta_robinhood_agent.agent.model_view import model_view
+from wheelta_robinhood_agent.agent.order_walk import (
+    CANCEL_TOOL,
+    EXECUTOR_TOOLS,
+    ORDER_WORK_SERVER,
+    WORK_TOOL,
+    Admitted,
+    Refused,
+    WorkRequest,
+    parse_work_request,
+)
 from wheelta_robinhood_agent.agent.proxy_dispatch import (
     CallState,
     ProxyCall,
@@ -138,6 +148,9 @@ from wheelta_robinhood_agent.integrations.registry import ToolRegistry, ToolSpec
 from wheelta_robinhood_agent.integrations.robinhood.registry import (
     PLACE_ORDER_TOOL,
     ROBINHOOD_REGISTRY,
+)
+from wheelta_robinhood_agent.integrations.robinhood.registry import (
+    SERVER_NAME as ROBINHOOD,
 )
 from wheelta_robinhood_agent.integrations.websearch.inputs import (
     TavilyInputError,
@@ -342,8 +355,39 @@ class ResultValidator(Protocol):
 
 
 WebPrecheck = Callable[[str, dict[str, Any]], str | None]
-# ADR-0048: `place_option_order` input → denial reason naming the failed checks, or None.
-PretradeCheck = Callable[[Mapping[str, object]], str | None]
+
+
+class PretradeCheck(Protocol):
+    """ADR-0048: `place_option_order` input → denial reason naming the failed checks, or
+    None. ADR-0066: `job` is the order-walk job placing it; `self_in_flight` is False for a
+    `work_option_order` admission (agent/pretrade_gate.py)."""
+
+    def __call__(
+        self,
+        tool_input: Mapping[str, object],
+        *,
+        job: uuid.UUID | None = None,
+        self_in_flight: bool = True,
+    ) -> str | None: ...
+
+
+class OrderWorkView(Protocol):
+    """What the hooks read from the session's order-walk runner (agent/order_walk.py)."""
+
+    @property
+    def placement_ended(self) -> bool: ...
+
+    def holds(self, broker_order_id: str) -> bool: ...
+
+    def plan(self, request: WorkRequest) -> tuple[Any, ...] | str: ...
+
+    def placing(self) -> bool: ...
+
+    def reserve(self, job_id: uuid.UUID, request: WorkRequest) -> None: ...
+
+    def release(self, job_id: uuid.UUID) -> None: ...
+
+
 WebCapture = Callable[[uuid.UUID, str, dict[str, Any], JsonValue], None]
 
 
@@ -433,6 +477,13 @@ class HookDeps:
     # ADR-0048: pre-trade validation of place_option_order (agent/pretrade_gate.py). None
     # denies every placement.
     pretrade_gate: PretradeCheck | None = None
+    # ADR-0066: the session's order-walk runner. None: work_option_order is denied.
+    order_work: OrderWorkView | None = None
+    # ADR-0066: seconds left in the session budget (no new walk unless its window and the
+    # order wind-down still fit). None: work_option_order is denied.
+    session_remaining: Callable[[], float] | None = None
+    # ADR-0066: the order wind-down (agent/order_cleanup.py), passed in to avoid a cycle.
+    wind_down_seconds: float = 180.0
 
     @classmethod
     def from_settings(
@@ -502,6 +553,34 @@ class _Call:
 
 class _Denied(Exception):
     """A check failed: deny with this reason (not an infrastructure failure)."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutorCall:
+    """An order-walk executor call (ADR-0066): the job making it, and whether it is the
+    job's one cancel after the stop latch."""
+
+    job_id: uuid.UUID
+    after_stop_cancel: bool = False
+
+
+NO_ORDER_WORK: Final = "the order executor is not available in this run"
+PLACEMENT_ENDED_DENIAL: Final = (
+    "an order action of this run had an unknown outcome, so no new order work is started this "
+    "run (stop-on-error). Read get_option_orders to reconcile and report it."
+)
+LATE_START_DENIAL: Final = (
+    "too little session time is left for a full order window ({window}s) before the order "
+    "wind-down; do not start new trades this run"
+)
+PLACING_CANCEL_DENIAL: Final = (
+    "an order-work job is placing an order right now; read get_option_orders again in a few "
+    "seconds and cancel only an order no job holds"
+)
+JOB_HELD_CANCEL_DENIAL: Final = (
+    "this order belongs to a running order-work job, which cancels it itself; wait for the job "
+    "with await_order_work"
+)
 
 
 def _resolve(name: str, registries: tuple[ToolRegistry, ...]) -> _Resolved:
@@ -706,6 +785,11 @@ def _order_tool_denial(deps: HookDeps, server: str) -> str | None:
         return "order venue inconsistent with the execution mode"
     if not executes_orders(venue):
         return "order tools are not available in this run"
+    if server == ORDER_WORK_SERVER:
+        # ADR-0066: the executor works every order through the Robinhood proxy.
+        server = ROBINHOOD
+        if deps.proxy_dispatch is None or not deps.proxy_dispatch.proxied(ROBINHOOD):
+            return "the order executor needs the validating proxy"
     if venue is OrderVenue.SIMULATED and (
         deps.proxy_dispatch is None or not deps.proxy_dispatch.proxied(server)
     ):
@@ -713,10 +797,40 @@ def _order_tool_denial(deps: HookDeps, server: str) -> str | None:
     return None
 
 
+class InternalCallGate:
+    """The hooks' checks and recording for the order-walk executor (ADR-0066), built by
+    `build_hooks_with_gate`: `admit` records the request (attributed to the job), runs the same
+    `decide` as PreToolUse, records the dispatch, and registers the call with the proxy."""
+
+    def __init__(self, admit: Callable[..., Admitted | Refused]) -> None:
+        self._admit = admit
+
+    def admit(
+        self,
+        tool: str,
+        tool_input: dict[str, Any],
+        *,
+        job_id: uuid.UUID,
+        after_stop_cancel: bool = False,
+    ) -> Admitted | Refused:
+        result: Admitted | Refused = self._admit(
+            tool, tool_input, job_id=job_id, after_stop_cancel=after_stop_cancel
+        )
+        return result
+
+
 def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     """Build the PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, and SubagentStop
     hooks."""
+    return build_hooks_with_gate(deps)[0]
+
+
+def build_hooks_with_gate(
+    deps: HookDeps,
+) -> tuple[dict[HookEvent, list[HookMatcher]], InternalCallGate]:
+    """`build_hooks`, plus the executor's gate over the same checks and state (ADR-0066)."""
     calls: dict[str, _Call] = {}
+    executor_seq = 0
     # Mignon bookkeeping: spawns so far, Agent calls in flight, and per Mignon (`agent_id`)
     # the refs delivered to it and the URLs it fetched. `run_refs` is every ref delivered to
     # any role this session (the orchestrator may hand a known ref to a follow-up Mignon).
@@ -852,14 +966,47 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                 raise _Denied(web_reason)
         return effective
 
+    def check_work(tool_input: Mapping[str, object]) -> None:
+        """ADR-0066: a new order-walk job may start (module docstring of agent/order_walk.py)."""
+        view = deps.order_work
+        if view is None or deps.session_remaining is None:
+            raise _Denied(NO_ORDER_WORK)
+        if view.placement_ended:
+            raise _Denied(PLACEMENT_ENDED_DENIAL)
+        if deps.withheld is not None and deps.withheld.reason(ROBINHOOD) is not None:
+            raise _Denied(f"source {ROBINHOOD} is withheld this run: no order work can start")
+        request = parse_work_request(tool_input)
+        if isinstance(request, str):
+            raise _Denied(request)
+        window = deps.rules.orders.walk.window_seconds
+        if deps.session_remaining() < window + deps.wind_down_seconds:
+            raise _Denied(LATE_START_DENIAL.format(window=window))
+        # The role, concurrency, and pre-trade checks first: they say whether this trade may
+        # be made at all; the price plan only whether these prices can be walked.
+        if deps.pretrade_gate is None:
+            raise _Denied("pre-trade validation is not configured; orders cannot be placed")
+        reason = deps.pretrade_gate(
+            request.order_input(request.start_price, request.quantity), self_in_flight=False
+        )
+        if reason is not None:
+            raise _Denied(reason)
+        planned = view.plan(request)
+        if isinstance(planned, str):
+            raise _Denied(planned)
+
     def decide(
-        resolved: _Resolved, tool_input: dict[str, Any], data: Mapping[str, Any]
+        resolved: _Resolved,
+        tool_input: dict[str, Any],
+        data: Mapping[str, Any],
+        executor: _ExecutorCall | None = None,
     ) -> tuple[ToolTier, dict[str, Any], tuple[JsonValue, ...], dict[str, Any] | None]:
         """Raise `_Denied` or return (tier, effective input, appended filters, upstream input).
 
         The upstream input is the effective input with the account placeholder replaced by the
-        configured number (ADR-0030), or None when nothing was replaced."""
-        if deps.output_gate is not None:
+        configured number (ADR-0030), or None when nothing was replaced. An `executor` call
+        (ADR-0066) skips the output gate (a started window is never cut short) and the role
+        check (it may use only `EXECUTOR_TOOLS` on Robinhood); every other check applies."""
+        if executor is None and deps.output_gate is not None:
             gate_reason = deps.output_gate.denial(resolved.qualified)
             if gate_reason is not None:
                 raise _Denied(gate_reason)
@@ -881,11 +1028,15 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             order_reason = _order_tool_denial(deps, resolved.server)
             if order_reason is not None:
                 raise _Denied(order_reason)
-        role = caller_role(data)
-        if tier is ToolTier.D and role is not Role.ORCHESTRATOR:
-            raise _Denied("Mignons cannot spawn Mignons")
-        if resolved.qualified not in role_tools(role, deps.agent):
-            raise _Denied(f"{resolved.qualified} is not available to the {role.value}")
+        if executor is not None:
+            if resolved.server != ROBINHOOD or resolved.tool not in EXECUTOR_TOOLS:
+                raise _Denied(f"{resolved.qualified} is not an order-executor tool")
+        else:
+            role = caller_role(data)
+            if tier is ToolTier.D and role is not Role.ORCHESTRATOR:
+                raise _Denied("Mignons cannot spawn Mignons")
+            if resolved.qualified not in role_tools(role, deps.agent):
+                raise _Denied(f"{resolved.qualified} is not available to the {role.value}")
         if tier is ToolTier.D:
             check_spawn(tool_input)
         if tier is ToolTier.S and not deps.workspace_writes:
@@ -893,7 +1044,11 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         if tier in (ToolTier.S, ToolTier.X, ToolTier.D):
             if deps.kill_switch:
                 raise _Denied("kill switch engaged")
-            if deps.run_control.stop_requested:
+            # ADR-0066: the executor's one cancel of its working step after the latch.
+            latch_cancel = (
+                executor is not None and executor.after_stop_cancel and resolved.tool == CANCEL_TOOL
+            )
+            if deps.run_control.stop_requested and not latch_cancel:
                 raise _Denied("run stop requested")
         upstream: dict[str, Any] | None = None
         if not resolved.builtin:
@@ -904,12 +1059,35 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             upstream = resolve_account_argument(scope, tool_input, deps.account_number)
         if tier is ToolTier.S:
             check_workspace(resolved.tool, tool_input)
-        if tier is ToolTier.X and resolved.tool == PLACE_ORDER_TOOL:
+        if (
+            tier is ToolTier.X
+            and resolved.server == ROBINHOOD
+            and resolved.tool == PLACE_ORDER_TOOL
+        ):
+            if deps.order_work is not None and deps.order_work.placement_ended:
+                raise _Denied(PLACEMENT_ENDED_DENIAL)  # CLAUDE.md §14: every job stops placing
             if deps.pretrade_gate is None:
                 raise _Denied("pre-trade validation is not configured; orders cannot be placed")
-            pretrade_reason = deps.pretrade_gate(tool_input)
+            pretrade_reason = (
+                deps.pretrade_gate(tool_input)
+                if executor is None
+                else deps.pretrade_gate(tool_input, job=executor.job_id, self_in_flight=False)
+            )
             if pretrade_reason is not None:
                 raise _Denied(pretrade_reason)
+        if (
+            executor is None
+            and resolved.server == ROBINHOOD
+            and resolved.tool == CANCEL_TOOL
+            and deps.order_work is not None
+        ):
+            order_id = tool_input.get("order_id")
+            if isinstance(order_id, str) and deps.order_work.holds(order_id):
+                raise _Denied(JOB_HELD_CANCEL_DENIAL)
+            if deps.order_work.placing():
+                raise _Denied(PLACING_CANCEL_DENIAL)
+        if resolved.server == ORDER_WORK_SERVER and resolved.tool == WORK_TOOL:
+            check_work(tool_input)
         if resolved.server == TAVILY:
             return tier, check_web(resolved.tool, tool_input, data), (), None
         if resolved.server == WHEELTA and resolved.tool == BOARD_QUERY_TOOL:
@@ -1029,6 +1207,13 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
                         reason="proxy registration failed",
                     )
                 return deny_and_stop(f"proxy registration failed ({type(exc).__name__})", now)
+        if resolved.server == ORDER_WORK_SERVER and resolved.tool == WORK_TOOL:
+            # ADR-0051/0066: an admitted call counts as working at once, so a second call
+            # sent in parallel is checked against it.
+            request = parse_work_request(effective)
+            if deps.order_work is None or isinstance(request, str):
+                return deny_and_stop("an admitted order-work call could not be reserved", now)
+            deps.order_work.reserve(tool_call_id, request)
         calls[use_id] = _Call(
             tool_call_id=tool_call_id,
             server=resolved.server,
@@ -1594,6 +1779,8 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         if call.tier is ToolTier.D:
             active.discard(cast(str, use_id))
+        if call.server == ORDER_WORK_SERVER and call.tool == WORK_TOOL and deps.order_work:
+            deps.order_work.release(call.tool_call_id)  # a no-op once its job started
         if call.server == TAVILY and call.tool == EXTRACT_TOOL:
             # ADR-0056: a timed-out or failed extract is not retried this run.
             refused_urls.update(_url_key(u) for u in _extract_urls(call.effective_input))
@@ -1643,8 +1830,83 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
             )
         return SyncHookJSONOutput()
 
+    def admit(
+        tool: str,
+        tool_input: dict[str, Any],
+        *,
+        job_id: uuid.UUID,
+        after_stop_cancel: bool = False,
+    ) -> Admitted | Refused:
+        """One executor call through the same checks and recording (ADR-0066). A recording
+        or lookup failure sets the stop latch and refuses (fail closed)."""
+        nonlocal executor_seq
+        executor_seq += 1
+        now = deps.clock()
+        use_id = f"executor:{job_id}:{executor_seq}"
+        resolved = _resolve(f"mcp__{ROBINHOOD}__{tool}", deps.registries)
+        tool_call_id = deps.recorder.requested(
+            sdk_tool_use_id=use_id,
+            server=resolved.server,
+            tool=resolved.tool,
+            tier=resolved.tier,
+            arguments_redacted=deps.redactor.redact_mapping(tool_input),
+            requested_at=now,
+            parent_tool_call_id=job_id,
+        )
+        try:
+            if not proxied(resolved.server, False):
+                raise _Denied("the order executor needs the validating proxy")
+            tier, effective, _, upstream = decide(
+                resolved, dict(tool_input), {}, _ExecutorCall(job_id, after_stop_cancel)
+            )
+        except _Denied as denied:
+            deps.recorder.outcome(
+                tool_call_id, ToolCallStatus.DENIED, observed_at=now, reason=str(denied)
+            )
+            return Refused(str(denied))
+        except Exception as exc:
+            stop(now)
+            reason = f"hook check failed ({type(exc).__name__})"
+            with contextlib.suppress(Exception):
+                deps.recorder.outcome(
+                    tool_call_id, ToolCallStatus.DENIED, observed_at=now, reason=reason
+                )
+            return Refused(reason)
+        deps.recorder.dispatched(
+            tool_call_id,
+            effective_arguments_redacted=deps.redactor.redact_mapping(effective),
+            dispatched_at=now,
+        )
+        cast(ProxyDispatch, deps.proxy_dispatch).register(
+            use_id,
+            ProxyCall(
+                tool_call_id=tool_call_id,
+                server=resolved.server,
+                tool=resolved.tool,
+                tier=tier,
+                effective_input=effective,
+                upstream_input=upstream,
+                by_executor=True,
+                after_stop_cancel=after_stop_cancel and resolved.tool == CANCEL_TOOL,
+            ),
+        )
+        return Admitted(use_id=use_id, tool_call_id=tool_call_id)
+
+    def guarded_admit(
+        tool: str,
+        tool_input: dict[str, Any],
+        *,
+        job_id: uuid.UUID,
+        after_stop_cancel: bool = False,
+    ) -> Admitted | Refused:
+        try:
+            return admit(tool, tool_input, job_id=job_id, after_stop_cancel=after_stop_cancel)
+        except Exception as exc:
+            stop(deps.clock())
+            return Refused(f"recording failed ({type(exc).__name__})")
+
     timeout = deps.hook_timeout_seconds
-    return {
+    matchers: dict[HookEvent, list[HookMatcher]] = {
         "PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_use], timeout=timeout)],
         "PostToolUse": [HookMatcher(matcher=None, hooks=[post_tool_use], timeout=timeout)],
         "PostToolUseFailure": [
@@ -1653,3 +1915,4 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         "SubagentStart": [HookMatcher(matcher=None, hooks=[subagent_start], timeout=timeout)],
         "SubagentStop": [HookMatcher(matcher=None, hooks=[subagent_stop], timeout=timeout)],
     }
+    return matchers, InternalCallGate(guarded_admit)

@@ -33,6 +33,12 @@ class ProxyCall:
     # ADR-0030: what the proxy sends upstream when it differs from `effective_input` (the
     # account placeholder replaced by the configured number). Never shown to the CLI.
     upstream_input: dict[str, Any] | None = None
+    # ADR-0066: made by the order-walk executor, not the model. Its result is never delivered
+    # to the CLI, so the delivery size limit does not apply.
+    by_executor: bool = False
+    # ADR-0066: the executor's one cancel of its working step after the stop latch. The only
+    # Tier X call the proxy forwards once a stop is requested.
+    after_stop_cancel: bool = False
 
 
 class CallState(StrEnum):

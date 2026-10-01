@@ -8,12 +8,15 @@ the result into issues the agent can fix by changing only its references:
   not resolve, is of the wrong kind, or does not fit its decision);
 - each dispatched place and each cancel that no decision or cancellation rationale claims,
   when its `order_call:` ref was delivered to the model (`citable`). A place denied before
-  dispatch reached no venue and has no ref, so it is not listed.
+  dispatch reached no venue and has no ref, so it is not listed. ADR-0066: a place or cancel
+  an order-work job made (`work_of`: call ID -> its job's `order_work:` ref, when delivered)
+  asks for that job's ref instead, since its own call was never delivered.
 
 Nothing here decides a trade, repairs a choice, or attaches an action: the agent restates
 its output, and the post-run assembly applies the same rules to whatever it returns.
 """
 
+from collections.abc import Mapping
 from typing import Final
 from uuid import UUID
 
@@ -58,9 +61,15 @@ def _where(finding: AssemblyFinding, positions: dict[str, int]) -> str:
     return "output"
 
 
-def reference_issues(record: RunRecord, citable: frozenset[str]) -> tuple[str, ...]:
+def reference_issues(
+    record: RunRecord,
+    citable: frozenset[str],
+    work_of: Mapping[UUID, str] | None = None,
+) -> tuple[str, ...]:
     """Issues to return to the agent, in a stable order (module docstring). Empty when every
     selected reference resolves and every order action it can cite is claimed."""
+    work_of = work_of or {}
+    jobs: list[str] = []
     positions = {d.decision_ref: i for i, d in enumerate(record.decisions)}
     issues = [
         f"{_where(f, positions)}: {f.detail} [{f.code}]"
@@ -78,6 +87,9 @@ def reference_issues(record: RunRecord, citable: frozenset[str]) -> tuple[str, .
             call_id = action.attempt.place_tool_call_id
             if call_id is None or ReasonCode.NOT_DISPATCHED in action.attempt.reason_codes:
                 continue
+            if call_id in work_of:
+                jobs.append(work_of[call_id])
+                continue
             ref = order_call_ref_for(call_id)
             if ref not in citable:
                 continue
@@ -94,6 +106,9 @@ def reference_issues(record: RunRecord, citable: frozenset[str]) -> tuple[str, .
                 f"of the decision it executed; {hint}"
             )
         elif action.kind is UnassociatedActionKind.CANCEL and action.cancellation is not None:
+            if action.cancellation.cancel_tool_call_id in work_of:
+                jobs.append(work_of[action.cancellation.cancel_tool_call_id])
+                continue
             ref = order_call_ref_for(action.cancellation.cancel_tool_call_id)
             if ref not in citable:
                 continue
@@ -101,6 +116,11 @@ def reference_issues(record: RunRecord, citable: frozenset[str]) -> tuple[str, .
                 f"cancel call {ref} is associated with no decision: add it to the "
                 "execution_refs of its decision, or explain it in cancellation_rationales"
             )
+    issues.extend(
+        f"order work {ref} is associated with no decision: add {ref} to the execution_refs of "
+        "the decision it executed"
+        for ref in dict.fromkeys(jobs)
+    )
     return tuple(issues)
 
 

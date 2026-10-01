@@ -19,7 +19,7 @@ Everything here is the deterministic part of that walk:
 
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
-from typing import Self
+from typing import Final, Self
 
 from pydantic import Field, model_validator
 
@@ -39,6 +39,11 @@ class WalkStatus(StrEnum):
 
 
 TERMINAL_WALK_STATUSES = frozenset(set(WalkStatus) - {WalkStatus.WORKING})
+
+# Time a step needs beyond its wait (quotes, review, place, cancel, confirm reads): an
+# operational allowance, not a trading value. `orders.walk` must fit max_steps x
+# (step_wait_seconds + this) within window_seconds.
+STEP_OVERHEAD_SECONDS: Final = 10
 
 
 class TickSchedule(DomainModel):
@@ -150,6 +155,7 @@ def can_start(
 
 
 __all__ = [
+    "STEP_OVERHEAD_SECONDS",
     "TERMINAL_WALK_STATUSES",
     "TickSchedule",
     "WalkStatus",

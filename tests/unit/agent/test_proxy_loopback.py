@@ -119,7 +119,7 @@ def test_a_role_with_no_tool_of_a_source_gets_no_server() -> None:
 
 def test_order_tools_never_reach_a_mignon_listing_even_in_live() -> None:
     allowed = _allowed(ExecutionMode.LIVE, venue=OrderVenue.BROKER)
-    assert "mcp__robinhood__place_option_order" in allowed
+    assert "mcp__robinhood__cancel_option_order" in allowed
     app = LoopbackProxyApp(TOKEN)
     app.mount(build_role_proxy_servers(_proxies(), allowed, MIGNON_ROLES))
     for listed in _listings(app, MIGNON_ROLES).values():

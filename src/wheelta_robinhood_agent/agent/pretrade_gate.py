@@ -27,6 +27,7 @@ roll's replacement, on the underlying and right of a buy-to-close this run fille
 more contracts than those fills less the replacements this run already placed (`run_orders`).
 """
 
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -72,12 +73,25 @@ def _price(value: object) -> Decimal | None:
 
 
 @dataclass(frozen=True)
+class WalkInProgress:
+    """An unfinished order-walk job (ADR-0066): working even between its steps, when no
+    order of it is at the broker. Its debit counts at its `worst_price` (ADR-0066 item 5)."""
+
+    job_id: uuid.UUID
+    option_id: str
+    closing: bool
+    remaining_quantity: int
+    worst_price: Decimal
+
+
+@dataclass(frozen=True)
 class PlacementState:
-    """This run's unresolved owned orders and its place calls that have no outcome yet
-    (the one being checked included)."""
+    """This run's unresolved owned orders, its place calls that have no outcome yet (the one
+    being checked included), and its unfinished order-walk jobs."""
 
     unresolved: tuple[OrderRecord, ...]
     placements_in_flight: int
+    active_jobs: tuple[WalkInProgress, ...] = ()
 
 
 def _working(record: OrderRecord) -> WorkingPlacement:
@@ -115,8 +129,18 @@ class PretradeGate:
     role: AgentRole = AgentRole.WHEEL
     run_orders: Callable[[], tuple[OrderRecord, ...]] = lambda: ()
 
-    def __call__(self, tool_input: Mapping[str, object]) -> str | None:
-        """A denial reason with the failed checks and values, or None when all legs pass."""
+    def __call__(
+        self,
+        tool_input: Mapping[str, object],
+        *,
+        job: uuid.UUID | None = None,
+        self_in_flight: bool = True,
+    ) -> str | None:
+        """A denial reason with the failed checks and values, or None when all legs pass.
+
+        ADR-0066: `job` is the order-walk job placing this order (it is not its own working
+        order); `self_in_flight` is False for a `work_option_order` admission, which is not
+        itself a place call in flight."""
         legs = tool_input.get("legs")
         if not isinstance(legs, list) or not legs:
             return (
@@ -146,8 +170,15 @@ class PretradeGate:
                 return denial
         as_of = self.clock()
         state = self.placements() if self.placements is not None else None
+        own = 1 if self_in_flight else 0
+        if state is not None:
+            state = PlacementState(
+                unresolved=state.unresolved,
+                placements_in_flight=max(state.placements_in_flight - own, 0),
+                active_jobs=tuple(j for j in state.active_jobs if j.job_id != job),
+            )
         concurrent = state is not None and (
-            bool(state.unresolved) or state.placements_in_flight > 1
+            bool(state.unresolved) or bool(state.active_jobs) or state.placements_in_flight > 0
         )
         if not opening and not concurrent:
             return None  # a lone buy-to-close: nothing to check (ADR-0048, ADR-0051)
@@ -218,7 +249,19 @@ class PretradeGate:
         evidence: RunEvidence,
         as_of: datetime,
     ) -> str | None:
-        working = tuple(_working(r) for r in state.unresolved)
+        working = (
+            *(_working(r) for r in state.unresolved),
+            *(
+                WorkingPlacement(
+                    label=f"order_work:{j.job_id}",
+                    option_id=j.option_id,
+                    closing=j.closing,
+                    remaining_quantity=j.remaining_quantity,
+                    limit_price=j.worst_price,
+                )
+                for j in state.active_jobs
+            ),
+        )
         ids = {leg.option_id for leg in legs} | {w.option_id for w in working if w.option_id}
         multipliers: dict[str, int | None] = {}
         for iid in ids:
@@ -231,7 +274,7 @@ class PretradeGate:
                 limit_price=_price(tool_input.get("price")),
             ),
             working,
-            other_placements_in_flight=max(state.placements_in_flight - 1, 0),
+            other_placements_in_flight=state.placements_in_flight,
             multipliers=multipliers,
             account=evidence.account(),
             account_max_age=self.rules.account_state_max_age_seconds,

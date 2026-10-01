@@ -268,3 +268,23 @@ def test_v7_unknown_fill_on_already_counted_leg_and_popped_orders() -> None:
     run = [x for x in check_v7(ctx) if x.rule_key == "limits.max_new_positions_per_run"]
     assert run == [] or run[0].outcome is P
     assert Decimal("1")
+
+
+def test_a_finding_never_cites_another_runs_tool_call() -> None:
+    """Production 2026-10-01: a finding that cited an earlier run's call could not be stored,
+    which failed the whole audit. Findings cite only this run's calls and say what was left out."""
+    import uuid
+
+    from wheelta_robinhood_agent.agent.audit._common import Findings
+    from wheelta_robinhood_agent.domain.enums import AuditCheck
+
+    s = Scenario()
+    live_csp(s)
+    ctx = s.ctx()
+    own = ctx.tool_calls[0].identity.tool_call_id
+    foreign = uuid.uuid4()
+    out = Findings(ctx, AuditCheck.V2)
+    out.bad("1", "quote source is not a quote read", tool_call_ids=(own, foreign))
+    (finding,) = out.result()
+    assert finding.tool_call_ids == (own,)
+    assert "another run's tool calls not cited: 1" in finding.detail

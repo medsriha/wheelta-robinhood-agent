@@ -88,6 +88,7 @@ from wheelta_robinhood_agent.domain.facts import (
 )
 from wheelta_robinhood_agent.domain.facts_rules import FactsRuleMarker, FactsRules
 from wheelta_robinhood_agent.domain.options import OccSymbol
+from wheelta_robinhood_agent.domain.order_walk import TickSchedule
 from wheelta_robinhood_agent.domain.positions import PositionBookEntry
 from wheelta_robinhood_agent.domain.run_record import Quote
 from wheelta_robinhood_agent.domain.sanity import is_fresh, require_aware
@@ -175,13 +176,16 @@ class _Observation(DomainModel):
 
 class OptionInstrument(_Observation):
     """Validated instrument identity. `multiplier` is None until verified (VALIDATION.md).
-    `tick_increment` is the price tick when it is the same at every price, else None."""
+    `tick_increment` is the price tick when it is the same at every price, else None.
+    `tick_schedule` is the broker's full `min_ticks` (ADR-0066: the order walk rounds on it);
+    None on evidence recorded before it was carried."""
 
     occ_symbol: OccSymbol
     broker_instrument_id: NonEmptyStr
     underlying: NonEmptyStr
     multiplier: PosCount | None
     tick_increment: PosDec | None = None
+    tick_schedule: TickSchedule | None = None
 
 
 class UnderlyingQuote(_Observation):

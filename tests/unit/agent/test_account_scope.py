@@ -161,3 +161,17 @@ def test_placeholder_is_not_account_shaped_so_it_stays_readable_in_the_ledger() 
         {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
     )
     assert redacted == {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+
+
+def test_the_order_work_server_name_is_pinned_and_unscoped() -> None:
+    """ADR-0066: spelled out in account_scope.py (order_walk imports it); never scoped."""
+    from wheelta_robinhood_agent.agent.account_scope import (
+        ORDER_WORK_SERVER_NAME,
+        AccountScope,
+        account_scope_for,
+    )
+    from wheelta_robinhood_agent.agent.order_walk import AWAIT_TOOL, ORDER_WORK_SERVER, WORK_TOOL
+
+    assert ORDER_WORK_SERVER_NAME == ORDER_WORK_SERVER
+    for tool in (WORK_TOOL, AWAIT_TOOL):
+        assert account_scope_for(ORDER_WORK_SERVER, tool).scope is AccountScope.NOT_ACCOUNT_SCOPED

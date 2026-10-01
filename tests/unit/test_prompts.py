@@ -55,8 +55,8 @@ def test_active_prompts_per_role_with_expected_placeholders() -> None:
     templates = load_agent_prompts()
     assert set(templates) == {AgentRole.CLOSE, AgentRole.SELL}
     assert ACTIVE_PROMPTS == {
-        AgentRole.CLOSE: ("wheel_close", 2),
-        AgentRole.SELL: ("wheel_sell", 2),
+        AgentRole.CLOSE: ("wheel_close", 3),
+        AgentRole.SELL: ("wheel_sell", 3),
     }
     for role, template in templates.items():
         assert (template.prompt_id, template.version) == ACTIVE_PROMPTS[role]
@@ -194,14 +194,16 @@ def test_v12_explains_pretrade_denials() -> None:
         assert "the role check, or the concurrency check was never sent" in flat
         assert "it is not an order error and does not end placement" in flat
         assert "unchanged after a denial." in " ".join(text.split())
-        assert "Never repeat the same order unchanged after a denial." in " ".join(text.split())
+        assert "Never repeat the same request unchanged after a denial." in flat
 
 
 def test_v13_finishes_with_no_order_working() -> None:
     """ADR-0050: cleanup turns and wind-down replace "stays open as a day order"."""
     for template in _both():
         text = template.text
-        assert "Finish with no order of yours working (`orders.working`)" in text
+        flat = " ".join(text.split())
+        assert "Finish only when none of your order-work jobs is still working" in flat
+        assert "Every job cancels its own unfilled order and never leaves one working." in flat
         assert "(wind-down)" in text
         assert "open day orders" not in text
 
@@ -262,8 +264,9 @@ def test_v14_cites_order_call_refs() -> None:
     for template in _both():
         text = template.text
         assert "Retain the supplied call reference" not in text
-        assert "carries an\n   `order_call_ref` (`order_call:...`), whatever its outcome" in text
-        assert "never the bare tool_call_id" in text
+        flat = " ".join(text.split())
+        assert "`work_ref` of each order-work job you started for it, exactly as code" in flat
+        assert "`order_call_ref` of any cancel you sent yourself" in flat
         assert "Once your output is valid, code checks every reference in it." in text
 
 
@@ -306,3 +309,13 @@ def test_market_mignon_carries_scanner_and_board_know_how() -> None:
         "`contract.greeks.delta`",
     ):
         assert fragment in body
+
+
+def test_v3_code_works_every_order() -> None:
+    """ADR-0066: the agent starts and awaits order work; it never reviews or places itself."""
+    for template in _both():
+        text = template.text
+        flat = " ".join(text.split())
+        assert "Call `work_option_order` with option_id, side, quantity, start_price" in flat
+        assert "Wait with `await_order_work` until the job's status is no longer" in flat
+        assert "review_option_order" not in text and "place_option_order" not in text

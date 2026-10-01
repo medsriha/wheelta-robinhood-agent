@@ -65,12 +65,14 @@ def record_tool_call_requested(
     requested_at: datetime,
     agent_id: str | None = None,
     agent_type: str | None = None,
+    parent_tool_call_id: uuid.UUID | None = None,
 ) -> ToolCallRef:
     """Persist the identity and `requested` event before dispatch. Idempotent per SDK ID.
 
     `tier` is None for a tool missing from the registry. Arguments must already be redacted.
     `agent_id`/`agent_type` attribute a Mignon's call (ADR-0025); both None for the
-    orchestrator.
+    orchestrator. `parent_tool_call_id` is the `work_option_order` call whose order-walk job
+    makes this call (ADR-0066); None for a model call.
     Raises IdentityConflict if the SDK ID exists for a different server/tool.
     """
     if requested_at.tzinfo is None:
@@ -90,8 +92,8 @@ def record_tool_call_requested(
         tool_call_id = new_id()
         conn.execute(
             "INSERT INTO tool_calls (tool_call_id, run_id, sdk_tool_use_id, stage, server, tool, "
-            "tier, requested_at, arguments_redacted, agent_id, agent_type) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "tier, requested_at, arguments_redacted, agent_id, agent_type, parent_tool_call_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 tool_call_id,
                 run_id,
@@ -104,6 +106,7 @@ def record_tool_call_requested(
                 Jsonb(dict(arguments_redacted)),
                 agent_id,
                 agent_type,
+                parent_tool_call_id,
             ),
         )
         append_event(
@@ -258,7 +261,8 @@ def tool_call_records(
     with conn.cursor(row_factory=dict_row) as cur:
         identities = cur.execute(
             "SELECT tool_call_id, sdk_tool_use_id, run_id, stage, server, tool, tier, "
-            "requested_at, arguments_redacted, agent_id, agent_type FROM tool_calls "
+            "requested_at, arguments_redacted, agent_id, agent_type, parent_tool_call_id "
+            "FROM tool_calls "
             "WHERE run_id = %s "
             "ORDER BY requested_at, tool_call_id",
             (run_id,),
@@ -333,6 +337,7 @@ def _record(identity: dict[str, Any], events: list[dict[str, Any]]) -> ToolCallR
                 arguments_redacted=identity["arguments_redacted"],
                 agent_id=identity["agent_id"],
                 agent_type=identity["agent_type"],
+                parent_tool_call_id=identity["parent_tool_call_id"],
             ),
             **fields,
         )

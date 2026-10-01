@@ -36,6 +36,7 @@ from wheelta_robinhood_agent.agent.account_scope import NOT_SCOPED
 from wheelta_robinhood_agent.agent.hooks import EnvelopeKind, last_assistant_text
 from wheelta_robinhood_agent.agent.local_server import LOCAL_REGISTRY
 from wheelta_robinhood_agent.agent.mignons import MignonLimits
+from wheelta_robinhood_agent.agent.order_walk import ORDER_WORK_REGISTRY
 from wheelta_robinhood_agent.agent.result_boundary import BoundaryValidator
 from wheelta_robinhood_agent.domain.enums import AgentRole, ExecutionMode, ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
@@ -178,10 +179,21 @@ def test_sell_and_legacy_orchestrators_keep_scan_tools(agent: AgentRole) -> None
 
 
 def test_close_agent_keeps_order_tools_and_mignons_keep_their_tools() -> None:
-    """ADR-0059: a roll places and cancels; Mignon sets do not depend on the agent."""
+    """ADR-0059: a roll works orders and cancels; Mignon sets do not depend on the agent.
+    ADR-0066: the orchestrator starts order-work jobs; review and place are the executor's."""
+    s = session(
+        agent=AgentRole.CLOSE,
+        effective_mode=ExecutionMode.LIVE,
+        registries=(ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, ORDER_WORK_REGISTRY),
+    )
+    for tool, args in (
+        ("mcp__wra_orders__work_option_order", {}),
+        (RH + "cancel_option_order", {"account_number": ACCOUNT, "order_id": "o-1"}),
+    ):
+        reason = denied_reason(s.pre(tool, args))
+        assert reason is None or "not available to" not in reason, reason
     s = session(agent=AgentRole.CLOSE, effective_mode=ExecutionMode.LIVE)
-    reason = denied_reason(s.pre(PLACE, {"account_number": ACCOUNT}))
-    assert reason is None or "not available" not in reason, reason
+    assert_denied(s, s.pre(PLACE, {"account_number": ACCOUNT}), "not available to the orchestrator")
     reason = denied_reason(s.pre(BOARD, {}, **MARKET))
     assert reason is None or "not available" not in reason, reason
 

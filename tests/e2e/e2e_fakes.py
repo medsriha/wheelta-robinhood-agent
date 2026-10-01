@@ -521,28 +521,35 @@ def simulated_second_order_script(advance: Callable[[], None]) -> Callable[[Fake
     return script
 
 
-def _spy_order(price: str) -> dict[str, Any]:
-    """One-contract limit sell-to-open of the captured SPY 740 put, day order."""
+WORK_TOOL = "mcp__wra_orders__work_option_order"
+AWAIT_TOOL = "mcp__wra_orders__await_order_work"
+
+
+def spy_work(start: str, worst: str | None = None, quantity: int = 1) -> dict[str, Any]:
+    """`work_option_order` input for a sell-to-open of the captured SPY 740 put (ADR-0066)."""
     return {
-        "account_number": AGENTIC_ACCOUNT_PLACEHOLDER,
-        "legs": [{"option_id": SPY_INSTRUMENT_ID, "side": "sell", "position_effect": "open"}],
-        "quantity": "1",
-        "price": price,
-        "type": "limit",
-        "time_in_force": "gfd",
+        "option_id": SPY_INSTRUMENT_ID,
+        "side": "sell_to_open",
+        "quantity": quantity,
+        "start_price": start,
+        "worst_price": worst or start,
     }
 
 
+async def work_order(model: FakeModel, work: dict[str, Any]) -> tuple[ToolTurn, dict[str, Any]]:
+    """Start one order-work job and await it; (the start turn, the job's final view)."""
+    started = await model.call(WORK_TOOL, work)
+    assert not started.denied and started.output["kind"] == "validated", started.output
+    ref = started.data["order_work"]["work_ref"]
+    done = await model.call(AWAIT_TOOL, {"work_ref": ref, "wait_seconds": 45})
+    assert done.output["kind"] == "validated", done.output
+    return started, done.data["order_work"]
+
+
 async def _step(model: FakeModel, advance: Callable[[], None], price: str) -> None:
-    account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
-    order = _spy_order(price)
     advance()
-    await model.call("mcp__robinhood__review_option_order", order)
-    advance()
-    placed = await model.call("mcp__robinhood__place_option_order", order)
-    assert placed.data["evidence"]["broker_orders"][0]["state_raw"] == "filled"
-    advance()
-    await model.call("mcp__robinhood__get_option_orders", account)
+    _, job = await work_order(model, spy_work(price))
+    assert job["status"] == "filled", job
 
 
 def simulated_order_script(advance: Callable[[], None]) -> Callable[[FakeModel], Any]:
@@ -562,13 +569,9 @@ async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> st
     await model.call("mcp__robinhood__get_option_instruments", {"ids": SPY_INSTRUMENT_ID})
     await model.call("mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]})
     await model.call("mcp__robinhood__get_equity_quotes", {"symbols": ["SPY"]})
-    order = _spy_order("11.90")
     advance()
-    review = await model.call("mcp__robinhood__review_option_order", order)
-    assert not review.denied and review.output["kind"] == "validated", review.output
-    advance()
-    placed = await model.call("mcp__robinhood__place_option_order", order)
-    assert not placed.denied and placed.output["kind"] == "validated", placed.output
+    _, job = await work_order(model, spy_work("11.90"))
+    assert job["status"] == "filled" and job["filled_quantity"] == 1, job
     advance()
     read = await model.call("mcp__robinhood__get_option_orders", account)
     assert read.output["kind"] == "validated", read.output
@@ -579,11 +582,11 @@ async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> st
 
 
 def linked_order_script(
-    advance: Callable[[], None], cite: Callable[[ToolTurn, ToolTurn], list[str]]
+    advance: Callable[[], None], cite: Callable[[ToolTurn], list[str]]
 ) -> Callable[[FakeModel], Any]:
-    """ADR-0052: research, then review, place, and read back the SPY put, and return an
-    OPEN_CSP decision on the SPY candidate whose execution_refs are `cite(review, placed)`.
-    The candidate comes from this run's `get_option_instruments` result."""
+    """ADR-0052/0066: research, then work the SPY put and read it back, and return an
+    OPEN_CSP decision on the SPY candidate whose execution_refs are `cite(started)` (the
+    `work_option_order` turn). The candidate comes from this run's instruments result."""
 
     async def script(model: FakeModel) -> str | None:
         await research(model)
@@ -596,17 +599,12 @@ def linked_order_script(
             "mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]}
         )
         await model.call("mcp__robinhood__get_equity_quotes", {"symbols": ["SPY"]})
-        order = _spy_order("11.90")
         advance()
-        review = await model.call("mcp__robinhood__review_option_order", order)
-        advance()
-        placed = await model.call("mcp__robinhood__place_option_order", order)
-        assert not placed.denied and placed.output["kind"] == "validated", placed.output
+        started, job = await work_order(model, spy_work("11.90"))
+        assert job["status"] != "working", job  # filled, or cancelled by a cancelling broker
         advance()
         await model.call("mcp__robinhood__get_option_orders", account)
-        return linked_decision_json(
-            candidate, instruments.data["evidence_ref"], cite(review, placed)
-        )
+        return linked_decision_json(candidate, instruments.data["evidence_ref"], cite(started))
 
     return script
 
@@ -639,17 +637,16 @@ def linked_decision_json(candidate_ref: str, evidence_ref: str, execution_refs: 
 def pretrade_denial_script(
     advance: Callable[[], None], feedback: list[str], spy_put: dict[str, str]
 ) -> Callable[[FakeModel], Any]:
-    """ADR-0048: place the SPY put without quoting it (denied: nothing to validate), then with
-    the captured live quote (denied: delta and yield below the rules), appending each denial
-    reason to `feedback`; then quote it passing and place it (filled on the simulated broker).
-    `spy_put` is the world's mutable SPY quote (`simulated_world`)."""
+    """ADR-0048/0066: work the SPY put without quoting it (denied: nothing to validate), then
+    with the captured live quote (denied: delta and yield below the rules), appending each
+    denial reason to `feedback`; then quote it passing and work it (filled on the simulated
+    broker). `spy_put` is the world's mutable SPY quote (`simulated_world`)."""
 
     async def script(model: FakeModel) -> str | None:
         candidate_ref, facts_ref = await research(model)
         await model.call("mcp__robinhood__get_option_instruments", {"ids": SPY_INSTRUMENT_ID})
-        order = _spy_order("1.79")
         advance()
-        unquoted = await model.call("mcp__robinhood__place_option_order", order)
+        unquoted = await model.call(WORK_TOOL, spy_work("1.79"))
         assert unquoted.denied, unquoted
         feedback.append(str(unquoted.reason))
         spy_put.update(bid="1.79", ask="1.80", delta="-0.122280")  # the captured quote
@@ -658,7 +655,7 @@ def pretrade_denial_script(
         )
         await model.call("mcp__robinhood__get_equity_quotes", {"symbols": ["SPY"]})
         advance()
-        failing = await model.call("mcp__robinhood__place_option_order", order)
+        failing = await model.call(WORK_TOOL, spy_work("1.79"))
         assert failing.denied, failing
         feedback.append(str(failing.reason))
         spy_put.update(passing_spy_put())
@@ -666,8 +663,8 @@ def pretrade_denial_script(
             "mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]}
         )
         advance()
-        placed = await model.call("mcp__robinhood__place_option_order", {**order, "price": "11.90"})
-        assert not placed.denied and placed.output["kind"] == "validated", placed.output
+        _, job = await work_order(model, spy_work("11.90"))
+        assert job["status"] == "filled", job
         return decision_json(candidate_ref, facts_ref)
 
     return script

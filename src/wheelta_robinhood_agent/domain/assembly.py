@@ -467,12 +467,22 @@ class _Assembler:
                 )
             for ref in plan.decision.execution_refs:
                 found = self.resolve(
-                    ref, frozenset({RefKind.TOOL_CALL}), "execution_ref", plan.decision_ref
+                    ref,
+                    frozenset({RefKind.TOOL_CALL, RefKind.ORDER_WORK}),
+                    "execution_ref",
+                    plan.decision_ref,
                 )
                 if found is None or found.tool_call_id is None:
                     continue
-                selections.append((plan, found.tool_call_id, None))
-                claims.setdefault(found.tool_call_id, []).append(plan.decision_ref)
+                # ADR-0066: a job's ref stands for every place and cancel call it made.
+                call_ids = (
+                    self.idx.children_of(found.tool_call_id)
+                    if found.kind is RefKind.ORDER_WORK
+                    else (found.tool_call_id,)
+                )
+                for call_id in call_ids:
+                    selections.append((plan, call_id, None))
+                    claims.setdefault(call_id, []).append(plan.decision_ref)
         if output.cancellation_rationales and self.off:
             self.find("cancellation_rationale_in_off_mode", "off mode has no cancellations")
         for rationale_index, rationale in enumerate(output.cancellation_rationales):

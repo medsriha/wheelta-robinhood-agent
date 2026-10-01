@@ -322,3 +322,67 @@ def test_orders_placed_by_others_open_no_lineage(
 ) -> None:
     _read_orders(conn, run_id, broker, [_filled(2, "e0e0e0e0-0000-4000-8000-000000000003")])
     assert position_book(conn, ACCOUNT, as_of=T0 + timedelta(minutes=5)).entries == ()
+
+
+def test_two_steps_of_one_order_walk_build_one_lineage(
+    conn: Conn, run_id: uuid.UUID, broker: BrokerLedger
+) -> None:
+    """ADR-0066: step 1 fills 1 of 2 and is cancelled; step 2 (a new broker order of the same
+    job) fills the other. Both fills join one lineage, never two on the same contract."""
+    work = record_tool_call_requested(
+        conn,
+        run_id=run_id,
+        sdk_tool_use_id=f"toolu_{next(_sdk)}",
+        stage="agent",
+        server="wra_orders",
+        tool="work_option_order",
+        tier=ToolTier.X,
+        arguments_redacted={},
+        requested_at=T0,
+    ).tool_call_id
+
+    def place(order: dict[str, Any], args: dict[str, Any]) -> None:
+        tool_call_id = record_tool_call_requested(
+            conn,
+            run_id=run_id,
+            sdk_tool_use_id=f"executor:{work}:{next(_sdk)}",
+            stage="agent",
+            server="robinhood",
+            tool="place_option_order",
+            tier=ToolTier.X,
+            arguments_redacted=args,
+            requested_at=T0,
+            parent_tool_call_id=work,
+        ).tool_call_id
+        call = ProxyCall(tool_call_id, "robinhood", "place_option_order", ToolTier.X, dict(args))
+        broker.before_dispatch(call)
+        _result(conn, run_id, broker, call, {"order": order})
+
+    place(ORDER, PLACE_ARGS)
+    first = {**_filled(1, "e0e0e0e0-0000-4000-8000-0000000000a1"), "state": "cancelled"}
+    first.update(pending_quantity="0", canceled_quantity="1")
+    _read_orders(conn, run_id, broker, [first])
+    second_id = "5c4d1f5f-2e3b-4f60-8b9c-8d7e6f5a4b3c"
+    second_args = {**PLACE_ARGS, "quantity": "1", "price": "1.20"}
+    second = {**copy.deepcopy(ORDER), "id": second_id, "quantity": "1", "pending_quantity": "1"}
+    place(second, second_args)
+    ex = {
+        "id": "e0e0e0e0-0000-4000-8000-0000000000a2",
+        "price": "1.20",
+        "quantity": "1",
+        "settlement_date": "2026-09-30",
+        "trade_date": "2026-09-29",
+        "timestamp": "2026-09-29T14:02:00Z",
+    }
+    filled = {
+        **second,
+        "state": "filled",
+        "processed_quantity": "1",
+        "pending_quantity": "0",
+        "price": "1.20",
+        "updated_at": "2026-09-29T14:02:00Z",
+        "legs": [{**LEG, "executions": [ex]}],
+    }
+    _read_orders(conn, run_id, broker, [first, filled])
+    (entry,) = position_book(conn, ACCOUNT, as_of=T0 + timedelta(minutes=5)).entries
+    assert len(entry.entry_fill_ids) == 2

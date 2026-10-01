@@ -288,3 +288,69 @@ def test_the_close_agent_opens_only_a_filled_roll_replacement() -> None:
     assert filled({**order(sto()), "quantity": "1"}) is None
     over = filled({**order(sto()), "quantity": "2"})
     assert over is not None and "allow 1" in over
+
+
+# ---- order-walk jobs (ADR-0066) -------------------------------------------------------------
+
+JOB = UUID(int=500)
+OTHER_JOB = UUID(int=501)
+
+
+def walk_gate(
+    jobs: tuple[UUID, ...] = (JOB,), in_flight: int = 1, closing: bool = True
+) -> PretradeGate:
+    from wheelta_robinhood_agent.agent.pretrade_gate import PlacementState, WalkInProgress
+
+    state = PlacementState(
+        unresolved=(),
+        placements_in_flight=in_flight,
+        active_jobs=tuple(
+            WalkInProgress(
+                job_id=j,
+                option_id="inst-2",
+                closing=closing,
+                remaining_quantity=1,
+                worst_price=D("0.60"),
+            )
+            for j in jobs
+        ),
+    )
+    return PretradeGate(
+        evidence=Loads(evidence()), rules=RULES, clock=lambda: T0, placements=lambda: state
+    )
+
+
+def test_an_active_job_counts_as_working_and_blocks_an_open() -> None:
+    """ADR-0066 item 5: an unfinished job is a working order even between its steps."""
+    reason = walk_gate()(order(sto()))
+    assert reason is not None and "Only buy-to-close orders" in reason
+    assert f"order_work:{JOB}" in reason
+
+
+def test_an_active_open_job_blocks_a_close_too() -> None:
+    reason = walk_gate(closing=False)({**order(btc()), "quantity": "1"})
+    assert reason is not None and "Only buy-to-close orders" in reason
+
+
+def test_a_job_is_not_its_own_working_order() -> None:
+    g = walk_gate()
+    assert g(order(sto()), job=JOB) is None  # its own placement: the leg checks pass
+    reason = g(order(sto()), job=OTHER_JOB)
+    assert reason is not None and f"order_work:{JOB}" in reason
+
+
+def test_a_close_beside_an_active_close_job_needs_verified_funds() -> None:
+    """Concurrent closes (ADR-0051): the job's debit counts at its worst_price, so the funds
+    check runs (and, with no account snapshot, cannot pass)."""
+    reason = walk_gate()({**order(btc()), "quantity": "1"})
+    assert reason is not None and "cannot be verified" in reason
+
+
+def test_a_work_admission_is_not_itself_a_placement_in_flight() -> None:
+    """`self_in_flight=False`: a work_option_order admission subtracts no own place call."""
+    lone = walk_gate(jobs=(), in_flight=0)
+    assert lone(order(btc()), self_in_flight=False) is None
+    busy = walk_gate(jobs=(), in_flight=1)
+    assert busy(order(btc())) is None  # the place call being checked is the one in flight
+    reason = busy(order(btc()), self_in_flight=False)
+    assert reason is not None and "one at a time" in reason

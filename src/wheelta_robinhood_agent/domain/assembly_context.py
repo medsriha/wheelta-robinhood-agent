@@ -48,9 +48,10 @@ from wheelta_robinhood_agent.domain.run_record import (
 )
 from wheelta_robinhood_agent.domain.tool_calls import ToolCallRecord
 
-ASSEMBLER_VERSION: Final = "assembler.v3"
+ASSEMBLER_VERSION: Final = "assembler.v4"
 """Version of the deterministic assembly algorithm; bump with any output-affecting change.
-v2 (ADR-0052): the `unassociated_place_matches_decision` finding."""
+v2 (ADR-0052): the `unassociated_place_matches_decision` finding. v4 (ADR-0066): an
+`order_work:` execution ref associates the job's place and cancel calls."""
 
 ORDER_CALL_REF_PREFIX: Final = "order_call:"
 
@@ -70,6 +71,7 @@ class RefKind(StrEnum):
     FACTS = "facts"
     EVIDENCE = "evidence"
     TOOL_CALL = "tool_call"  # an `order_call:` ref (ADR-0052)
+    ORDER_WORK = "order_work"  # an `order_work:` ref: one code-run order walk (ADR-0066)
 
 
 class DeliveredRef(DomainModel):
@@ -82,7 +84,8 @@ class DeliveredRef(DomainModel):
       run's context or tool results; an undelivered reference cannot be selected.
     - Candidate/position refs carry the instrument identity (`occ_symbol`,
       `broker_instrument_id`) from validated source records; `tool_call_id` identifies the
-      recorded call a TOOL_CALL ref names.
+      recorded call a TOOL_CALL ref names, or the `work_option_order` call of an ORDER_WORK
+      ref (its job's id, ADR-0066).
     """
 
     ref: Ref
@@ -101,8 +104,10 @@ class DeliveredRef(DomainModel):
 
     @model_validator(mode="after")
     def _check_ref(self) -> Self:
-        if (self.kind is RefKind.TOOL_CALL) != (self.tool_call_id is not None):
-            raise ValueError("tool_call_id is required exactly for tool_call refs")
+        if (self.kind in (RefKind.TOOL_CALL, RefKind.ORDER_WORK)) != (
+            self.tool_call_id is not None
+        ):
+            raise ValueError("tool_call_id is required exactly for tool_call and order_work refs")
         if self.kind is RefKind.POSITION and self.position_id is None:
             raise ValueError("a position ref needs a position_id")
         if self.kind is not RefKind.POSITION and self.run_id is None:

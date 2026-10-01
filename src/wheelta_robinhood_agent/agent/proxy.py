@@ -109,6 +109,7 @@ MCP_PATH: Final = "mcp"
 
 __all__ = [
     "LOOPBACK_HOST",
+    "ExecutorOutcome",
     "MAX_DELIVERED_CHARS",
     "PROXY_DEDUP_KEY",
     "PROXY_TIMEOUT_MARGIN_SECONDS",
@@ -128,6 +129,22 @@ class OrderRecorder(Protocol):
     def before_dispatch(self, call: ProxyCall) -> None: ...
 
     def after_validated(self, call: ProxyCall, envelope: dict[str, Any]) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorOutcome:
+    """What an order-walk call returned (ADR-0066): the recorded, labeled envelope and the
+    call's recorded status (`succeeded` only for a validated result)."""
+
+    payload: dict[str, Any]
+    status: ToolCallStatus
+
+
+@dataclass(frozen=True, slots=True)
+class _Handled:
+    output: list[dict[str, str]]
+    payload: dict[str, Any]
+    status: ToolCallStatus
 
 
 def upstream_timeout_seconds(mcp_tool_timeout_ms: int) -> float:
@@ -214,7 +231,14 @@ class ValidatingProxy:
                     )
                 )
             tool_call_id = call.tool_call_id
-            output = await self._handle(call, params)
+            if call.by_executor:
+                self._stop()
+                return _text_result(
+                    _fallback_output(
+                        self.server, params.name, None, "an executor call came from the CLI"
+                    )
+                )
+            output = (await self._handle(call, params)).output
             self.dispatch.complete(use_id, output)
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=b["text"]) for b in output]
@@ -230,14 +254,44 @@ class ValidatingProxy:
                 )
             )
 
+    async def execute(
+        self, use_id: str, *, timeout_seconds: float | None = None
+    ) -> ExecutorOutcome:
+        """Forward one order-walk call the hooks' gate admitted (ADR-0066), in-process.
+
+        Same path as a CLI call: claim, intent before dispatch, upstream within the deadline,
+        validation, recording, `order_call_ref` label. Nothing is delivered to the model, so
+        the delivery size limit does not apply. `timeout_seconds` narrows the upstream
+        deadline (the bounded cancel after the stop latch). Never raises for an upstream or
+        validation failure: the outcome says what was recorded; a recording failure sets the
+        stop latch and raises.
+        """
+        call = self.dispatch.claim(use_id)
+        if call is None or not call.by_executor:
+            self._stop()
+            raise ValueError("no admitted executor call for this id")
+        params = types.CallToolRequestParams(name=call.tool, arguments=dict(call.effective_input))
+        try:
+            handled = await self._handle(call, params, timeout_seconds=timeout_seconds)
+        except Exception:
+            self._stop()
+            raise
+        self.dispatch.complete(use_id, handled.output)
+        return ExecutorOutcome(payload=handled.payload, status=handled.status)
+
     async def _handle(
-        self, call: ProxyCall, params: types.CallToolRequestParams
-    ) -> list[dict[str, str]]:
+        self,
+        call: ProxyCall,
+        params: types.CallToolRequestParams,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> _Handled:
         arguments = dict(params.arguments or {})
         if params.name != call.tool or arguments != call.effective_input:
             self._stop()
             return self._not_forwarded(call, "tool or arguments differ from the dispatched call")
-        if call.tier in (ToolTier.S, ToolTier.X) and self.run_control.stop_requested:
+        stopped = call.tier in (ToolTier.S, ToolTier.X) and self.run_control.stop_requested
+        if stopped and not call.after_stop_cancel:
             return self._not_forwarded(call, "run stop requested")
         sent = call.upstream_input if call.upstream_input is not None else arguments
         if self.order_recorder is not None:
@@ -248,10 +302,11 @@ class ValidatingProxy:
                 return self._not_forwarded(
                     call, f"order intent not recorded ({type(exc).__name__})"
                 )
+        deadline = self.upstream_timeout_seconds
+        if timeout_seconds is not None:
+            deadline = min(deadline, timeout_seconds)
         try:
-            result = await self.upstream.call_tool(
-                call.tool, sent, timeout_seconds=self.upstream_timeout_seconds
-            )
+            result = await self.upstream.call_tool(call.tool, sent, timeout_seconds=deadline)
         except UpstreamError as exc:
             return self._failed(call, str(exc))
         now = self.clock()
@@ -281,7 +336,7 @@ class ValidatingProxy:
         # ADR-0037: the ledger keeps the full envelope; the model gets its view.
         output = mcp_tool_output(model_view(payload))
         size = len(output[0]["text"])
-        if size > MAX_DELIVERED_CHARS:
+        if size > MAX_DELIVERED_CHARS and not call.by_executor:
             return self._failed(
                 call,
                 f"result too large to deliver ({size} characters; limit {MAX_DELIVERED_CHARS})"
@@ -313,7 +368,8 @@ class ValidatingProxy:
                 self.order_recorder.after_validated(call, payload)
             except Exception:  # noqa: BLE001 - deliver the broker's answer; stop further actions
                 self._stop()
-        return output
+        status = ToolCallStatus.SUCCEEDED if valid else _unresolved(call.tier)
+        return _Handled(output, payload, status)
 
     def _error_output(self, call: ProxyCall, gap: str, now: datetime) -> list[dict[str, str]]:
         envelope = ResultEnvelope(
@@ -326,31 +382,30 @@ class ValidatingProxy:
         ).model_dump(mode="json")
         return mcp_tool_output(_labeled(call, envelope))
 
-    def _failed(self, call: ProxyCall, gap: str) -> list[dict[str, str]]:
+    def _failed(self, call: ProxyCall, gap: str) -> _Handled:
         """The upstream exchange failed, or its result cannot be delivered, after dispatch:
         S/X outcomes are unknown."""
         now = self.clock()
         output = self._error_output(call, gap, now)
-        ref = self.recorder.store_result(
-            call.tool_call_id, ResultKind.ERROR, json.loads(output[0]["text"])
-        )
+        payload = json.loads(output[0]["text"])
+        ref = self.recorder.store_result(call.tool_call_id, ResultKind.ERROR, payload)
+        status = _unresolved(call.tier)
         self.recorder.outcome(
             call.tool_call_id,
-            _unresolved(call.tier),
+            status,
             observed_at=now,
             dedup_key=PROXY_DEDUP_KEY,
             reason=gap,
             error_ref=ref,
         )
-        return output
+        return _Handled(output, payload, status)
 
-    def _not_forwarded(self, call: ProxyCall, reason: str) -> list[dict[str, str]]:
+    def _not_forwarded(self, call: ProxyCall, reason: str) -> _Handled:
         """Nothing reached the server, so the outcome is known: failed, in every tier."""
         now = self.clock()
         output = self._error_output(call, f"not forwarded: {reason}", now)
-        ref = self.recorder.store_result(
-            call.tool_call_id, ResultKind.ERROR, json.loads(output[0]["text"])
-        )
+        payload = json.loads(output[0]["text"])
+        ref = self.recorder.store_result(call.tool_call_id, ResultKind.ERROR, payload)
         self.recorder.outcome(
             call.tool_call_id,
             ToolCallStatus.FAILED,
@@ -359,7 +414,7 @@ class ValidatingProxy:
             reason=f"not forwarded: {reason}",
             error_ref=ref,
         )
-        return output
+        return _Handled(output, payload, ToolCallStatus.FAILED)
 
 
 def _listed_tools(

@@ -252,3 +252,50 @@ def test_agent_attribution_is_all_or_nothing(conn: Conn, run_id: uuid.UUID) -> N
             "(%s, %s, 'toolu_x', 'agent', 's', 't', 'R', now(), '{}', 'a-1')",
             (uuid.uuid4(), run_id),
         )
+
+
+def test_executor_calls_project_their_parent(conn: Conn, run_id: uuid.UUID) -> None:
+    """ADR-0066 / migration 0008: an order-walk call links to its `work_option_order` call."""
+    work = record_tool_call_requested(
+        conn,
+        run_id=run_id,
+        sdk_tool_use_id="toolu_work",
+        stage="agent",
+        server="wra_local",
+        tool="work_option_order",
+        tier=ToolTier.X,
+        arguments_redacted={},
+        requested_at=T0,
+    ).tool_call_id
+    place = record_tool_call_requested(
+        conn,
+        run_id=run_id,
+        sdk_tool_use_id=f"executor:{work}:1",
+        stage="agent",
+        server="robinhood",
+        tool="place_option_order",
+        tier=ToolTier.X,
+        arguments_redacted={},
+        requested_at=T0 + timedelta(seconds=1),
+        parent_tool_call_id=work,
+    ).tool_call_id
+    records = {r.identity.tool_call_id: r.identity for r in tool_call_records(conn, run_id)}
+    assert records[place].parent_tool_call_id == work and records[place].by_executor
+    assert records[work].parent_tool_call_id is None and not records[work].by_executor
+
+
+def test_an_executor_call_is_never_a_mignons(conn: Conn, run_id: uuid.UUID) -> None:
+    parent = uuid.uuid4()
+    conn.execute(
+        "INSERT INTO tool_calls (tool_call_id, run_id, sdk_tool_use_id, stage, server, tool, "
+        "tier, requested_at, arguments_redacted) VALUES "
+        "(%s, %s, 'toolu_p', 'agent', 'wra_local', 'work_option_order', 'X', now(), '{}')",
+        (parent, run_id),
+    )
+    with pytest.raises(psycopg.errors.CheckViolation, match="executor_attribution"):
+        conn.execute(
+            "INSERT INTO tool_calls (tool_call_id, run_id, sdk_tool_use_id, stage, server, tool, "
+            "tier, requested_at, arguments_redacted, agent_id, agent_type, parent_tool_call_id) "
+            "VALUES (%s, %s, 'toolu_y', 'agent', 's', 't', 'R', now(), '{}', 'a-1', 'm', %s)",
+            (uuid.uuid4(), run_id, parent),
+        )

@@ -84,6 +84,9 @@ _WEB_CACHE = f"mcp__{LOCAL_SERVER_NAME}__{WEB_CACHE_TOOL_NAME}"
 # Spelled out, not imported from facts_tool (hooks -> mignons -> facts_tool -> result_boundary
 # -> hooks would cycle); tests pin it to FACTS_TOOL_NAME.
 _FACTS = f"mcp__{LOCAL_SERVER_NAME}__get_decision_facts"
+# ADR-0066: code works orders; the orchestrator starts and awaits order-work jobs. Spelled out
+# like _FACTS (hooks -> mignons; order_walk is imported by hooks); tests pin the names.
+_ORDER_WORK = ("mcp__wra_orders__work_option_order", "mcp__wra_orders__await_order_work")
 
 ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
     {
@@ -91,6 +94,7 @@ ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
             {
                 DELEGATION_TOOL,
                 _FACTS,
+                *_ORDER_WORK,
                 # Account state (every account-scoped read) and the pre-order re-quote.
                 *_rh(
                     "get_portfolio",
@@ -108,7 +112,8 @@ ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
                     "get_option_instruments",
                     "get_option_quotes",
                 ),
-                # Workspace reads and writes (Tier S) and the live order tools (Tier X).
+                # Workspace reads and writes (Tier S), and cancels of owned orders no
+                # order-work job holds (Tier X; ADR-0066: review and place are code's).
                 *_rh(
                     "get_scans",
                     "get_watchlists",
@@ -131,8 +136,6 @@ ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
                     "update_alert",
                     "delete_alert",
                     "mark_alerts_read",
-                    "review_option_order",
-                    "place_option_order",
                     "cancel_option_order",
                 ),
             }

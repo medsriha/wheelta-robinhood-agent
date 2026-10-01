@@ -17,6 +17,11 @@ from wheelta_robinhood_agent.agent.local_server import (
 )
 from wheelta_robinhood_agent.agent.mignons import MignonLimits, Role
 from wheelta_robinhood_agent.agent.options import AgentOptionsError, build_agent_options
+from wheelta_robinhood_agent.agent.order_walk import (
+    ORDER_WORK_REGISTRY,
+    QUALIFIED_AWAIT_TOOL,
+    QUALIFIED_WORK_TOOL,
+)
 from wheelta_robinhood_agent.agent.session import (
     RemoteSource,
     SessionPlanError,
@@ -51,6 +56,12 @@ RH_VERIFIED = ROBINHOOD_REGISTRY.model_copy(update={"verified": True})
 # A registry left unverified, for the withholding rules (Wheelta itself is verified, ADR-0041).
 WT_UNVERIFIED = WHEELTA_REGISTRY.model_copy(update={"verified": False})
 ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified(n) for n in LIVE_ORDER_TOOLS}
+# ADR-0066: with an order venue the model's Tier X tools; review and place are the executor's.
+MODEL_ORDER_TOOLS = {ROBINHOOD_REGISTRY.qualified("cancel_option_order"), QUALIFIED_WORK_TOOL}
+EXECUTOR_ONLY = {
+    ROBINHOOD_REGISTRY.qualified(n) for n in ("review_option_order", "place_option_order")
+}
+ORDER_WORK_TOOLS = {QUALIFIED_WORK_TOOL, QUALIFIED_AWAIT_TOOL}
 LOCAL_TOOLS = {LOCAL_REGISTRY.qualified(t.name) for t in LOCAL_REGISTRY.tools}
 
 
@@ -119,8 +130,9 @@ def test_verified_wheelta_is_proxied_with_its_read_tools() -> None:
 
 
 def test_proxied_dry_run_gets_the_live_order_tools_on_the_simulated_venue() -> None:
-    """ADR-0038: with Robinhood proxied, a dry run sees exactly the live option-order tools
-    (answered by the simulated broker); every other Tier X tool stays denied."""
+    """ADR-0038: with Robinhood proxied, a dry run sees the same order tools as live
+    (answered by the simulated broker); every other Tier X tool stays denied. ADR-0066: those
+    are cancel and the order-work tools; review and place are the executor's."""
     plan = plan_session(
         effective_mode=ExecutionMode.OFF,
         workspace_writes=True,
@@ -128,8 +140,11 @@ def test_proxied_dry_run_gets_the_live_order_tools_on_the_simulated_venue() -> N
         observed_at=NOW,
     )
     assert plan.order_venue is OrderVenue.SIMULATED
+    assert ORDER_WORK_REGISTRY in plan.registries
     allowed = set(plan.tool_access.allowed_tools)
-    assert ORDER_TOOLS <= allowed
+    assert MODEL_ORDER_TOOLS | ORDER_WORK_TOOLS <= allowed
+    assert not EXECUTOR_ONLY & allowed
+    assert EXECUTOR_ONLY <= set(plan.tool_access.disallowed_tools)
     denied_x = {
         RH_VERIFIED.qualified(t.name)
         for t in RH_VERIFIED.by_tier(ToolTier.X)
@@ -144,6 +159,10 @@ def test_direct_robinhood_dry_run_has_no_order_venue() -> None:
     plan = _plan()
     assert plan.servers == (RH,) and plan.order_venue is OrderVenue.NONE
     assert not ORDER_TOOLS & set(plan.tool_access.allowed_tools)
+    # ADR-0066: without a venue the order-work server's tools do not exist at all.
+    assert ORDER_WORK_REGISTRY not in plan.registries
+    names = {*plan.tool_access.allowed_tools, *plan.tool_access.disallowed_tools}
+    assert not any(t.startswith("mcp__wra_orders__") for t in names)
 
 
 def test_stored_cli_login_cannot_be_proxied_and_needs_direct_acceptance() -> None:
@@ -187,7 +206,9 @@ def test_order_tools_only_in_live_and_never_in_off() -> None:
         observed_at=NOW,
         remote_boundary_accepted=True,
     )
-    assert ORDER_TOOLS <= set(live.tool_access.allowed_tools)
+    assert MODEL_ORDER_TOOLS | ORDER_WORK_TOOLS <= set(live.tool_access.allowed_tools)
+    assert not EXECUTOR_ONLY & set(live.tool_access.allowed_tools)
+    assert ORDER_WORK_REGISTRY in live.registries
     denied_x = {
         RH_VERIFIED.qualified(t.name)
         for t in RH_VERIFIED.by_tier(ToolTier.X)
@@ -599,3 +620,108 @@ def test_a_loopback_listener_off_the_loopback_address_is_refused(
     endpoint = LoopbackEndpoint(app=LoopbackProxyApp(), base_url="http://0.0.0.0:41234")
     with pytest.raises(SessionPlanError, match="not on 127.0.0.1"):
         _build_session_options(endpoint, monkeypatch)
+
+
+# ---- ADR-0066: the order-walk runner and the order-work server ------------------------------
+
+
+def _simulated_plan() -> Any:
+    return plan_session(
+        effective_mode=ExecutionMode.OFF,
+        workspace_writes=True,
+        sources=(
+            RemoteSource(RH_VERIFIED, RH, required=True),
+            RemoteSource(WHEELTA_REGISTRY, WT),
+            RemoteSource(TAVILY_REGISTRY, TV),
+        ),
+        observed_at=NOW,
+        agent=AgentRole.SELL,
+    )
+
+
+def test_a_runner_needs_an_order_venue_and_the_proxied_robinhood() -> None:
+    from wheelta_robinhood_agent.agent.order_walk import OrderWorkRunner
+    from wheelta_robinhood_agent.agent.session import _order_work_runner
+
+    deps = _session_deps(_simulated_plan())
+    runner = _order_work_runner(deps, _upstreams())
+    assert isinstance(runner, OrderWorkRunner)
+    assert runner.timing == deps.rules.rules.orders.walk.timing()
+    assert runner.partial_fill is deps.rules.rules.orders.walk.partial_fill
+    no_robinhood = {k: v for k, v in _upstreams().items() if k != "robinhood"}
+    assert _order_work_runner(deps, no_robinhood) is None
+    direct = _session_deps(_plan(agent=AgentRole.SELL))  # direct Robinhood: no order venue
+    assert direct.plan.order_venue is OrderVenue.NONE
+    assert _order_work_runner(direct, _upstreams()) is None
+
+
+def test_with_a_runner_the_order_work_server_is_served() -> None:
+    from wheelta_robinhood_agent.agent import session as session_module
+    from wheelta_robinhood_agent.agent.session import _order_work_runner
+
+    deps = _session_deps(_simulated_plan())
+    runner = _order_work_runner(deps, _upstreams())
+    options = session_module.build_session_options(
+        deps, ServerWithholding(), _upstreams(), runner=runner
+    )
+    assert "wra_orders" in options.mcp_servers
+    assert QUALIFIED_WORK_TOOL in options.allowed_tools
+    assert QUALIFIED_AWAIT_TOOL in options.allowed_tools
+    assert not EXECUTOR_ONLY & set(options.allowed_tools)
+    without = session_module.build_session_options(deps, ServerWithholding(), _upstreams())
+    assert "wra_orders" not in without.mcp_servers
+
+
+def test_a_runner_without_the_robinhood_proxy_is_refused() -> None:
+    from wheelta_robinhood_agent.agent import session as session_module
+    from wheelta_robinhood_agent.agent.session import _order_work_runner
+
+    deps = _session_deps(_simulated_plan())
+    runner = _order_work_runner(deps, _upstreams())
+    no_robinhood = {k: v for k, v in _upstreams().items() if k != "robinhood"}
+    with pytest.raises(SessionPlanError, match="proxied Robinhood"):
+        session_module.build_session_options(deps, ServerWithholding(), no_robinhood, runner=runner)
+
+
+def test_order_work_message_lists_each_job_and_asks_for_the_output_again() -> None:
+    from wheelta_robinhood_agent.agent.session import MAX_ORDER_WORK_TURNS, order_work_message
+
+    jobs = [
+        {
+            "work_ref": "order_work:a",
+            "status": "filled",
+            "filled_quantity": 2,
+            "quantity": 2,
+            "reason": None,
+        },
+        {
+            "work_ref": "order_work:b",
+            "status": "cancelled",
+            "filled_quantity": 0,
+            "quantity": 1,
+            "reason": "QUOTE_MOVED: step 1",
+        },
+    ]
+    text = order_work_message(jobs, 1)
+    assert f"report 1 of {MAX_ORDER_WORK_TURNS}" in text
+    assert "- order_work:a: filled, filled 2 of 2\n" in text
+    assert "- order_work:b: cancelled, filled 0 of 1 (QUOTE_MOVED: step 1)" in text
+    assert "execution_refs" in text and "AgentDecisionOutput" in text
+
+
+def test_live_with_a_direct_robinhood_has_no_order_work_tools() -> None:
+    """ADR-0066: code works orders only through the Robinhood proxy, so a live plan whose
+    Robinhood is served directly (no token) never lists the order-work tools."""
+    direct = McpHttpServer(  # type: ignore[arg-type]
+        name="robinhood", url="https://rh.example/mcp", uses_stored_cli_login=True
+    )
+    live = plan_session(
+        effective_mode=ExecutionMode.LIVE,
+        workspace_writes=True,
+        sources=(RemoteSource(RH_VERIFIED, direct, required=True),),
+        observed_at=NOW,
+        remote_boundary_accepted=True,
+    )
+    assert live.order_venue is OrderVenue.BROKER
+    assert ORDER_WORK_REGISTRY not in live.registries
+    assert not ORDER_WORK_TOOLS & set(live.tool_access.allowed_tools)

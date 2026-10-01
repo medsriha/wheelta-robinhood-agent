@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 
+from wheelta_robinhood_agent.agent.order_walk import QUALIFIED_AWAIT_TOOL
 from wheelta_robinhood_agent.agent.simulated_broker import simulated_scope_id
 from wheelta_robinhood_agent.domain.enums import AttemptStatus, CancellationStatus, OrderVenue
 from wheelta_robinhood_agent.domain.orders import OrderRecord
@@ -49,17 +50,23 @@ MAX_ORDER_CLEANUPS: Final = 2
 # a few order reads, cancels, and one final response; not a trading rule.
 ORDER_WIND_DOWN_SECONDS: Final = 180.0
 CLEANUP_TOOLS: Final = frozenset(
-    f"mcp__{ROBINHOOD}__{tool}"
-    for tool in ("get_option_orders", "get_option_positions", "cancel_option_order")
+    {
+        *(
+            f"mcp__{ROBINHOOD}__{tool}"
+            for tool in ("get_option_orders", "get_option_positions", "cancel_option_order")
+        ),
+        # ADR-0066: waiting for running order-work jobs (no new job starts).
+        QUALIFIED_AWAIT_TOOL,
+    }
 )
 WIND_DOWN_DENIAL: Final = (
-    "the run is winding down: only get_option_orders, get_option_positions, and "
-    "cancel_option_order are allowed. Cancel your working orders, confirm them, and return "
-    "your final output"
+    "the run is winding down: only get_option_orders, get_option_positions, "
+    "cancel_option_order, and await_order_work are allowed. Wait for your order-work jobs, "
+    "cancel any other working order of yours, confirm it, and return your final output"
 )
 CLEANUP_DENIAL: Final = (
-    "orders are being cleaned up: only get_option_orders, get_option_positions, and "
-    "cancel_option_order are allowed"
+    "orders are being cleaned up: only get_option_orders, get_option_positions, "
+    "cancel_option_order, and await_order_work are allowed"
 )
 
 

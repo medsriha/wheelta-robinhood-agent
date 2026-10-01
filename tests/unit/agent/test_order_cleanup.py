@@ -138,6 +138,7 @@ def test_cleanup_tools_are_order_reads_and_cancel_only() -> None:
         "mcp__robinhood__get_option_orders",
         "mcp__robinhood__get_option_positions",
         "mcp__robinhood__cancel_option_order",
+        "mcp__wra_orders__await_order_work",  # ADR-0066: waiting for jobs, never starting one
     }
 
 

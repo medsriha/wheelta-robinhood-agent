@@ -85,7 +85,11 @@ from wheelta_robinhood_agent.agent.facts_tool import (
     build_facts_tool,
     load_run_evidence,
 )
-from wheelta_robinhood_agent.agent.hooks import HookDeps, OutputRepairGate, build_hooks
+from wheelta_robinhood_agent.agent.hooks import (
+    HookDeps,
+    OutputRepairGate,
+    build_hooks_with_gate,
+)
 from wheelta_robinhood_agent.agent.ledger_adapters import (
     LedgerWorkspaceCounter,
     LedgerWorkspaceOwnership,
@@ -112,7 +116,23 @@ from wheelta_robinhood_agent.agent.order_cleanup import (
     order_scope,
     unresolved_orders,
 )
-from wheelta_robinhood_agent.agent.pretrade_gate import PlacementState, PretradeGate
+from wheelta_robinhood_agent.agent.order_walk import (
+    AWAIT_TOOL,
+    ORDER_WORK_REGISTRY,
+    ORDER_WORK_SERVER,
+    WORK_TOOL,
+    CallOutcome,
+    OrderWorkRunner,
+)
+from wheelta_robinhood_agent.agent.order_work_server import (
+    OrderWorkServer,
+    build_order_work_server,
+)
+from wheelta_robinhood_agent.agent.pretrade_gate import (
+    PlacementState,
+    PretradeGate,
+    WalkInProgress,
+)
 from wheelta_robinhood_agent.agent.proxy import (
     LOOPBACK_HOST,
     LoopbackProxyApp,
@@ -131,6 +151,7 @@ from wheelta_robinhood_agent.agent.result_boundary import (
     PayloadError,
     PayloadKind,
     extract_mcp_payload,
+    mapped_evidence_of,
 )
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
 from wheelta_robinhood_agent.agent.simulated_broker import (
@@ -153,7 +174,7 @@ from wheelta_robinhood_agent.agent.web_cache import (
 )
 from wheelta_robinhood_agent.agent.withholding import ServerWithholding
 from wheelta_robinhood_agent.config.facts_rules import facts_rules_from, pretrade_rules_from
-from wheelta_robinhood_agent.config.rules import LoadedRules
+from wheelta_robinhood_agent.config.rules import LoadedRules, RuleMarker
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.account import AgenticEligibility
 from wheelta_robinhood_agent.domain.decision_output import (
@@ -172,6 +193,7 @@ from wheelta_robinhood_agent.domain.enums import (
     ToolCallStatus,
     ToolTier,
 )
+from wheelta_robinhood_agent.domain.events import RunEventType
 from wheelta_robinhood_agent.domain.gating import executes_orders, order_venue
 from wheelta_robinhood_agent.domain.orders import OrderRecord
 from wheelta_robinhood_agent.domain.start_conditions import (
@@ -208,6 +230,7 @@ from wheelta_robinhood_agent.integrations.websearch.registry import (
 )
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
 from wheelta_robinhood_agent.ledger import orders as ledger_orders
+from wheelta_robinhood_agent.ledger import runs as ledger_runs
 from wheelta_robinhood_agent.ledger import tool_calls as ledger_tool_calls
 from wheelta_robinhood_agent.observability.metrics import RunMetrics
 from wheelta_robinhood_agent.observability.redaction import Redactor
@@ -362,7 +385,12 @@ def plan_session(
             )
             continue
         (proxied if proxy else servers).append(source.server)
-    venue = order_venue(effective_mode, robinhood_proxied=any(p.name == ROBINHOOD for p in proxied))
+    robinhood_proxied = any(p.name == ROBINHOOD for p in proxied)
+    venue = order_venue(effective_mode, robinhood_proxied=robinhood_proxied)
+    if executes_orders(venue) and robinhood_proxied:
+        # ADR-0066: code works orders through the Robinhood proxy; the order-work tools exist
+        # only with an order venue and that proxy.
+        registries = (*registries, ORDER_WORK_REGISTRY)
     base = build_tool_access(
         effective_mode=effective_mode,
         workspace_writes=workspace_writes,
@@ -415,6 +443,12 @@ _TOOL_PURPOSES: Final[dict[str, str]] = {
     ),
     f"mcp__{LOCAL_SERVER_NAME}__{FACTS_TOOL_NAME}": (
         "Code-computed decision facts, sizing, and facts_ref for a candidate/position ref"
+    ),
+    f"mcp__{ORDER_WORK_SERVER}__{WORK_TOOL}": (
+        "Work one order in the order window: code steps start_price to worst_price (ADR-0066)"
+    ),
+    f"mcp__{ORDER_WORK_SERVER}__{AWAIT_TOOL}": (
+        "Wait for an order-work job to end; its status, steps, and fills"
     ),
 }
 
@@ -574,6 +608,8 @@ class SessionResult:
     reference_check_error: str | None = None
     # ADR-0057: the trusted start-condition check (CLOSE/SELL); None if it did not run.
     start_condition: StartCondition | None = None
+    # ADR-0066: turns reporting order-work jobs that ended after the agent returned.
+    order_work_turns: int = 0
 
 
 def _web_cache_parts(
@@ -612,8 +648,12 @@ def build_session_options(
     account_eligible: bool = False,
     output_gate: OutputRepairGate | None = None,
     loopback: LoopbackEndpoint | None = None,
+    runner: OrderWorkRunner | None = None,
 ) -> ClaudeAgentOptions:
     """Hooks, local server, validating proxies (one per open upstream), and options (no I/O).
+
+    ADR-0066: with `runner` (an order venue and a proxied Robinhood) the `wra_orders` server
+    is served and the runner is bound to the hooks' executor gate and the Robinhood proxy.
 
     `account_eligible` is the result of the session's trusted `get_accounts` check;
     `output_gate` is closed by the session during final-output repair turns (ADR-0044).
@@ -631,7 +671,11 @@ def build_session_options(
         board_screens=lambda: load_run_evidence(deps.conn, deps.run_id).board_screens(),
     )
     upstreams = dict(upstreams or {})
-    dispatch = ProxyDispatch(frozenset(upstreams))
+    if runner is not None and ROBINHOOD not in upstreams:
+        raise SessionPlanError("the order executor needs the proxied Robinhood upstream")
+    dispatch = ProxyDispatch(
+        frozenset(upstreams) | ({ORDER_WORK_SERVER} if runner is not None else frozenset())
+    )
     settings = deps.settings
     prefix = settings.ROBINHOOD_WORKSPACE_PREFIX
     hook_deps = HookDeps(
@@ -663,11 +707,15 @@ def build_session_options(
             evidence=lambda: load_run_evidence(deps.conn, deps.run_id),
             rules=pretrade_rules_from(deps.rules),
             clock=deps.clock,
-            placements=lambda: placement_state(deps),
+            placements=lambda: placement_state(deps, runner),
             role=deps.role,
             run_orders=lambda: ledger_orders.run_order_records(deps.conn, deps.run_id),
         ),
+        order_work=runner,
+        session_remaining=deps.session_budget_seconds if runner is not None else None,
+        wind_down_seconds=ORDER_WIND_DOWN_SECONDS,
     )
+    hooks, executor_gate = build_hooks_with_gate(hook_deps)
     facts_service = DecisionFactsService(
         conn=deps.conn,
         run_id=deps.run_id,
@@ -728,6 +776,32 @@ def build_session_options(
             name=name,
             instance=build_proxy_server(proxy, registry_by_name[name], main_allowed),
         )
+    if runner is not None:
+        robinhood_proxy = proxies[ROBINHOOD][0]
+
+        async def transport(use_id: str, *, timeout_seconds: float | None = None) -> CallOutcome:
+            done = await robinhood_proxy.execute(use_id, timeout_seconds=timeout_seconds)
+            evidence = (
+                mapped_evidence_of(done.payload)
+                if done.status is ToolCallStatus.SUCCEEDED
+                else None
+            )
+            return CallOutcome(status=done.status, evidence=evidence)
+
+        runner.bind(executor_gate, transport)
+        sdk_servers[ORDER_WORK_SERVER] = McpSdkServerConfig(
+            type="sdk",
+            name=ORDER_WORK_SERVER,
+            instance=build_order_work_server(
+                OrderWorkServer(
+                    runner=runner,
+                    dispatch=dispatch,
+                    recorder=recorder,
+                    run_control=deps.run_control,
+                    clock=deps.clock,
+                )
+            ),
+        )
     mignon_servers = (
         _mount_mignon_servers(loopback, proxies, allowed) if split and loopback else None
     )
@@ -735,7 +809,7 @@ def build_session_options(
         tool_access=deps.plan.tool_access,
         mcp_servers=deps.plan.servers,
         sdk_servers=sdk_servers,
-        hooks=build_hooks(hook_deps),
+        hooks=hooks,
         system_prompt=deps.system_prompt,
         model=settings.AGENT_MODEL,
         scratch_dir=deps.scratch_dir,
@@ -995,7 +1069,7 @@ def _init_check(
         if withholding.withhold(name, reason):
             result.withheld[name] = reason
         result.observations.append(observe_server(name, raw, deps.clock()))
-        if name in (ROBINHOOD, LOCAL_SERVER_NAME):
+        if name in (ROBINHOOD, LOCAL_SERVER_NAME, ORDER_WORK_SERVER):
             deps.run_control.request_stop(StopReason.INFRASTRUCTURE_FAILURE, deps.clock())
 
 
@@ -1027,6 +1101,25 @@ OUTPUT_REPAIR_DENIAL: Final = (
 
 # ADR-0052: follow-up turns returning a valid output's reference issues to the agent.
 MAX_REFERENCE_REPAIRS: Final = 2
+
+# ADR-0066: follow-up turns reporting order-work jobs that ended after the agent returned.
+MAX_ORDER_WORK_TURNS: Final = 3
+
+
+def order_work_message(jobs: Sequence[Mapping[str, object]], attempt: int) -> str:
+    """The follow-up turn sent once the order-work jobs the agent left running have ended."""
+    lines = [
+        f"- {j['work_ref']}: {j['status']}, filled {j['filled_quantity']} of {j['quantity']}"
+        + (f" ({j['reason']})" if j.get("reason") else "")
+        for j in jobs
+    ]
+    return (
+        f"Order work you left running has ended (report {attempt} of {MAX_ORDER_WORK_TURNS}):\n"
+        + "\n".join(lines)
+        + "\n\nReturn your complete AgentDecisionOutput JSON object again with these outcomes: "
+        "cite each job's work_ref in the decision's execution_refs. You may start other trades "
+        "the rules still allow."
+    )
 
 
 def reference_message(issues: Sequence[str], attempt: int) -> str:
@@ -1069,8 +1162,13 @@ async def _converse(
     withholding: ServerWithholding,
     result: SessionResult,
     output_gate: OutputRepairGate | None = None,
+    runner: OrderWorkRunner | None = None,
 ) -> None:
     """Send the start message and read until the ResultMessage, interrupting on stop.
+
+    ADR-0066: an output returned while order-work jobs are still running is not final: code
+    waits for the jobs (the watcher still enforces stop and deadline), then sends up to
+    `MAX_ORDER_WORK_TURNS` turns listing their outcomes, before any cleanup or repair.
 
     ADR-0044: a final output that fails to parse gets up to `MAX_OUTPUT_REPAIRS` follow-up
     turns in the same session, each listing the issues, with every tool denied (the gate).
@@ -1147,6 +1245,22 @@ async def _converse(
                 result.reference_issues = None
                 if deps.run_control.stop_requested:
                     break
+                if runner is not None and (runner.active() or runner.pending()):
+                    # Never past a running job: the cleanup and reference checks below read
+                    # the shared connection and the order state the jobs are changing.
+                    left = runner.active()
+                    await runner.wait_all()
+                    if deps.run_control.stop_requested:
+                        break
+                    if left and result.order_work_turns < MAX_ORDER_WORK_TURNS:
+                        result.order_work_turns += 1
+                        text = await turn(
+                            order_work_message([j.view() for j in left], result.order_work_turns)
+                        )
+                        continue
+                    if output_gate is not None:
+                        # Out of report turns: no new job may start behind the checks.
+                        output_gate.restrict(CLEANUP_DENIAL, CLEANUP_TOOLS)
                 if (
                     repairs == 0
                     and result.reference_repairs == 0
@@ -1292,15 +1406,19 @@ async def run_agent_session(deps: SessionDeps) -> SessionResult:
                 if result.start_condition.outcome is StartOutcome.NOT_MET:
                     result.status = SessionStatus.SKIPPED
                 return result
-        await _run_client(deps, withholding, upstreams, result)
-    if result.status is not SessionStatus.NOT_STARTED:
-        close_unresolved_calls(deps)
-        persist_output(deps, result)
-        result.orders_left_unresolved = orders_left_unresolved(deps)
+        try:
+            await _run_client(deps, withholding, upstreams, result)
+        finally:
+            # Even if something escaped the client: unknown calls closed, output and the
+            # leftover orders recorded (CLAUDE.md §17).
+            if result.status is not SessionStatus.NOT_STARTED:
+                close_unresolved_calls(deps)
+                persist_output(deps, result)
+                result.orders_left_unresolved = orders_left_unresolved(deps)
     return result
 
 
-def placement_state(deps: SessionDeps) -> PlacementState:
+def placement_state(deps: SessionDeps, runner: OrderWorkRunner | None = None) -> PlacementState:
     """This run's unresolved owned orders and its place calls without an outcome (ADR-0051).
 
     Only this tick's placements count (this run's and, ADR-0057, those of its earlier runs):
@@ -1315,12 +1433,40 @@ def placement_state(deps: SessionDeps) -> PlacementState:
         for r in unresolved_orders(deps.conn, scope)
         if r.intent is not None and r.intent.run_id in (deps.run_id, *deps.related_run_ids)
     )
+    # ADR-0066: a running job is counted as working through `active_jobs`, so its own
+    # placement in flight is not also "another placement" (executor placements are
+    # serialized by the runner).
+    running = {j.job_id for j in runner.active()} if runner is not None else set()
+    records = ledger_tool_calls.tool_call_records(deps.conn, deps.run_id)
     in_flight = sum(
         1
-        for r in ledger_tool_calls.tool_call_records(deps.conn, deps.run_id)
-        if r.identity.tool == PLACE_ORDER_TOOL and r.status is ToolCallStatus.REQUESTED
+        for r in records
+        if r.identity.tool == PLACE_ORDER_TOOL
+        and r.status is ToolCallStatus.REQUESTED
+        and r.identity.parent_tool_call_id not in running
     )
-    return PlacementState(unresolved=unresolved, placements_in_flight=in_flight)
+    # A running job's working order is counted once, as the job (at its worst price).
+    jobs_places = {
+        r.identity.tool_call_id for r in records if r.identity.parent_tool_call_id in running
+    }
+    unresolved = tuple(
+        r for r in unresolved if r.intent is None or r.intent.place_tool_call_id not in jobs_places
+    )
+    jobs = (
+        tuple(
+            WalkInProgress(
+                job_id=j.job_id,
+                option_id=j.option_id,
+                closing=j.closing,
+                remaining_quantity=j.remaining_quantity,
+                worst_price=j.worst_price,
+            )
+            for j in runner.active_jobs()
+        )
+        if runner is not None
+        else ()
+    )
+    return PlacementState(unresolved=unresolved, placements_in_flight=in_flight, active_jobs=jobs)
 
 
 def cleanup_candidates(deps: SessionDeps) -> tuple[OrderRecord, ...]:
@@ -1360,6 +1506,46 @@ def orders_left_unresolved(deps: SessionDeps) -> tuple[str, ...]:
         elif record.intent is not None:
             left.append(f"place:{record.intent.place_tool_call_id}")
     return tuple(left)
+
+
+def _order_work_runner(
+    deps: SessionDeps, upstreams: Mapping[str, McpUpstream]
+) -> OrderWorkRunner | None:
+    """ADR-0066: the session's order-walk runner when it has an order venue and Robinhood is
+    proxied (the executor works every order through the proxy); else None."""
+    if not executes_orders(deps.plan.order_venue) or ROBINHOOD not in upstreams:
+        return None
+    walk = deps.rules.rules.orders.walk
+
+    def record(key: str, payload: Mapping[str, object], calls: tuple[uuid.UUID, ...]) -> None:
+        ledger_runs.append_run_event(
+            deps.conn,
+            deps.run_id,
+            RunEventType.METADATA,
+            observed_at=deps.clock(),
+            dedup_key=key,
+            payload=payload,
+            source_tool_call_ids=calls,
+        )
+
+    max_age = deps.rules.rules.data_quality.freshness.option_quote_max_age_seconds
+    # await_order_work must answer before the CLI's per-call timeout (proxy margin kept).
+    await_cap = upstream_timeout_seconds(deps.settings.MCP_TOOL_TIMEOUT) - 5.0
+    return OrderWorkRunner(
+        max_await_seconds=await_cap,
+        # A `none` rule has no age limit; TBD (or any marker but none) fails every quote.
+        quote_max_age_seconds=max_age
+        if isinstance(max_age, int)
+        else None
+        if max_age is RuleMarker.NONE
+        else 0,
+        timing=walk.timing(),
+        partial_fill=walk.partial_fill,
+        instruments=lambda iid: load_run_evidence(deps.conn, deps.run_id).instrument(iid),
+        run_control=deps.run_control,
+        clock=deps.clock,
+        events=record,
+    )
 
 
 async def _run_client(
@@ -1403,14 +1589,26 @@ async def _run_client_with(
     direct = [s.name for s in deps.plan.servers]
     eligible = result.eligibility is not None and result.eligibility.eligible
     gate = OutputRepairGate()
+    runner = _order_work_runner(deps, upstreams)
     options = build_session_options(
-        deps, withholding, upstreams, account_eligible=eligible, output_gate=gate, loopback=loopback
+        deps,
+        withholding,
+        upstreams,
+        account_eligible=eligible,
+        output_gate=gate,
+        loopback=loopback,
+        runner=runner,
     )
+    if runner is not None:
+        # ADR-0066: jobs outlive no session; leaving waits for each (latch: one cancel).
+        await stack.enter_async_context(runner)
     if loopback is not None:
         await stack.enter_async_context(loopback.app.running())
     # ADR-0063: a Mignon-only source is not in the session, so the init check skips it.
     in_session = options.mcp_servers if isinstance(options.mcp_servers, dict) else {}
     configured = [*direct, *(n for n in upstreams if n in in_session), LOCAL_SERVER_NAME]
+    if runner is not None:
+        configured.append(ORDER_WORK_SERVER)
     transport = deps.transport_factory(options) if deps.transport_factory else None
     client = ClaudeSDKClient(options, transport=transport)
     try:
@@ -1423,7 +1621,7 @@ async def _run_client_with(
         if ROBINHOOD in result.withheld or deps.run_control.stop_requested:
             result.status = SessionStatus.NOT_STARTED
             return
-        await _converse(client, deps, configured, withholding, result, gate)
+        await _converse(client, deps, configured, withholding, result, gate, runner)
         result.status = (
             SessionStatus.STOPPED
             if deps.run_control.stop_requested
@@ -1436,6 +1634,9 @@ async def _run_client_with(
         result.error = f"session failed ({type(exc).__name__})"
         result.error_details = (deps.redactor.redact_text(f"{type(exc).__name__}: {exc}"),)
     finally:
+        if runner is not None:
+            # ADR-0066: no job outlives its agent; after a normal end none is running.
+            runner.halt()
         with contextlib.suppress(Exception), anyio.move_on_after(DISCONNECT_TIMEOUT_SECONDS):
             await client.disconnect()
 

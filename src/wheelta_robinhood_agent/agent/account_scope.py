@@ -125,8 +125,11 @@ ROBINHOOD_ACCOUNT_SCOPE: Mapping[str, AccountScopeSpec] = MappingProxyType(
 # Servers whose tools are never account-scoped: Wheelta is read-only market data (§10); Tavily
 # is public web search (ADR-0058); the local server's tools read only this run's already
 # account-scoped ledger evidence and take no account argument (web_cache_lookup,
-# get_decision_facts).
-_UNSCOPED_SERVERS = frozenset({WHEELTA, TAVILY, LOCAL_SERVER_NAME})
+# get_decision_facts). ADR-0066: the order-work server takes no account argument; the
+# executor's Robinhood calls are scoped like any other (agent/order_walk.py). Spelled out:
+# order_walk imports this module; tests pin it to ORDER_WORK_SERVER.
+ORDER_WORK_SERVER_NAME = "wra_orders"
+_UNSCOPED_SERVERS = frozenset({WHEELTA, TAVILY, LOCAL_SERVER_NAME, ORDER_WORK_SERVER_NAME})
 
 
 def account_scope_for(

@@ -95,6 +95,7 @@ from wheelta_robinhood_agent.domain.facts_compute import (
     WorkingOrder,
 )
 from wheelta_robinhood_agent.domain.options import OccSymbol
+from wheelta_robinhood_agent.domain.order_walk import TickSchedule
 from wheelta_robinhood_agent.domain.run_record import Quote
 
 # --------------------------------------------------------------------------------------------
@@ -289,7 +290,8 @@ def map_option_instruments(
 
     OCC symbol from `chain_symbol`, `expiration_date`, `type`, and `strike_price`; broker ID
     from `id`; underlying is `chain_symbol`; `multiplier` from `trade_value_multiplier`
-    (verified in the capture). `min_ticks` is schema-checked (positive); `tick_increment` is
+    (verified in the capture). `min_ticks` is schema-checked (positive) and carried whole as
+    `tick_schedule` (ADR-0066); `tick_increment` is
     carried only when `above_tick == below_tick` (one tick at every price), else None, because
     a price-dependent tick cannot be stated as one increment. An instrument that is not
     `active`/`tradable` or whose `underlying_type` is not `equity` yields a gap, because
@@ -341,6 +343,11 @@ def map_option_instruments(
                     multiplier=multiplier,
                     tick_increment=(
                         ticks.above_tick if ticks.above_tick == ticks.below_tick else None
+                    ),
+                    tick_schedule=TickSchedule(
+                        above_tick=ticks.above_tick,
+                        below_tick=ticks.below_tick,
+                        cutoff_price=ticks.cutoff_price,
                     ),
                 )
             )

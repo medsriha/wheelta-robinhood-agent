@@ -20,12 +20,18 @@ from wheelta_robinhood_agent.agent.mignons import (
     parse_agent_name,
     role_of,
 )
+from wheelta_robinhood_agent.agent.order_walk import (
+    ORDER_WORK_REGISTRY,
+    ORDER_WORK_SERVER,
+    QUALIFIED_AWAIT_TOOL,
+    QUALIFIED_WORK_TOOL,
+)
 from wheelta_robinhood_agent.config.rules import RuleMarker, load_rules
 from wheelta_robinhood_agent.domain.enums import MignonType, ToolTier
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 from wheelta_robinhood_agent.integrations.wheelta.registry import WHEELTA_REGISTRY
 
-REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, LOCAL_REGISTRY)
+REGISTRIES = (ROBINHOOD_REGISTRY, WHEELTA_REGISTRY, LOCAL_REGISTRY, ORDER_WORK_REGISTRY)
 KNOWN = {r.qualified(t.name): (r, t) for r in REGISTRIES for t in r.tools} | {
     name: None for name in (DELEGATION_TOOL, *WEB_TOOLS)
 }
@@ -62,11 +68,28 @@ def test_orchestrator_reads_no_web_and_delegates() -> None:
     assert f"mcp__wra_local__{FACTS_TOOL_NAME}" in tools  # the spelled-out name matches
 
 
+# ADR-0066: only the order-walk executor reviews and places; no role holds them.
+EXECUTOR_ONLY = frozenset({"review_option_order", "place_option_order"})
+
+
 def test_every_account_scoped_read_belongs_to_the_orchestrator_only() -> None:
     for name, spec in ROBINHOOD_ACCOUNT_SCOPE.items():
-        if spec.scope is AccountScope.VERIFIED:
+        if spec.scope is AccountScope.VERIFIED and name not in EXECUTOR_ONLY:
             qualified = ROBINHOOD_REGISTRY.qualified(name)
             assert qualified in ROLE_TOOLS[Role.ORCHESTRATOR], name
+
+
+def test_review_and_place_belong_to_no_role() -> None:
+    for role in Role:
+        for name in EXECUTOR_ONLY:
+            assert ROBINHOOD_REGISTRY.qualified(name) not in ROLE_TOOLS[role], (role, name)
+
+
+def test_orchestrator_holds_the_order_work_tools_and_mignons_do_not() -> None:
+    """The spelled-out names in agent/mignons.py match agent/order_walk.py."""
+    assert {QUALIFIED_WORK_TOOL, QUALIFIED_AWAIT_TOOL} <= ROLE_TOOLS[Role.ORCHESTRATOR]
+    for role in MIGNON_ROLES:
+        assert not any(f"__{ORDER_WORK_SERVER}__" in t for t in ROLE_TOOLS[role])
 
 
 def test_role_of_accepts_only_mignon_types_on_allowed_models() -> None:

@@ -905,7 +905,7 @@ def test_determinism_with_and_without_output() -> None:
     assert input_hash(changed, None) != input_hash(context, None)
     raw = canonical_json(assemble_run_record(context, out))
     assert raw.startswith(
-        b'{"assembler_version":"assembler.v3","cancellation_rationales":[],"cancellations":[]'
+        b'{"assembler_version":"assembler.v4","cancellation_rationales":[],"cancellations":[]'
     )
 
 

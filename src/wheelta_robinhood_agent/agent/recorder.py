@@ -54,10 +54,12 @@ class ToolEventRecorder(Protocol):
         requested_at: datetime,
         agent_id: str | None = None,
         agent_type: str | None = None,
+        parent_tool_call_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
         """Persist the identity and `requested` event; return the tool_call_id.
 
         `agent_id`/`agent_type` attribute a Mignon's call (ADR-0025); None: the orchestrator.
+        `parent_tool_call_id` attributes an order-walk executor call to its job (ADR-0066).
         """
         ...
 
@@ -140,6 +142,7 @@ class LedgerToolEventRecorder:
         requested_at: datetime,
         agent_id: str | None = None,
         agent_type: str | None = None,
+        parent_tool_call_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
         ref = ledger_tool_calls.record_tool_call_requested(
             self._conn,
@@ -153,6 +156,7 @@ class LedgerToolEventRecorder:
             requested_at=requested_at,
             agent_id=agent_id,
             agent_type=agent_type,
+            parent_tool_call_id=parent_tool_call_id,
         )
         return ref.tool_call_id
 

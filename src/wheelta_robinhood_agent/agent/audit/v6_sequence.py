@@ -6,10 +6,14 @@
    the full target close.
 3. After any place/cancel error, timeout, or unknown outcome, no later placement is dispatched.
 4. Missing events, overlapping calls, or unknown terminal state are unverifiable.
+5. ADR-0066: each order-work job's placements number at most `orders.walk.max_steps`, are
+   all dispatched within `window_seconds` of the job's acceptance, and step monotonically
+   from its `start_price` toward its `worst_price` without passing it.
 Off mode: the whole check is unverifiable (`dry_run_no_execution`).
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 from wheelta_robinhood_agent.agent.audit._common import (
     MUTATION_TOOLS,
@@ -42,6 +46,7 @@ def check_v6(ctx: AuditContext) -> tuple[AuditFinding, ...]:
         out.unknown("all", Reason.DRY_RUN_NO_EXECUTION, "no order sequence exists in dry run")
         return out.result()
     _missing_events(ctx, out)
+    _order_walks(ctx, out)
     attempts = [a for a in live_attempts(ctx)]
     if not attempts:
         out.ok("all", "no placements")
@@ -73,6 +78,86 @@ def _missing_events(ctx: AuditContext, out: Findings) -> None:
                 "order intent without its recorded place call",
                 tool_call_ids=(order.intent.place_tool_call_id,),
             )
+
+
+def _decimal(value: object) -> Decimal | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        price = Decimal(value)
+    except InvalidOperation:
+        return None
+    return price if price.is_finite() else None
+
+
+def _order_walks(ctx: AuditContext, out: Findings) -> None:
+    """V6.5 (module docstring). The job's own call records its request and its acceptance."""
+    walk = ctx.rules.orders.walk
+    for work in ctx.tool_calls:
+        if work.identity.tool != "work_option_order" or work.identity.parent_tool_call_id:
+            continue
+        work_id = work.identity.tool_call_id
+        places = sorted(
+            (
+                c
+                for c in ctx.tool_calls
+                if c.identity.parent_tool_call_id == work_id
+                and c.identity.tool == "place_option_order"
+                and c.dispatched_at is not None
+            ),
+            key=lambda c: (c.dispatched_at, c.identity.tool_call_id),
+        )
+        if not places:
+            continue
+        ids = tuple(c.identity.tool_call_id for c in places)
+        args = work.effective_arguments_redacted or work.identity.arguments_redacted
+        start, worst = _decimal(args.get("start_price")), _decimal(args.get("worst_price"))
+        selling = args.get("side") == OrderSide.SELL_TO_OPEN.value
+        accepted = work.completed_at
+        prices = [
+            _decimal((c.effective_arguments_redacted or c.identity.arguments_redacted).get("price"))
+            for c in places
+        ]
+        if start is None or worst is None or accepted is None or None in prices:
+            out.unknown(
+                "5",
+                Reason.MISSING_EVIDENCE,
+                "the job's request, acceptance, or step prices are not recorded",
+                tool_call_ids=(work_id, *ids),
+            )
+            continue
+        steps = [p for p in prices if p is not None]
+        window_end = accepted + timedelta(seconds=walk.window_seconds)
+        late = [c for c in places if c.dispatched_at is not None and c.dispatched_at > window_end]
+        lo, hi = (worst, start) if selling else (start, worst)
+        pairs = zip(steps, steps[1:], strict=False)
+        monotone = all((a > b) if selling else (a < b) for a, b in pairs)
+        if len(steps) > walk.max_steps:
+            out.bad(
+                "5",
+                "the job placed more steps than orders.walk.max_steps",
+                rule_key="orders.walk.max_steps",
+                rule_value=walk.max_steps,
+                observed=len(steps),
+                tool_call_ids=(work_id, *ids),
+            )
+        elif late:
+            out.bad(
+                "5",
+                "a step was placed after the job's window",
+                rule_key="orders.walk.window_seconds",
+                rule_value=walk.window_seconds,
+                tool_call_ids=(work_id, *(c.identity.tool_call_id for c in late)),
+            )
+        elif not monotone or any(not lo <= p <= hi for p in steps):
+            out.bad(
+                "5",
+                "step prices are not monotone between start_price and worst_price",
+                observed=",".join(str(p) for p in steps),
+                tool_call_ids=(work_id, *ids),
+            )
+        else:
+            out.ok("5", "the job stayed within its window, steps, and prices", tool_call_ids=ids)
 
 
 def _at(attempt: AuditAttempt) -> datetime:

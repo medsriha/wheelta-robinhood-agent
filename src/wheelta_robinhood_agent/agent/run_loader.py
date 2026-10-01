@@ -13,7 +13,8 @@ Loader decisions (documented, not guessed values):
   that execute orders (venue `broker`, ADR-0034, or `simulated`, ADR-0038) load every order
   the run placed or observed (`ledger.orders.run_order_records`), for assembly and the audit.
 - `attempt_evidence` links each dispatched place call to the latest pre-dispatch evidence of
-  this run, by a fixed rule: the delivered quote of the placed instrument (`legs[0].option_id`)
+  this run, by a fixed rule: the quote of the placed instrument (`legs[0].option_id`) from a
+  quote or chain read (never one echoed by an order review), delivered or the executor's own
   and the delivered account snapshot whose source calls all completed at or before the
   dispatch, latest by completion then `as_of`. None found leaves the link empty (V2/V3
   unverifiable), never a later or another instrument's quote.
@@ -41,6 +42,7 @@ from typing import Any
 
 import psycopg
 
+from wheelta_robinhood_agent.agent.audit._common import QUOTE_TOOLS
 from wheelta_robinhood_agent.agent.audit.context import (
     AuditContext,
     BrokerState,
@@ -56,6 +58,12 @@ from wheelta_robinhood_agent.agent.model_view import (
     ORDER_CALL_REF_KEY,
     is_model_view,
     model_view,
+)
+from wheelta_robinhood_agent.agent.order_walk import (
+    AWAIT_TOOL,
+    ORDER_WORK_SERVER,
+    WORK_TOOL,
+    work_id_of,
 )
 from wheelta_robinhood_agent.agent.result_boundary import (
     evidence_ref_for,
@@ -192,8 +200,58 @@ def _order_call_ref(
     )
 
 
+def _order_work_ref(
+    envelope: Mapping[str, Any], run_id: uuid.UUID, scope: str
+) -> DeliveredRef | None:
+    """The job ref a delivered `work_option_order`/`await_order_work` envelope carried
+    (ADR-0066): its `work_ref` names the job's own `work_option_order` call."""
+    if envelope.get("server") != ORDER_WORK_SERVER or envelope.get("tool") not in (
+        WORK_TOOL,
+        AWAIT_TOOL,
+    ):
+        return None
+    data = envelope.get("data")
+    work = data.get("order_work") if isinstance(data, dict) else None
+    ref = work.get("work_ref") if isinstance(work, dict) else None
+    job_id = work_id_of(ref)
+    if job_id is None or not isinstance(ref, str):
+        return None
+    if envelope.get("tool") == WORK_TOOL and envelope.get("tool_call_id") != str(job_id):
+        return None  # a start result names its own call, never another
+    return DeliveredRef(
+        ref=ref,
+        kind=RefKind.ORDER_WORK,
+        run_id=run_id,
+        account_scope_id=scope,
+        delivered=True,
+        tool_call_id=job_id,
+    )
+
+
+def _executor_envelopes(conn: Conn, run_id: uuid.UUID) -> list[Mapping[str, Any]]:
+    """Validated envelopes of the order-walk executor's own reads (ADR-0066). Never delivered
+    to the model, so they add no citable ref; they are the evidence its orders rest on."""
+    executor = {
+        r.identity.tool_call_id for r in tool_call_records(conn, run_id) if r.identity.by_executor
+    }
+    if not executor:
+        return []
+    results = ledger_evidence.effective(ledger_evidence.results_for_run(conn, run_id))
+    return [
+        r.payload
+        for r in results
+        if r.kind is ledger_evidence.ResultKind.VALIDATED
+        and r.tool_call_id in executor
+        and isinstance(r.payload, dict)
+    ]
+
+
 def load_delivered(conn: Conn, meta: RunMeta, book: PositionBook | None) -> DeliveredEvidence:
-    """Code-issued references delivered in this run (tool results and the rendered book)."""
+    """Code-issued references delivered in this run (tool results and the rendered book).
+
+    ADR-0066: quotes, instruments, snapshots, and reviews also come from the order-walk
+    executor's validated reads: the evidence the decision-maker of each call saw (the
+    model's deliveries, or the executor's own reads). Its calls add no reference."""
     refs: dict[str, DeliveredRef] = {}
     quotes: dict[uuid.UUID, Quote] = {}
     instruments: dict[str, InstrumentFact] = {}
@@ -206,6 +264,10 @@ def load_delivered(conn: Conn, meta: RunMeta, book: PositionBook | None) -> Deli
         order_ref = _order_call_ref(envelope, meta.run_id, scope)
         if order_ref is not None:
             refs[order_ref.ref] = order_ref
+        work_ref = _order_work_ref(envelope, meta.run_id, scope)
+        if work_ref is not None:
+            refs[work_ref.ref] = work_ref
+            continue
         if envelope.get("server") == LOCAL_SERVER_NAME and envelope.get("tool") == (
             FACTS_TOOL_NAME
         ):
@@ -260,6 +322,27 @@ def load_delivered(conn: Conn, meta: RunMeta, book: PositionBook | None) -> Deli
                 candidate_origin=candidate.origin,
                 source_evidence_ids=(candidate.instrument_evidence_id,),
             )
+    for envelope in _executor_envelopes(conn, meta.run_id):
+        mapped = mapped_evidence_of(envelope)
+        if mapped is None:
+            continue
+        for quote in mapped.option_quotes:
+            quotes[quote.quote_id] = quote
+        for inst in mapped.instruments:
+            instruments.setdefault(
+                inst.broker_instrument_id,
+                InstrumentFact(
+                    broker_instrument_id=inst.broker_instrument_id,
+                    occ_symbol=inst.occ_symbol,
+                    multiplier=inst.multiplier,
+                    tick_increment=inst.tick_increment,
+                    source_tool_call_id=inst.source_tool_call_ids[0],
+                ),
+            )
+        for snap in mapped.account_snapshots:
+            snapshots[snap.snapshot_id] = snap.tool_call_ids
+        for review in mapped.order_reviews:
+            reviews[review.evidence_id] = review
     for entry in book.entries if book else ():
         current = entry.current_instruments[0] if len(entry.current_instruments) == 1 else None
         refs[entry.position_ref] = DeliveredRef(
@@ -317,6 +400,11 @@ def attempt_evidence(
             (done, q.as_of, q.quote_id)
             for q in delivered.quotes
             if q.broker_instrument_id == iid
+            # A quote echoed inside an order review is not a quote read (V2.1): the order
+            # walk reviews after it re-quotes, so the review's copy would always be latest.
+            and all(
+                i in calls and calls[i].identity.tool in QUOTE_TOOLS for i in q.source_tool_call_ids
+            )
             and (done := _completed(calls, q.source_tool_call_ids)) is not None
             and done <= at
         ]
@@ -577,7 +665,14 @@ def check_references(
     context = load_assembly_context(conn, meta, terminated_at=as_of, book=book, output_id=None)
     record = assemble_run_record(context, decisions)
     citable = frozenset(r.ref for r in context.refs if r.kind is RefKind.TOOL_CALL)
-    return reference_issues(record, citable)
+    # ADR-0066: an executor call is cited through its job's delivered `order_work:` ref.
+    jobs = {r.tool_call_id: r.ref for r in context.refs if r.kind is RefKind.ORDER_WORK}
+    work_of = {
+        call.identity.tool_call_id: jobs[call.identity.parent_tool_call_id]
+        for call in context.tool_calls
+        if call.identity.parent_tool_call_id in jobs
+    }
+    return reference_issues(record, citable, work_of)
 
 
 def load_audit_context(
