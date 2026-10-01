@@ -486,12 +486,19 @@ def test_boundary_validates_real_fixtures(
 
 
 def test_boundary_keeps_unregistered_tools_missing() -> None:
+    envelope = _validate("get_equity_historicals", {"historicals": []})
+    assert envelope.kind is EnvelopeKind.MISSING
+
+
+def test_equity_orders_are_context_never_evidence() -> None:
+    """ADR-0060: delivered as context; no fact reads equity orders, so no evidence ref."""
     envelope = _validate(
         "get_equity_orders",
         _data("get_equity_orders.empty_account.json"),
         account_number="****1234",
     )
-    assert envelope.kind is EnvelopeKind.MISSING
+    assert envelope.kind is EnvelopeKind.VALIDATED
+    assert mapped_evidence_of(envelope.model_dump(mode="json")) is None
 
 
 def test_boundary_turns_malformed_orders_into_missing() -> None:

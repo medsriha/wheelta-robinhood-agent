@@ -144,7 +144,10 @@ from wheelta_robinhood_agent.integrations.websearch.registry import (
 from wheelta_robinhood_agent.integrations.websearch.registry import (
     SERVER_NAME as TAVILY,
 )
-from wheelta_robinhood_agent.integrations.websearch.results import extracted_urls
+from wheelta_robinhood_agent.integrations.websearch.results import (
+    extracted_urls,
+    leaves_urls_requestable,
+)
 from wheelta_robinhood_agent.integrations.wheelta.board_filters import (
     FILTERS_ARG,
     BoardFilterError,
@@ -718,6 +721,9 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
     run_refs: set[str] = set()
     # ADR-0056/0058: URLs (`_url_key`) a tavily_extract returned no content for, or failed on.
     refused_urls: set[str] = set()
+    # ADR-0060: URLs whose extract hit a rate limit or server error once; a second such
+    # failure refuses them like any other.
+    retried_urls: set[str] = set()
     # ADR-0047: reports under repair, by Mignon `agent_id`.
     drafts: dict[str, _MignonDraft] = {}
     ws = deps.rules.workspace
@@ -1253,8 +1259,16 @@ def build_hooks(deps: HookDeps) -> dict[HookEvent, list[HookMatcher]]:
         is_extract = call.server == TAVILY and call.tool == EXTRACT_TOOL
         if not isinstance(envelope, Mapping) or envelope.get("kind") != EnvelopeKind.VALIDATED:
             if is_extract:
-                # A failed extract (cap, timeout, schema): its URLs are not retried this run.
-                refused_urls.update(_url_key(u) for u in _extract_urls(call.effective_input))
+                urls = {_url_key(u) for u in _extract_urls(call.effective_input)}
+                gaps = envelope.get("gaps") if isinstance(envelope, Mapping) else None
+                if leaves_urls_requestable(gaps):
+                    # ADR-0060: a rate limit or server error says nothing about the URLs;
+                    # each may be requested once more.
+                    refused_urls.update(urls & retried_urls)
+                    retried_urls.update(urls)
+                else:
+                    # A failed extract (cap, schema, bad request): not retried this run.
+                    refused_urls.update(urls)
             return
         refs: set[str] = set()
         _refs_in(envelope.get("data"), refs)

@@ -9,8 +9,9 @@ docs/DATA_QUALITY.md "Delivery and failure contract"; CLAUDE.md §2.3-2.4, §8, 
   is enabled since ADR-0058; `Agent` hand-backs are validated in hooks.py).
 - **Tavily** (ADR-0058, `integrations/websearch/results.py`): only a search/extract payload
   is delivered, normalized and labelled untrusted web content, with no evidence ref. Anything
-  else (a cap notice, a changed shape) is `missing` with a fixed gap, and a tool error never
-  carries Tavily's own text: web-facing text is untrusted (CLAUDE.md §11, §24).
+  else (a cap notice, an HTTP error, a changed shape) is `missing` with a code-written
+  diagnosis of the root cause and next step (ADR-0060), and a tool error never carries
+  Tavily's own text: web-facing text is untrusted (CLAUDE.md §11, §24).
 - **Remote MCP tools** (Robinhood, Wheelta): a result is `validated` only if a verified
   `EvidenceMapper` exists for that exact (server, tool). The mapper normalizes the payload
   into typed evidence (`MappedEvidence`) with code-issued evidence IDs and candidate refs.
@@ -19,8 +20,10 @@ docs/DATA_QUALITY.md "Delivery and failure contract"; CLAUDE.md §2.3-2.4, §8, 
   MCP `isError` results become `error` envelopes.
 
 `VERIFIED_MAPPERS` holds only the Robinhood tools whose results were captured as scrubbed
-fixtures (ADR-0017; `robinhood_mappers.py`). Every other Robinhood/Wheelta result stays
-`missing`. Tests inject fixture mappers for fake servers.
+fixtures (ADR-0017; `robinhood_mappers.py`). `CONTEXT_ONLY_TOOLS` are delivered as redacted
+context without an evidence ref (ADR-0026, ADR-0041, ADR-0060; scanner catalogs are cut to
+fit by `project_catalog`). Every other Robinhood/Wheelta result stays `missing`. Tests inject
+fixture mappers for fake servers.
 
 The shape of `tool_response` for MCP tools in the PostToolUse hook input is itself unverified
 against the pinned CLI; `extract_mcp_payload` accepts the documented MCP `CallToolResult`
@@ -84,6 +87,7 @@ from wheelta_robinhood_agent.integrations.websearch.registry import (
 )
 from wheelta_robinhood_agent.integrations.websearch.results import (
     TavilyResultError,
+    diagnose_error,
     normalize_result,
 )
 from wheelta_robinhood_agent.integrations.wheelta.registry import (
@@ -104,6 +108,11 @@ def evidence_ref_for(tool_call_id: uuid.UUID) -> str:
 
 
 PREVIEW_SCAN_TOOL: Final = "preview_scan"
+FILTER_SPECS_TOOL: Final = "get_scanner_filter_specs"
+DATAPOINTS_TOOL: Final = "get_scanner_datapoints"
+CONTEXT_READ_TOOLS: Final = frozenset(
+    {FILTER_SPECS_TOOL, DATAPOINTS_TOOL, "search", "get_equity_orders"}
+)
 # ADR-0026: login-scoped workspace reads without a verified mapper reach the model as redacted
 # context, never as evidence (no evidence_ref, not citable, cannot support a number).
 # ADR-0041: every Wheelta tool but the board query is delivered the same way (read-only
@@ -113,6 +122,9 @@ CONTEXT_ONLY_TOOLS: Final = frozenset(
         *((ROBINHOOD_SERVER, tool) for tool in LOGIN_SCOPED_TOOLS),
         # ADR-0041: the Robinhood scanner fallback; market data, projected like run_scan.
         (ROBINHOOD_SERVER, PREVIEW_SCAN_TOOL),
+        # ADR-0060: how to build a scan, instrument search, and equity orders. Reads whose
+        # shapes were captured 2026-10-01 but that no fact uses.
+        *((ROBINHOOD_SERVER, tool) for tool in CONTEXT_READ_TOOLS),
         *(
             (WHEELTA_SERVER, t.name)
             for t in WHEELTA_REGISTRY.tools
@@ -216,11 +228,13 @@ class BoundaryValidator:
         except (PayloadError, TypeError, ValueError) as exc:
             return self._invalid(request, EnvelopeKind.ERROR, f"unrecognized result: {exc}")
         if kind is PayloadKind.TOOL_ERROR:
-            gap = (
-                TAVILY_ERROR_GAP
-                if request.server == TAVILY_SERVER
-                else self._tool_error_gap(payload)
-            )
+            if request.server == TAVILY_SERVER:
+                # ADR-0060: a recognized Tavily error object gets its code-written diagnosis;
+                # anything else the fixed gap. Tavily's own text is never delivered.
+                diagnosed = diagnose_error(request.tool, payload)
+                gap = str(diagnosed) if diagnosed is not None else TAVILY_ERROR_GAP
+            else:
+                gap = self._tool_error_gap(payload)
             return self._invalid(request, EnvelopeKind.ERROR, gap)
         redacted = self.redactor.redact(payload)
         if request.server == LOCAL_SERVER_NAME:
@@ -240,6 +254,9 @@ class BoundaryValidator:
             if request.tool in (RUN_SCAN_TOOL, PREVIEW_SCAN_TOOL):
                 context, scan_gaps = project_scan(context)
                 gaps += scan_gaps
+            elif request.tool in _CATALOG_LISTS:
+                context, catalog_gaps = project_catalog(request.tool, context)
+                gaps += catalog_gaps
             return self._envelope(
                 request,
                 EnvelopeKind.VALIDATED,
@@ -413,6 +430,57 @@ def project_scan(payload: JsonValue) -> tuple[JsonValue, tuple[str, ...]]:
     gap = (
         f"run_scan: showing the first {len(kept)} of {len(rows)} rows in the scan's own order "
         "(delivery size limit)"
+    )
+    return projected, (gap,)
+
+
+# ADR-0060: scanner catalog entries delivered per call; the proxy's MAX_DELIVERED_CHARS also
+# has to fit the envelope, the catalog's other keys, and its guide.
+CATALOG_CONTEXT_BUDGET_CHARS: Final = 20_000
+# Catalog tool -> the list under `data` that is cut to fit (captured 2026-10-01).
+_CATALOG_LISTS: Final[Mapping[str, str]] = MappingProxyType(
+    {FILTER_SPECS_TOOL: "filter_specs", DATAPOINTS_TOOL: "datapoints"}
+)
+_CATALOG_NARROWER: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        FILTER_SPECS_TOOL: "",
+        DATAPOINTS_TOOL: (
+            "; call again with a narrower category (technical, price_volume, fundamental, "
+            "options, volatility, quote, descriptive) rather than function or field"
+        ),
+    }
+)
+
+
+def project_catalog(tool: str, payload: JsonValue) -> tuple[JsonValue, tuple[str, ...]]:
+    """A scanner catalog (`get_scanner_filter_specs`, `get_scanner_datapoints`) trimmed to fit
+    delivery (ADR-0060). Pure, deterministic.
+
+    Keeps the tool's `guide` (it says how to use the entries) and every other key, and, in
+    the tool's own order, as many entries of the catalog list as fit
+    `CATALOG_CONTEXT_BUDGET_CHARS`, with a gap naming how many were kept and how to ask for
+    fewer. A payload of any other shape is returned unchanged; the proxy's size cap applies.
+    """
+    key = _CATALOG_LISTS[tool]
+    data = payload.get("data") if isinstance(payload, dict) else None
+    entries = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(payload, dict) or not isinstance(data, dict) or not isinstance(entries, list):
+        return payload, ()
+    rest = {**payload, "data": {k: v for k, v in data.items() if k != key}}
+    used = len(json.dumps(rest, sort_keys=True))
+    kept: list[JsonValue] = []
+    for entry in entries:
+        size = len(json.dumps(entry, sort_keys=True)) + 2
+        if used + size > CATALOG_CONTEXT_BUDGET_CHARS:
+            break
+        kept.append(entry)
+        used += size
+    projected: JsonValue = {**payload, "data": {**data, key: kept}}
+    if len(kept) == len(entries):
+        return projected, ()
+    gap = (
+        f"{tool}: showing the first {len(kept)} of {len(entries)} {key} in the tool's own "
+        f"order (delivery size limit){_CATALOG_NARROWER[tool]}"
     )
     return projected, (gap,)
 

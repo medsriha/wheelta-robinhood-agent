@@ -1,0 +1,248 @@
+{
+ "provenance": {
+  "tool": "get_scanner_datapoints",
+  "arguments": {
+   "category": "descriptive"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "local dry run 1ce6d88e (read-only call through the validating proxy); the redacted raw payload from the ledger",
+  "scrubbing": "public scanner catalog; no account data"
+ },
+ "data": {
+  "data": {
+   "categories": [
+    {
+     "name": "Aggregated Options",
+     "aliases": [
+      "aggregated options",
+      "option",
+      "options"
+     ],
+     "description": "Options activity rolled up onto the underlying, so an equity scan can screen on it: volume (optionsCallVolume, optionsPutVolume, optionsTotalDayVolume) and open interest (optionsCall/Put/TotalOpenInterest) with their averages (…Avg, …Avg10Day), premium traded (optionsDayPremium), and contract conventions (optionsExpirationStyles, optionsSettlementStyles). Ratios like put/call are built by dividing two of these.",
+     "datapoint_count": 46
+    },
+    {
+     "name": "Descriptive",
+     "aliases": [
+      "descriptive"
+     ],
+     "description": "Instrument identity and calendar helpers rather than market data: symbol, type, description, country, currency, officialPlaceOfListing, tradingStatus, halt times, plus date arithmetic (nowYMD, days, daysFromNow) used to turn the fundamental.*Ymd date fields into day counts.",
+     "datapoint_count": 12
+    },
+    {
+     "name": "Fundamental",
+     "aliases": [
+      "fundamental",
+      "fundamentals"
+     ],
+     "description": "Company financials, valuation ratios and calendar facts, all prefixed fundamental.*: size and valuation (marketCap, peRatio, forwardPeRatio, enterpriseValue, priceBookRatio), earnings and growth (eps, dilutedEps, annualEpsGrowth, revenue), balance sheet and cash flow (cash, currentDebt, bookValuePerShare, cashFlowFreePerShare), dividends (dps, cashDividend, forwardDividendYield), risk (beta), classification (sector, industry, morningstarSectorLabel) and dates (earningsYmd, exYmd).",
+     "datapoint_count": 65
+    },
+    {
+     "name": "Price",
+     "aliases": [
+      "price",
+      "price volume"
+     ],
+     "description": "Traded price and its movement: current and session prices (tradeAllDay.price, dayOpenPrice, dayHighPrice, dayLowPrice, close, vwap), moving averages of price (closeAvg, closeEma), and change measures both absolute and as ratios (changeFromCloseAllDay, changeFromOpen, changeFromHigh/Low, changeFromPrevDay, changeIn5Day, gap*). Use the *Ratio variants for percentage screens.",
+     "datapoint_count": 64
+    },
+    {
+     "name": "Quote",
+     "aliases": [
+      "quote"
+     ],
+     "description": "Current bid and ask, all prefixed quote.*: askPrice, bidPrice, askSize, bidSize, spread, and their timestamps. Use these for liquidity and spread screens.",
+     "datapoint_count": 8
+    },
+    {
+     "name": "Technical Indicator",
+     "aliases": [
+      "indicator",
+      "indicators",
+      "technical",
+      "technical indicator"
+     ],
+     "description": "Chart studies computed from candles: momentum and oscillators (rsi, commodityChannelIndex, relativeVolatilityIndex, stochastic), trend (adx, macd, aroonUp/Down, alligator*, linearRegression*), ranges and bands (atr, bollingerBandUp/Down), pivots and distances (distanceFrom200DaySma, distanceFromPivot*), plus cross() for crossovers. Most take candleCount or timePeriod together with candlePeriod, so the same indicator can be evaluated over any horizon.",
+     "datapoint_count": 77
+    },
+    {
+     "name": "Volatility",
+     "aliases": [
+      "vol",
+      "volatility"
+     ],
+     "description": "How much the instrument moves, and options-implied expectations of it: implied volatility at the money across tenors (iv, atmIv30Day ... atmIv720Day, frontIV, backIV), where current IV sits in its own historical range (atmIv*PosInRange, useful for IV rank style screens), and realized measures (priceStandardDeviation, relativeVolatilityIndex).",
+     "datapoint_count": 65
+    },
+    {
+     "name": "Volume",
+     "aliases": [
+      "price volume",
+      "volume"
+     ],
+     "description": "Shares traded and its averages: dayVolume, volume, volumeAvg, volumeAvg10Day, volumeAvg10Minutes, volumeEma, volumePostMarket. Relative-volume screens are built by dividing dayVolume by a volumeAvg call rather than by a dedicated datapoint.",
+     "datapoint_count": 12
+    }
+   ],
+   "datapoints": [
+    {
+     "kind": "field",
+     "name": "country",
+     "examples": [
+      "\"US\"",
+      "\"JP\""
+     ],
+     "signature": "country: string",
+     "value_type": "string",
+     "description": "Country of origin (incorporation) of corresponding company or parent entity encoded as two-letter country code from ISO 3166-1 standard."
+    },
+    {
+     "kind": "field",
+     "name": "currency",
+     "examples": [
+      "\"USD\"",
+      "\"RUB\""
+     ],
+     "signature": "currency: string",
+     "value_type": "string",
+     "description": "Currency of quotation, pricing and trading encoded as three-letter currency code from ISO 4217 standard."
+    },
+    {
+     "kind": "function",
+     "name": "days",
+     "signature": "days(from: number, to: number): number",
+     "value_type": "number",
+     "description": "The number of calendar days between two dates in YYYYMMDD format."
+    },
+    {
+     "kind": "function",
+     "name": "daysFromNow",
+     "signature": "daysFromNow(date: number): number",
+     "value_type": "number",
+     "description": "The number of calendar days between the current date in the America/New_York timezone and the provided date in YYYYMMDD format."
+    },
+    {
+     "kind": "field",
+     "name": "description",
+     "examples": [
+      "\"AT&T Inc.\"",
+      "\"Bank of America Corporation Common Stock\""
+     ],
+     "signature": "description: string",
+     "value_type": "string",
+     "description": "Textual description of the instrument."
+    },
+    {
+     "kind": "field",
+     "name": "haltEndTime",
+     "signature": "haltEndTime: number",
+     "value_type": "number",
+     "description": "Timestamp when halt is finished and stock symbol became available."
+    },
+    {
+     "kind": "field",
+     "name": "haltStartTime",
+     "signature": "haltStartTime: number",
+     "value_type": "number",
+     "description": "Timestamp when this stock symbol became unavailable (halted or sales of other restrictions)."
+    },
+    {
+     "kind": "field",
+     "name": "nowYMD",
+     "signature": "nowYMD: number",
+     "value_type": "number",
+     "description": "The current date in YYYYMMDD format for the America/New_York timezone."
+    },
+    {
+     "kind": "field",
+     "name": "officialPlaceOfListing",
+     "examples": [
+      "\"XNAS\"",
+      "\"RTSX\""
+     ],
+     "signature": "officialPlaceOfListing: string",
+     "value_type": "string",
+     "description": "The organization that have listed this instrument encoded as Market Identifier Code (MIC) from ISO 10383 standard or custom dxFeed values."
+    },
+    {
+     "kind": "field",
+     "name": "symbol",
+     "examples": [
+      "\"AAPL\"",
+      "\".MSFT210416P220\""
+     ],
+     "signature": "symbol: string",
+     "value_type": "string",
+     "description": "Symbol of the instrument in [dxFeed Symbology](https://kb.dxfeed.com/en/data-model/symbology-guide.html)."
+    },
+    {
+     "kind": "field",
+     "name": "tradingStatus",
+     "signature": "tradingStatus: string",
+     "value_type": "string",
+     "description": "The current status of the stock symbol: whether it is being traded/halted or is subject of short sales restrictions."
+    },
+    {
+     "kind": "field",
+     "name": "type",
+     "signature": "type: string",
+     "value_type": "string",
+     "description": "The type of the instrument."
+    }
+   ],
+   "argument_types": [
+    {
+     "name": "CandlePeriod",
+     "note": "Candle granularity: the size of each candle, not how far back to look. rsi(candleCount=14, candlePeriod=\"1mo\") is RSI over 14 months, not 14 days.",
+     "values": [
+      "1m",
+      "2m",
+      "3m",
+      "4m",
+      "5m",
+      "10m",
+      "15m",
+      "30m",
+      "1h",
+      "2h",
+      "4h",
+      "1d",
+      "1w",
+      "1mo",
+      "1y"
+     ],
+     "argument_names": [
+      "candlePeriod"
+     ]
+    },
+    {
+     "name": "Session",
+     "note": "Which trading session is included: \"all\" covers extended and overnight trading, \"regular\" is regular hours only. Must be lowercase.",
+     "values": [
+      "all",
+      "regular"
+     ],
+     "argument_names": [
+      "session"
+     ]
+    },
+    {
+     "name": "TimePeriod",
+     "note": "Lookback duration: how far back to look. Accepts a strictly smaller set than candlePeriod - intraday values are invalid. Use either candleCount or timePeriod alongside candlePeriod, not both.",
+     "values": [
+      "1d",
+      "1w",
+      "1mo",
+      "1y"
+     ],
+     "argument_names": [
+      "timePeriod"
+     ]
+    }
+   ]
+  },
+  "guide": "Build an expression by copying a signature and filling its arguments: rsi(candleCount: number, candlePeriod: CandlePeriod, session: Session = \"all\") becomes rsi(candleCount=14, candlePeriod=\"1d\", session=\"all\"). Arguments are passed by name, string values are quoted, and an argument shown with a default may be omitted.\n\nAn argument type in UpperCamelCase has a fixed value set in argument_types — using a value outside it fails upstream, so check there rather than inferring. Read the note on CandlePeriod and TimePeriod before choosing: candlePeriod is the size of each candle, timePeriod is how far back to look, and confusing them silently changes what the screen measures.\n\nSome screens are composed rather than looked up: comparing two datapoints puts the whole comparison in the expression with predicate \"=\" and values [\"True\"] — \"put volume exceeds call volume\" is optionsPutDayVolume > optionsCallDayVolume, \"price above its average\" is tradeAllDay.price > closeAvg(...). Prefer that boolean form over dividing (optionsPutDayVolume / optionsCallDayVolume > 1): a division silently drops every instrument whose denominator is zero, which here are the most put-skewed names — the ones the screen exists to find. Composition is also the fallback when an enum filter covers the screen but not your variant — e.g. relative volume has an enum filter (FILTER_TYPE_RELATIVE_VOLUME), so only compose dayVolume / volumeAvg(...) for a lookback missing from its supported_lengths.\n\nScoping the universe to specific instruments uses the symbol field with a LIST predicate rather than a comparison, and the expression is the bare word symbol:\n- named tickers — predicate ANY_OF, values the tickers (\"only AAPL and MSFT\" is expression symbol, predicate ANY_OF, values [\"AAPL\", \"MSFT\"]).\n- members of an index — predicate IN_LIST, values index CODES, not tickers (\"S&P 500 stocks\" is expression symbol, predicate IN_LIST, values [\"SP500\"]). Several codes union: [\"SP500\", \"NDX\"] means in either index.\nThe two predicates are not interchangeable, and mixing them up fails in opposite ways: IN_LIST with a ticker is rejected upstream (\"list name 'AAPL' does not exist\"), while ANY_OF with an index code returns zero rows and no error at all. Valid index codes: SP100, SP400, SP500, SP500_SecIndicies, SP500_SecIndustrIndicies, SP600, DJI, NDX, NDXT25, Russell1000, Russell2000, Russell3000, RussellMidcap, RussellMicrocap, HGX, HXC, OSX, RUF, SOX, UTY, XAU, S5C. There is no code for the Nasdaq Composite: \"COMP\" resolves upstream but collides with the Compound (COMP) crypto symbol, so avoid it. A user's own watchlist or positions cannot be used as a scope.\n\nThe same expressions work as result COLUMNS (the columns parameter of preview_scan, create_scan and update_scan_config): a column displays the expression's value without screening on it. A boolean-comparison filter reads best with its operands as columns (e.g. the put-exceeds-call screen showing both volumes); the division that is wrong as a filter is fine as a column, where a zero denominator only blanks a cell instead of dropping the row.\n\nAlways validate an expression with preview_scan before saving it to a scan."
+ }
+}

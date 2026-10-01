@@ -467,6 +467,20 @@ def test_a_failed_or_timed_out_url_is_not_extracted_again_this_run() -> None:
     assert "not extracted again" in (denied_reason(out) or "")
 
 
+def test_a_rate_limited_url_may_be_extracted_once_more_then_is_refused() -> None:
+    """ADR-0060: a 429 says nothing about the page; the agent is told why and may retry once."""
+    s = web_session()
+    limited = {"error": "Extract failed", "detail": {"error": "blocked"}, "status": 429}
+    for use_id in ("toolu_r1", "toolu_r2"):
+        assert_ok(s.pre(EXTRACT, {"urls": [URL]}, use_id=use_id, **COMPANY))
+        out = s.post(EXTRACT, {"structuredContent": limited, "content": []}, use_id=use_id)
+        delivered = wire(out["hookSpecificOutput"]["updatedToolOutput"])
+        assert delivered["kind"] == "missing" and "HTTP 429" in delivered["gaps"][0]
+        assert "blocked" not in json.dumps(delivered)
+    out = s.pre(EXTRACT, {"urls": [URL]}, use_id="toolu_r3", **COMPANY)
+    assert "not extracted again" in (denied_reason(out) or "")
+
+
 def test_a_mignon_may_extract_a_page_another_mignon_extracted_but_not_repeat_its_own() -> None:
     """ADR-0056: a page is citable only by the Mignon that extracted it, so the cache does not
     deny another Mignon's extract of the same page; a Mignon's own repeat is denied."""

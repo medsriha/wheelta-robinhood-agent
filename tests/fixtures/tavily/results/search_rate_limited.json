@@ -1,0 +1,26 @@
+{
+ "provenance": {
+  "server": "tavily remote MCP (https://mcp.tavily.com/mcp/)",
+  "captured_on": "2026-10-01",
+  "captured_via": "local dry run 1ce6d88e with a development API key; the redacted raw payload from the ledger",
+  "tool": "tavily_search",
+  "arguments": {
+   "query": "Reuters Brazil election October 4 2026 first round runoff October 25 EWZ markets",
+   "max_results": 5,
+   "include_domains": [
+    "reuters.com"
+   ]
+  },
+  "note": "HTTP 429 from Tavily's API delivered as a successful (isError false) result: {error, detail, status, documentation}",
+  "scrubbing": "none needed: no account or personal data"
+ },
+ "isError": false,
+ "structuredContent": {
+  "error": "Search failed",
+  "detail": {
+   "error": "Your request has been blocked due to excessive requests. Please reduce the rate of requests. Verify you are using production API keys."
+  },
+  "status": 429,
+  "documentation": "https://docs.tavily.com/documentation/api-reference/endpoint/search"
+ }
+}

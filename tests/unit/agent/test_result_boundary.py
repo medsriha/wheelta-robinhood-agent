@@ -4,6 +4,7 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -294,7 +295,72 @@ def test_a_tavily_notice_instead_of_results_is_missing_and_kept_only_as_raw() ->
     notice = {"code": "monthly_cap_reached", "message": "Pay via x402", "next_actions": []}
     outcome = _tavily({"structuredContent": notice, "content": []}, "tavily_extract")
     assert outcome.envelope.kind is EnvelopeKind.MISSING
-    assert outcome.envelope.gaps == (
-        "tavily_extract: Tavily returned no results (code monthly_cap_reached)",
-    )
+    (gap,) = outcome.envelope.gaps
+    assert gap.startswith("tavily_extract: Tavily answered with a usage notice instead of results")
+    assert "(code monthly_cap_reached)" in gap and "do not call the web tools again" in gap
+    assert "x402" not in gap
     assert outcome.raw_redacted is not None  # restricted evidence, never delivered
+
+
+def test_a_tavily_http_error_is_diagnosed_without_its_text() -> None:
+    """ADR-0060: the 2026-10-01 429 (isError false) and the same body as an isError result."""
+    body = {
+        "error": "Search failed",
+        "detail": {"error": "Your request has been blocked. Verify you are using production"},
+        "status": 429,
+    }
+    for response, kind in (
+        ({"structuredContent": body, "content": []}, EnvelopeKind.MISSING),
+        ({"isError": True, "content": [{"type": "text", "text": json.dumps(body)}]},
+         EnvelopeKind.ERROR),
+    ):  # fmt: skip
+        envelope = _tavily(response).envelope
+        assert envelope.kind is kind
+        (gap,) = envelope.gaps
+        assert "rate-limited" in gap and "HTTP 429" in gap and "not an absence" in gap
+        assert "Verify" not in gap and "blocked" not in gap
+
+
+def test_robinhood_scanner_catalogs_search_and_equity_orders_are_context() -> None:
+    """ADR-0060: delivered redacted as context, never as evidence; catalogs cut to fit."""
+    from wheelta_robinhood_agent.agent.result_boundary import (
+        CATALOG_CONTEXT_BUDGET_CHARS,
+        CONTEXT_ONLY_GAP,
+    )
+
+    fixtures = Path(__file__).resolve().parents[2] / "fixtures" / "robinhood" / "results"
+
+    def deliver(tool: str, name: str) -> Any:
+        data = json.loads((fixtures / name).read_text())["data"]
+        return BoundaryValidator(redactor=Redactor())(_req("robinhood", tool, _text(data)))
+
+    for tool, name in (
+        ("get_scanner_filter_specs", "get_scanner_filter_specs.json"),
+        ("get_scanner_datapoints", "get_scanner_datapoints.descriptive.json"),
+        ("search", "search.EWZ.json"),
+        ("get_equity_orders", "get_equity_orders.empty_account.json"),
+    ):
+        envelope = deliver(tool, name).envelope
+        assert envelope.kind is EnvelopeKind.VALIDATED, tool
+        assert envelope.gaps == (CONTEXT_ONLY_GAP,), tool
+        assert envelope.data["context_only"] is True and "evidence_ref" not in envelope.data
+    specs = deliver("get_scanner_filter_specs", "get_scanner_filter_specs.json").envelope
+    payload = specs.data["payload"]
+    assert len(payload["data"]["filter_specs"]) == 56 and "Match filter_type" in payload["guide"]
+    # The function catalog (199 entries) is over the budget: cut in order, with a gap.
+    cut = deliver("get_scanner_datapoints", "get_scanner_datapoints.function.json").envelope
+    kept = cut.data["payload"]["data"]["datapoints"]
+    assert 0 < len(kept) < 199
+    assert len(json.dumps(cut.data["payload"])) <= CATALOG_CONTEXT_BUDGET_CHARS
+    assert cut.gaps[0] == CONTEXT_ONLY_GAP
+    assert cut.gaps[1].startswith(
+        f"get_scanner_datapoints: showing the first {len(kept)} of 199 datapoints"
+    )
+    assert "narrower category" in cut.gaps[1]
+
+
+def test_project_catalog_returns_an_unknown_shape_unchanged() -> None:
+    from wheelta_robinhood_agent.agent.result_boundary import project_catalog
+
+    for payload in ({"data": {"other": []}}, [], {"data": []}):
+        assert project_catalog("get_scanner_datapoints", payload) == (payload, ())

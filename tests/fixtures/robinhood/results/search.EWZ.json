@@ -1,0 +1,24 @@
+{
+ "provenance": {
+  "tool": "search",
+  "arguments": {
+   "query": "EWZ iShares MSCI Brazil ETF"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "local dry run 1ce6d88e (read-only call through the validating proxy); the redacted raw payload from the ledger",
+  "scrubbing": "public instrument search; no account data"
+ },
+ "data": {
+  "data": {
+   "results": [
+    {
+     "name": "Corgi Brazil 2x Daily ETF",
+     "symbol": "BRZX",
+     "instrument_id": "943a3493-e48c-45c6-afde-d8e98a3ea723"
+    }
+   ]
+  },
+  "guide": "Exactly one of results[] (instruments), currency_pairs[] (crypto), or market_indexes[] (indexes) is populated, matching the requested asset_type. Instrument entries carry symbol + instrument_id — pass symbol to symbol-based tools (get_equity_quotes, get_equity_tradability, place_equity_order) and instrument_id to id-based tools. Currency-pair entries carry hyphenated symbol (e.g. BTC-USD) + id — the symbol routes to crypto quote/order tools, the id routes to watchlist tools as currency_pair_ids. Market-index entries carry symbol + id — pass id to index quote tools for live values; the symbol cross-references index snapshot tools. Multiple results means the query was ambiguous (e.g. \"apple\" could match AAPL or APLE; \"bitcoin\" could match BTC-USD or BCH-USD); ask the user to disambiguate before placing trades. An empty result list means no Robinhood-tradable match — do not invent a symbol."
+ }
+}
