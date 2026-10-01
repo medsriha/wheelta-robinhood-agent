@@ -16,6 +16,12 @@ result, a payload that fails its mapper, or an incomplete read (paged or narrowe
 fact `None`, so the condition is UNAVAILABLE rather than guessed. Only the derived counts and
 amounts are kept (`StartCondition`); no payload is persisted.
 
+A paged options read (more positions than one page) is incomplete, so it never proves there
+is no short. For the Buy-to-Close agent, a short row listed on its first page still proves
+there is one (`first_page_lists_a_short`), so the session starts; the agent reads its
+positions itself. The Sell Options agent's share coverage needs every short, so a paged read
+leaves it unknown.
+
 In a simulated-venue dry run, the option rows are overlaid with the tick's simulated fills
 (`SimulatedState.short_delta`), as the simulated broker overlays the model's positions reads,
 and settled cash is reduced by the tick's simulated debits (a buy-to-close's
@@ -25,11 +31,12 @@ settled cash this tick, so the dry-run check can only under-count.
 
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Final
 
-from pydantic import SecretStr
+from pydantic import JsonValue, SecretStr
 
 from wheelta_robinhood_agent.agent.account_scope import AGENTIC_ACCOUNT_PLACEHOLDER
 from wheelta_robinhood_agent.agent.mapped_evidence import MappedEvidence, MappingRequest
@@ -50,6 +57,7 @@ from wheelta_robinhood_agent.domain.start_conditions import (
     Shares,
     ShortRow,
     StartCondition,
+    StartOutcome,
     evaluate_close_start,
     evaluate_sell_start,
 )
@@ -69,6 +77,12 @@ class _ProbeFailed(Exception):
     """A probe read that cannot establish its fact."""
 
 
+@dataclass(frozen=True)
+class _Read:
+    evidence: MappedEvidence
+    payload: JsonValue
+
+
 async def _read(
     upstream: McpUpstream,
     tool: str,
@@ -77,7 +91,7 @@ async def _read(
     account_number: SecretStr,
     clock: Callable[[], datetime],
     timeout_seconds: float,
-) -> MappedEvidence:
+) -> _Read:
     try:
         response = await upstream.call_tool(
             tool,
@@ -87,7 +101,7 @@ async def _read(
         kind, payload = extract_mcp_payload(response.response)
         if kind is PayloadKind.TOOL_ERROR:
             raise _ProbeFailed(f"{tool}: the tool returned an error")
-        return mapper(
+        evidence = mapper(
             MappingRequest(
                 tool_call_id=uuid.uuid4(),
                 server=upstream.server,
@@ -99,8 +113,27 @@ async def _read(
             ),
             uuid.uuid4,
         )
+        return _Read(evidence=evidence, payload=payload)
     except (UpstreamError, PayloadError, ValueError, TypeError) as exc:
         raise _ProbeFailed(f"{tool}: {type(exc).__name__}") from None
+
+
+def first_page_lists_a_short(payload: JsonValue) -> bool:
+    """Whether a `get_option_positions` page lists a short row with a positive quantity
+    (module docstring: only ever used to start the Buy-to-Close agent)."""
+    data = payload.get("data", payload) if isinstance(payload, dict) else None
+    rows = data.get("positions") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if not isinstance(row, dict) or row.get("type") != "short":
+            continue
+        try:
+            if Decimal(str(row.get("quantity"))) > 0:
+                return True
+        except (ArithmeticError, ValueError):
+            continue
+    return False
 
 
 def short_rows(evidence: MappedEvidence) -> tuple[ShortRow, ...] | None:
@@ -199,13 +232,19 @@ async def probe_start_condition(
     read = _Reader(upstream, account_number, clock, timeout_seconds, table)
     failures: list[str] = []
 
+    paged_short = False
+
     async def options() -> tuple[ShortRow, ...] | None:
+        nonlocal paged_short
         try:
-            evidence = await read(OPTION_POSITIONS_TOOL)
+            done = await read(OPTION_POSITIONS_TOOL)
         except _ProbeFailed as exc:
             failures.append(str(exc))
             return None
+        evidence = done.evidence
         rows = short_rows(evidence)
+        if rows is None:
+            paged_short = first_page_lists_a_short(done.payload)
         ids = (
             tuple(
                 r.broker_instrument_id
@@ -218,11 +257,19 @@ async def probe_start_condition(
         return overlay_simulated(rows, simulated, ids)
 
     if role is AgentRole.CLOSE:
-        result = evaluate_close_start(await options())
+        held = await options()
+        if held is None and paged_short and simulated is None:
+            result = StartCondition(
+                role=role,
+                outcome=StartOutcome.MET,
+                reason="a short option is listed on the first page of an incomplete read",
+            )
+        else:
+            result = evaluate_close_start(held)
     elif role is AgentRole.SELL:
         cash: Decimal | None = None
         try:
-            cash = settled_cash(await read(PORTFOLIO_TOOL))
+            cash = settled_cash((await read(PORTFOLIO_TOOL)).evidence)
         except _ProbeFailed as exc:
             failures.append(str(exc))
         if cash is not None and simulated is not None:
@@ -235,7 +282,7 @@ async def probe_start_condition(
         rows: tuple[ShortRow, ...] | None = None
         if cash is None or cash < min_settled_cash_usd:
             try:
-                shares = share_lots(await read(EQUITY_POSITIONS_TOOL))
+                shares = share_lots((await read(EQUITY_POSITIONS_TOOL)).evidence)
             except _ProbeFailed as exc:
                 failures.append(str(exc))
             rows = await options()
@@ -269,7 +316,7 @@ class _Reader:
         self._timeout = timeout_seconds
         self._mappers = mappers
 
-    async def __call__(self, tool: str) -> MappedEvidence:
+    async def __call__(self, tool: str) -> _Read:
         mapper = self._mappers.get((self._upstream.server, tool), _DEFAULT_MAPPERS[tool])
         return await _read(
             self._upstream,
@@ -288,6 +335,7 @@ def start_condition_payload(condition: StartCondition) -> Mapping[str, object]:
 
 __all__ = [
     "EQUITY_POSITIONS_TOOL",
+    "first_page_lists_a_short",
     "OPTION_POSITIONS_TOOL",
     "PORTFOLIO_TOOL",
     "overlay_simulated",

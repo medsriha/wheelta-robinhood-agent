@@ -2327,3 +2327,44 @@ def test_a_long_close_run_leaves_the_sell_agent_no_session(
     assert len(h.clis) == 1
     statuses = [e for e in h.events(RunEventType.STATUS, h.run_id) if e and "reason" in e]
     assert statuses[-1]["reason"] == "no_budget_left"
+
+
+def test_a_refired_slot_recovers_an_interrupted_sell_run_without_a_session(
+    harness: Callable[..., Harness],
+) -> None:
+    """CLAUDE.md §15, ADR-0057: the close run finished; the process died during the sell run.
+    A re-fire of the slot finalizes the sell run and starts nothing."""
+    from wheelta_robinhood_agent.ledger.runs import append_run_event
+
+    h = harness()
+    with h.conn() as c:
+        slot = slot_for(h.clock.now)
+        close = open_run_slot(c, AppEnv.LOCAL, slot, AgentRole.CLOSE)
+        append_run_event(
+            c,
+            close.run_id,
+            RunEventType.STATUS,
+            observed_at=h.clock.now,
+            dedup_key="status:done",
+            status=RunStatus.SKIPPED_NO_OPEN_SHORTS,
+        )
+        sell = open_run_slot(c, AppEnv.LOCAL, slot, AgentRole.SELL)
+        append_run_event(
+            c,
+            sell.run_id,
+            RunEventType.STATUS,
+            observed_at=h.clock.now,
+            dedup_key="status:running",
+            status=RunStatus.RUNNING,
+        )
+    assert h.run() == 1
+    assert h.clis == []
+    assert h.close_status() is RunStatus.SKIPPED_NO_OPEN_SHORTS
+    assert h.status() is RunStatus.FAILED
+    statuses = [e for e in h.events(RunEventType.STATUS, h.run_id) if e and "reason" in e]
+    assert statuses[-1]["reason"] == "interrupted_run_recovered"
+    assert h.events(RunEventType.RECOVERY_STARTED, h.run_id)
+    assert h.mailer.summaries == []
+    # A second re-fire finds both runs final: nothing to do, no heartbeat.
+    beats = len(h.notifier.heartbeats)
+    assert h.run() == 0 and len(h.notifier.heartbeats) == beats

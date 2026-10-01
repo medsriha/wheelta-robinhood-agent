@@ -217,3 +217,19 @@ def test_without_a_trusted_upstream_only_a_proposal_only_dry_run_starts() -> Non
         )
         result = asyncio.run(_check_start_condition(deps, None))
         assert result.outcome is expected, venue
+
+
+def test_a_short_on_the_first_page_of_a_paged_read_starts_the_close_agent() -> None:
+    upstream = Upstream(shorts=[_short(str(uuid.UUID(int=4)), "AAPL")])
+    upstream.payloads["get_option_positions"]["next"] = "cursor-2"
+    result = probe(AgentRole.CLOSE, upstream)
+    assert result.outcome is StartOutcome.MET and "first page" in result.reason
+    # A paged page with no short proves nothing either way: fail closed.
+    empty = Upstream()
+    empty.payloads["get_option_positions"]["next"] = "cursor-2"
+    assert probe(AgentRole.CLOSE, empty).outcome is StartOutcome.UNAVAILABLE
+    # The sell agent's share coverage needs every short: a paged read leaves it unknown.
+    lot = [{"symbol": "AAPL", "quantity": "300", "type": "long"}]
+    sell = Upstream(cash="10", shares=lot, shorts=[_short(str(uuid.UUID(int=5)), "AAPL")])
+    sell.payloads["get_option_positions"]["next"] = "cursor-2"
+    assert probe(AgentRole.SELL, sell).outcome is StartOutcome.UNAVAILABLE
