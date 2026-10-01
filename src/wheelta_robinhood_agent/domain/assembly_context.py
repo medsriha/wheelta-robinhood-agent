@@ -48,8 +48,18 @@ from wheelta_robinhood_agent.domain.run_record import (
 )
 from wheelta_robinhood_agent.domain.tool_calls import ToolCallRecord
 
-ASSEMBLER_VERSION: Final = "assembler.v1"
-"""Version of the deterministic assembly algorithm; bump with any output-affecting change."""
+ASSEMBLER_VERSION: Final = "assembler.v2"
+"""Version of the deterministic assembly algorithm; bump with any output-affecting change.
+v2 (ADR-0052): the `unassociated_place_matches_decision` finding."""
+
+ORDER_CALL_REF_PREFIX: Final = "order_call:"
+
+
+def order_call_ref_for(tool_call_id: UUID) -> str:
+    """The code-issued reference of one review/place/cancel call (ADR-0052). Delivered with
+    the call's result, whatever its outcome, and cited in `execution_refs` or
+    `cancel_call_ref`."""
+    return f"{ORDER_CALL_REF_PREFIX}{tool_call_id}"
 
 
 class RefKind(StrEnum):
@@ -59,7 +69,7 @@ class RefKind(StrEnum):
     POSITION = "position"
     FACTS = "facts"
     EVIDENCE = "evidence"
-    TOOL_CALL = "tool_call"
+    TOOL_CALL = "tool_call"  # an `order_call:` ref (ADR-0052)
 
 
 class DeliveredRef(DomainModel):
@@ -218,6 +228,7 @@ class AssemblyContext(DomainModel):
 
 __all__ = [
     "ASSEMBLER_VERSION",
+    "ORDER_CALL_REF_PREFIX",
     "AssemblyContext",
     "AttemptEvidence",
     "DeliveredRef",
@@ -227,4 +238,5 @@ __all__ = [
     "ReservationRequirement",
     "ResourceAmount",
     "ResourceUse",
+    "order_call_ref_for",
 ]

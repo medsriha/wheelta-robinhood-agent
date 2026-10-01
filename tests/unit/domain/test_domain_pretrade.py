@@ -13,6 +13,8 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from wheelta_robinhood_agent.config.facts_rules import pretrade_rules_from
+from wheelta_robinhood_agent.config.rules import load_rules
 from wheelta_robinhood_agent.domain.facts_compute import OptionInstrument, UnderlyingQuote
 from wheelta_robinhood_agent.domain.facts_rules import FactsRuleMarker
 from wheelta_robinhood_agent.domain.options import OccSymbol
@@ -200,6 +202,40 @@ def test_dte_uses_the_new_york_calendar_date() -> None:
         u=spot().model_copy(update={"as_of": late}),
     )
     assert check(run(lg, at=late), CheckName.DTE)[1] == D(20)
+
+
+SHIPPED = pretrade_rules_from(load_rules())
+
+
+@pytest.mark.parametrize(
+    ("at", "dte", "status"),
+    [
+        (datetime(2026, 9, 24, 15, 0, tzinfo=UTC), 1, CheckStatus.PASS),  # Thu 11:00 ET
+        (datetime(2026, 9, 25, 3, 30, tzinfo=UTC), 1, CheckStatus.PASS),  # Thu 23:30 ET
+        (datetime(2026, 9, 25, 13, 30, tzinfo=UTC), 0, CheckStatus.FAIL),  # Fri 09:30 ET
+    ],
+)
+def test_shipped_min_dte_admits_tomorrow_and_excludes_same_day(
+    at: datetime, dte: int, status: CheckStatus
+) -> None:
+    """ADR-0054: filters.min_dte = 1, so a weekly expiring tomorrow (New York date) is
+    allowed and a 0DTE contract is not."""
+    assert SHIPPED.min_dte == 1
+    lg = leg(
+        inst=instrument(OccSymbol.parse("XYZ   260925P00073000")).model_copy(
+            update={"as_of": at - timedelta(seconds=5)}
+        ),
+        q=quote().model_copy(update={"as_of": at - timedelta(seconds=10)}),
+        u=spot().model_copy(update={"as_of": at - timedelta(seconds=10)}),
+    )
+    v = run(lg, SHIPPED, at=at)
+    got, value, detail = check(v, CheckName.DTE)
+    assert (got, value) == (status, D(dte))
+    if status is CheckStatus.PASS:
+        assert v.passed  # 1.00 x 365 / (73 x 1) = 5.0 clears the yield floor
+    else:
+        assert "below filters.min_dte 1" in detail
+        assert not v.passed
 
 
 def test_stale_option_quote_blocks_delta_and_yield_but_not_cushion() -> None:

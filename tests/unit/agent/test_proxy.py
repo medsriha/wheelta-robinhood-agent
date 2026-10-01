@@ -468,3 +468,48 @@ def test_the_model_gets_the_view_and_the_ledger_keeps_the_full_envelope() -> Non
     assert "quote_id" not in blocks[0]["text"]
     r.session.post(QUOTES, blocks)
     assert r.rec.event("store_delivered")["payload"]["tool_output"] == delivered
+
+
+# ---- order-call refs (ADR-0052) ---------------------------------------------------------------
+
+
+def _order_rig(behavior: Any = None, validator: Any = None) -> tuple[Rig, uuid.UUID]:
+    r = rig(behavior, validator)
+    call_id = uuid.uuid4()
+    r.dispatch.register(
+        "toolu_x", ProxyCall(call_id, "robinhood", "place_option_order", ToolTier.X, {"a": 1})
+    )
+    return r, call_id
+
+
+def test_an_order_call_result_carries_its_order_call_ref_stored_and_delivered() -> None:
+    r, call_id = _order_rig()
+    envelope = wire(r.call("place_option_order", {"a": 1}, use_id="toolu_x"))
+    assert envelope["kind"] == "validated"
+    assert envelope["order_call_ref"] == f"order_call:{call_id}"
+    assert r.rec.event("store_validated")["payload"]["order_call_ref"] == f"order_call:{call_id}"
+
+
+@pytest.mark.parametrize(
+    ("behavior", "validator", "args"),
+    [
+        (UpstreamTimeout("place_option_order: no answer"), None, {"a": 1}),  # unknown outcome
+        (None, FakeValidator("invalid"), {"a": 1}),  # result failed validation
+        (None, None, {"a": 2}),  # not forwarded: arguments differ from the dispatch
+    ],
+)
+def test_every_order_call_outcome_carries_its_order_call_ref(
+    behavior: Any, validator: Any, args: dict[str, Any]
+) -> None:
+    r, call_id = _order_rig(behavior, validator)
+    envelope = wire(r.call("place_option_order", args, use_id="toolu_x"))
+    assert envelope["kind"] != "validated"
+    assert envelope["order_call_ref"] == f"order_call:{call_id}"
+    stored = [kw["payload"] for n, kw in r.rec.events if n == "store_error"]
+    assert stored and all(p["order_call_ref"] == f"order_call:{call_id}" for p in stored)
+
+
+def test_a_read_result_carries_no_order_call_ref() -> None:
+    r = rig()
+    r.session.pre(QUOTES, {"symbols": ["AAPL"]})
+    assert "order_call_ref" not in wire(r.call())

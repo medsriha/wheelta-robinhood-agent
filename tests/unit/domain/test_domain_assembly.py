@@ -905,7 +905,7 @@ def test_determinism_with_and_without_output() -> None:
     assert input_hash(changed, None) != input_hash(context, None)
     raw = canonical_json(assemble_run_record(context, out))
     assert raw.startswith(
-        b'{"assembler_version":"assembler.v1","cancellation_rationales":[],"cancellations":[]'
+        b'{"assembler_version":"assembler.v2","cancellation_rationales":[],"cancellations":[]'
     )
 
 
@@ -944,6 +944,44 @@ def test_prior_findings_pass_through() -> None:
     record = assemble_run_record(ctx(prior_findings=(prior,)), parsed())
     assert record.findings == (prior,)
     assert "0 decision(s)" in record.summary
+
+
+def test_unlinked_place_names_the_one_decision_it_fits() -> None:
+    """ADR-0052: a dispatched place no execution_refs cites, whose instrument and side fit
+    exactly one decision's leg, is flagged with that decision; it stays unassociated."""
+    record = assemble_run_record(
+        _live_bundle(), parsed(decision(DecisionAction.OPEN_CSP, "cand:a", exec_refs=()))
+    )
+    (finding,) = [f for f in record.findings if f.code == "unassociated_place_matches_decision"]
+    assert finding.decision_ref == record.decisions[0].decision_ref
+    assert finding.leg_ref == f"{finding.decision_ref}:leg:open"
+    assert finding.tool_call_ids == (uid(11),)
+    assert f"order_call:{uid(11)}" in finding.detail
+    assert record.decisions[0].legs == ()
+    (action,) = record.unassociated_actions
+    assert action.attempt is not None and action.attempt.place_tool_call_id == uid(11)
+
+
+def test_unlinked_place_is_not_flagged_without_exactly_one_fit() -> None:
+    """Two decisions on the same contract, a close-side order, and a place denied before
+    dispatch are left without a likely-owner finding."""
+    context = _live_bundle()
+    two = parsed(
+        decision(DecisionAction.OPEN_CSP, "cand:a"), decision(DecisionAction.OPEN_CSP, "cand:a")
+    )
+    assert "unassociated_place_matches_decision" not in codes(assemble_run_record(context, two))
+    close_side = context.model_copy(
+        update={"orders": (order(11, intent(11, PUT_A, 2, side="buy_to_close", inst="inst-a")),)}
+    )
+    one = parsed(decision(DecisionAction.OPEN_CSP, "cand:a"))
+    assert "unassociated_place_matches_decision" not in codes(assemble_run_record(close_side, one))
+    denied = context.model_copy(
+        update={
+            "tool_calls": (call(11, "place_option_order", ToolCallStatus.DENIED, t=10),),
+            "orders": (order(11, intent(11, PUT_A, 2, inst="inst-a"), status=None, broker=False),),
+        }
+    )
+    assert "unassociated_place_matches_decision" not in codes(assemble_run_record(denied, one))
 
 
 # ------------------------------------------------------------------------------------------

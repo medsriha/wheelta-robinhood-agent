@@ -40,6 +40,7 @@ from e2e_fakes import (
     build_world,
     decision_json,
     dry_run_script,
+    linked_order_script,
     market_mignon,
     mignon_report,
     research,
@@ -606,7 +607,7 @@ def test_dry_run_records_an_unsubmitted_proposal_and_audits_it(
     # ADR-0038: a simulated-venue dry run is assembled like live: a proposal the agent did
     # not submit is a leg with its computed target and no attempt (no DRY_RUN stand-in).
     assert record.order_venue is OrderVenue.SIMULATED
-    # min(cash 30000, 20% of 150000 = 30000, cap 10 contracts) / (150 x 100) = 2
+    # min(cash 30000, 30% of 150000 = 45000, cap 10 contracts) / (150 x 100) = 2
     assert leg.target_quantity == 2 and leg.attempts == ()
     assert facts and facts[0].facts.initial_quantity == 2
     outcomes = {(f.check_id.value, f.outcome.value) for f in findings}
@@ -973,6 +974,11 @@ def test_dry_run_order_tools_go_to_the_simulated_broker(
     assert ORDER_TOOLS <= set(cli.options.allowed_tools)
     assert "mcp__robinhood__place_equity_order" in cli.options.disallowed_tools
     assert "Effective execution mode: live" in (cli.options.system_prompt or "")
+    # ADR-0053: the wind-down start, before the run deadline and after the run started.
+    prompt = cli.options.system_prompt or ""
+    work = datetime.fromisoformat(prompt.split("- Work deadline: ", 1)[1].split(". ", 1)[0])
+    budget = timedelta(seconds=h.settings.RUN_TIMEOUT_SECONDS)
+    assert h.clock.now - budget < work < h.clock.now + budget
     upstream = [tool for _, tool, _ in h.world.upstream_calls]
     assert not {t for t in upstream if t.endswith("_option_order")}, upstream
     with h.conn() as c:
@@ -1030,6 +1036,132 @@ def test_pretrade_validation_denies_a_failing_order_with_feedback_and_the_agent_
     ]
     upstream = [tool for _, tool, _ in h.world.upstream_calls]
     assert not {t for t in upstream if t.endswith("_option_order")}, upstream
+
+
+def _order_refs(review: ToolTurn, placed: ToolTurn) -> list[str]:
+    return [review.output["order_call_ref"], placed.output["order_call_ref"]]
+
+
+def _bare_ids(review: ToolTurn, placed: ToolTurn) -> list[str]:
+    """What the agent cited in the dry run of 2026-09-30: bare tool call IDs."""
+    return [review.output["tool_call_id"], placed.output["tool_call_id"]]
+
+
+def _linked_record(h: Harness) -> Any:
+    with h.conn() as c:
+        (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
+    record = stored.record
+    (decision,) = record.decisions
+    (leg,) = decision.legs
+    (attempt,) = leg.attempts
+    assert attempt.status is AttemptStatus.FILLED and attempt.place_tool_call_id is not None
+    assert record.unassociated_actions == ()
+    assert not [f.code for f in record.findings], record.findings
+    return record
+
+
+def test_an_order_cited_by_its_order_call_ref_is_linked_to_its_decision(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0052: each review/place result carries its order_call_ref; citing those links the
+    simulated fill to the decision, with no reference turn and no unassociated action."""
+    h = harness()
+    h.world = simulated_world(h.clock.now)
+    script = linked_order_script(lambda: h.clock.advance(1), _order_refs)
+    assert h.run(script, mappers=SIMULATED_MAPPERS) == 0, h.notifier.alert_kinds()
+    assert h.status() is RunStatus.COMPLETED
+    _linked_record(h)
+    with h.conn() as c:
+        assert len(ledger_evidence.agent_outputs_for_run(c, h.run_id)) == 1
+    assert not [e for e in h.events(RunEventType.METADATA) if "reference_check" in e]
+
+
+def test_unresolved_order_refs_get_a_reference_turn_and_are_corrected(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0052: the output of the 2026-09-30 dry run cited bare call IDs. Code sends the
+    unresolved refs and the unclaimed place back with tools denied; the corrected output
+    links the order."""
+    from wheelta_robinhood_agent.agent.session import MAX_REFERENCE_REPAIRS
+
+    cited: dict[str, list[str]] = {}
+    turns: list[ToolTurn] = []
+
+    def remember(review: ToolTurn, placed: ToolTurn) -> list[str]:
+        cited["refs"] = _order_refs(review, placed)
+        return _bare_ids(review, placed)
+
+    async def followup(model: FakeModel) -> str:
+        message = model.message or ""
+        assert f"reference check 1 of {MAX_REFERENCE_REPAIRS}" in message
+        assert "[unknown_reference]" in message
+        assert f"place call {cited['refs'][1]}" in message and "it matches decisions[0]" in message
+        turns.append(await model.call("mcp__robinhood__get_portfolio", {}))
+        return first[0].replace(bare[0], cited["refs"][0]).replace(bare[1], cited["refs"][1])
+
+    first: list[str] = []
+    bare: list[str] = []
+    inner = None
+
+    async def script(model: FakeModel) -> str | None:
+        text = await inner(model)  # type: ignore[misc]
+        assert text is not None
+        first.append(text)
+        bare.extend(json.loads(text)["decisions"][0]["execution_refs"])
+        return text
+
+    h = harness()
+    h.world = simulated_world(h.clock.now)
+    inner = linked_order_script(lambda: h.clock.advance(1), remember)
+    h.followup = followup
+    assert h.run(script, mappers=SIMULATED_MAPPERS) == 0, h.notifier.alert_kinds()
+    assert h.status() is RunStatus.COMPLETED
+    (denied,) = turns
+    assert denied.denied and denied.reason == OUTPUT_REPAIR_DENIAL
+    _linked_record(h)
+    with h.conn() as c:
+        original, corrected = ledger_evidence.agent_outputs_for_run(c, h.run_id)
+    assert corrected.corrects_id == original.record_id
+    (check,) = [
+        e["reference_check"] for e in h.events(RunEventType.METADATA) if "reference_check" in e
+    ]
+    assert check == {"reference_turns": 1, "issues_left": [], "error": None}
+
+
+def test_a_bad_reply_to_a_reference_turn_keeps_the_valid_output(
+    harness: Callable[..., Harness],
+) -> None:
+    """ADR-0052: a reference turn can only improve the output. A reply that does not parse is
+    not repaired; the last valid output is stored again and stays effective, so the run
+    completes instead of failing with invalid_agent_output."""
+    first: list[str] = []
+
+    async def followup(model: FakeModel) -> str:
+        assert "reference check 1 of" in (model.message or "")
+        return "Sorry, here is my answer: {not json"
+
+    async def script(model: FakeModel) -> str | None:
+        text = await linked_order_script(lambda: h.clock.advance(1), _bare_ids)(model)
+        assert text is not None
+        first.append(text)
+        return text
+
+    h = harness()
+    h.world = simulated_world(h.clock.now)
+    h.followup = followup
+    assert h.run(script, mappers=SIMULATED_MAPPERS) == 0, h.notifier.alert_kinds()
+    assert h.status() is RunStatus.COMPLETED
+    assert "invalid_agent_output" not in h.notifier.alert_kinds()
+    with h.conn() as c:
+        original, bad, restored = ledger_evidence.agent_outputs_for_run(c, h.run_id)
+        (stored,) = ledger_evidence.run_records_for_run(c, h.run_id)
+    assert restored.corrects_id == bad.record_id and bad.corrects_id == original.record_id
+    assert restored.raw_redacted == original.raw_redacted
+    assert stored.record.decision_output_status.value == "parsed"
+    (check,) = [
+        e["reference_check"] for e in h.events(RunEventType.METADATA) if "reference_check" in e
+    ]
+    assert check["reference_turns"] == 1 and check["issues_left"]
 
 
 def _assert_simulated_trace(h: Harness) -> None:
@@ -1339,16 +1471,19 @@ def test_spawns_stop_at_max_per_run(harness: Callable[..., Harness]) -> None:
     async def empty(model: FakeModel) -> str:
         return mignon_report("Nothing to report.")
 
+    cap = RULES.rules.mignons.max_per_run
+    assert isinstance(cap, int)
+
     async def script(model: FakeModel) -> str | None:
-        turns = [await model.spawn(MACRO, f"Task {i}.", empty) for i in range(8)]
+        turns = [await model.spawn(MACRO, f"Task {i}.", empty) for i in range(cap)]
         assert not any(t.denied for t in turns)
-        ninth = await model.spawn(MACRO, "Task 9.", empty)
-        assert ninth.denied and "max_per_run=8" in (ninth.reason or "")
+        extra = await model.spawn(MACRO, "One too many.", empty)
+        assert extra.denied and f"max_per_run={cap}" in (extra.reason or "")
         return "{}"
 
     h = harness()
     h.run(script)
-    assert [n for n, _ in h.world.calls].count("Agent") == 8
+    assert [n for n, _ in h.world.calls].count("Agent") == cap
 
 
 def test_the_orchestrator_assigns_each_mignon_a_model_from_the_allowlist(
@@ -1750,6 +1885,9 @@ def test_the_wheelta_board_is_the_initial_scanner_and_board_candidates_are_compa
     live_bid = Decimal("1.790000")
     expected = abs(live_bid - Decimal(BOARD_BID)) / Decimal(BOARD_BID)
     assert abs(metric.value.value - expected) < Decimal("1e-20")
+    usd = stored.facts.metric("board_vs_live_premium_divergence_usd")  # ADR-0054
+    assert usd is not None and usd.unit == "USD"
+    assert usd.value.value == abs(live_bid - Decimal(BOARD_BID)) == Decimal("0.11")
     assert not [g for g in stored.facts.gaps if g.field == "board_screen"]
     (decision,) = trace.decisions
     assert decision.action == "OPEN_CSP"

@@ -15,7 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from e2e_fake_cli import FakeModel, FakeWorld
+from e2e_fake_cli import FakeModel, FakeWorld, ToolTurn
 
 from wheelta_robinhood_agent.agent.account_scope import (
     AGENTIC_ACCOUNT_PLACEHOLDER,
@@ -534,6 +534,64 @@ async def _simulated_orders(model: FakeModel, advance: Callable[[], None]) -> st
     assert listed["state_raw"] == "filled" and listed["processed_quantity"] == 1
     assert listed["pending_quantity"] == 0
     return decision_json(candidate_ref, facts_ref)
+
+
+def linked_order_script(
+    advance: Callable[[], None], cite: Callable[[ToolTurn, ToolTurn], list[str]]
+) -> Callable[[FakeModel], Any]:
+    """ADR-0052: research, then review, place, and read back the SPY put, and return an
+    OPEN_CSP decision on the SPY candidate whose execution_refs are `cite(review, placed)`.
+    The candidate comes from this run's `get_option_instruments` result."""
+
+    async def script(model: FakeModel) -> str | None:
+        await research(model)
+        account = {"account_number": AGENTIC_ACCOUNT_PLACEHOLDER}
+        instruments = await model.call(
+            "mcp__robinhood__get_option_instruments", {"ids": SPY_INSTRUMENT_ID}
+        )
+        candidate = instruments.data["evidence"]["candidates"][0]["candidate_ref"]
+        await model.call(
+            "mcp__robinhood__get_option_quotes", {"instrument_ids": [SPY_INSTRUMENT_ID]}
+        )
+        await model.call("mcp__robinhood__get_equity_quotes", {"symbols": ["SPY"]})
+        order = _spy_order("11.90")
+        advance()
+        review = await model.call("mcp__robinhood__review_option_order", order)
+        advance()
+        placed = await model.call("mcp__robinhood__place_option_order", order)
+        assert not placed.denied and placed.output["kind"] == "validated", placed.output
+        advance()
+        await model.call("mcp__robinhood__get_option_orders", account)
+        return linked_decision_json(
+            candidate, instruments.data["evidence_ref"], cite(review, placed)
+        )
+
+    return script
+
+
+def linked_decision_json(candidate_ref: str, evidence_ref: str, execution_refs: list[str]) -> str:
+    """An OPEN_CSP decision executed by the cited order calls (no unsubmitted proposal)."""
+    return json.dumps(
+        {
+            "decisions": [
+                {
+                    "action": "OPEN_CSP",
+                    "target_ref": candidate_ref,
+                    "replacement_ref": None,
+                    "funding_close_refs": [],
+                    "proposed_legs": [],
+                    "execution_refs": execution_refs,
+                    "rationale": "Scripted e2e order.",
+                    "thesis": "Scripted thesis.",
+                    "invalidation_conditions": ["Scripted invalidation."],
+                    "evidence_refs": [evidence_ref],
+                }
+            ],
+            "cancellation_rationales": [],
+            "unresolved_questions": [],
+            "next_run": None,
+        }
+    )
 
 
 def pretrade_denial_script(

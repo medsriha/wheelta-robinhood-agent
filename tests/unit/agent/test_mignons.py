@@ -94,7 +94,7 @@ def test_agent_names_round_trip() -> None:
 
 
 def test_limits_come_from_the_rules() -> None:
-    assert mignon_limits(RULES) == MignonLimits(8, 4, 40)
+    assert mignon_limits(RULES) == MignonLimits(12, 4, 40)
 
 
 @pytest.mark.parametrize("value", [RuleMarker.TBD, RuleMarker.NONE, RuleMarker.AGENT_DISCRETION, 0])

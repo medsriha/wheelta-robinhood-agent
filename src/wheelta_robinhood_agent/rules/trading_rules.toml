@@ -28,11 +28,11 @@
 
 [meta]
 rules_id = "wheel_rules"
-version = 12
+version = 14
 status = "signed_off"
-adr = "ADR-0051" # v12: ADR-0050 (no working order at the end) and ADR-0051 (concurrent closes)
+adr = "ADR-0054" # v14: looser board comparison, catalyst, cap, earnings, screening age, weeklies
 signed_off_by = "medsriha (account owner)"
-signed_off_on = "2026-09-29"
+signed_off_on = "2026-09-30"
 
 [conventions]
 value_conventions = [
@@ -75,7 +75,7 @@ max_contracts_per_order = 10
 max_new_positions_per_run = 5
 max_new_positions_per_day = 10
 max_collateral_per_underlying_usd = "none"
-max_collateral_per_underlying_ratio = "0.20" # owner, 2026-09-26: avoid concentration
+max_collateral_per_underlying_ratio = "0.30" # owner, 2026-09-30 (ADR-0054); was 0.20 (2026-09-26)
 max_total_csp_collateral_ratio = "1.00"
 min_cash_reserve_usd = "0.00"
 max_sector_concentration_ratio = "agent_discretion"
@@ -95,9 +95,9 @@ notes = [
   "min_annualized_yield_ratio is premium / collateral, annualized over DTE (CSP collateral = strike x multiplier; CC collateral = share price x multiplier). The premium is the live bid, as for min_premium_usd. Annualize per definitions.annualization.",
   "min_cushion_ratio is definitions.cushion, measured with the live underlying price.",
   "Apply min_dte, max_dte, min_abs_delta, max_abs_delta, min_cushion_ratio, and min_annualized_yield_ratio while screening and selecting candidates, not only before placing. Quote both the option and its underlying, then read the dte, cushion_ratio, and annualized_yield_on_collateral_ratio metrics from the decision-facts tool and delta from the live option quote. A candidate that fails any of them, or whose value is missing, is not selectable; do not carry it into the order procedure.",
-  "Pre-trade validation: code checks those six filters again on every sell-to-open leg of place_option_order, from the latest option and underlying quotes recorded in this run within data_quality.freshness. A failed, stale, or missing value denies the order, and the denial names each failed check with its value and bound. The limit price does not change these values.",
+  "Pre-trade validation: code checks those six filters again on every sell-to-open leg of place_option_order, from the latest option and underlying quotes recorded in this run within data_quality.freshness.option_quote_max_age_seconds and equity_quote_max_age_seconds. A failed, stale, or missing value denies the order, and the denial names each failed check with its value and bound. The limit price does not change these values.",
 ]
-min_dte = 7
+min_dte = 1 # owner, 2026-09-30 (ADR-0054): weeklies in their last week; was 7
 max_dte = 45 # the board's own gates: DTE 1-45, |delta| 0.15-0.35
 min_abs_delta = "0.15"
 max_abs_delta = "0.30"
@@ -139,10 +139,11 @@ working = [
 # ---------------------------------------------------------------------------------------------
 
 [events]
-earnings_exclusion = "Exclude a new leg if the underlying's next earnings date falls on or before the leg's expiration."
+earnings_exclusion = "Exclude a new leg if the underlying's next earnings date falls on or before the leg's expiration. For a single stock, query Robinhood earnings in this run. Take the next date from the sources in data_quality.precedence: a lower-listed source may supply it only when every higher-listed source was queried and gave none. Use it as confirmed or estimated as the source reports it (a date without a stated status counts as estimated) and say which in the rationale; a confirmed date overrides an estimate from a lower-listed source and is not a contradiction. If no listed source gives a next earnings date for a company, exclude the leg for insufficient data. A fund that Robinhood's instrument or fundamentals data in this run classify as an ETF reports no earnings, so this exclusion does not apply to it, except a single-stock ETF (one whose holdings or strategy track one company): it follows that company's earnings date."
 ex_dividend_exclusion = "Exclude a new covered call if an ex-dividend date falls on or before its expiration and the call's extrinsic value is below the dividend. Cash-secured puts: no ex-dividend exclusion."
 exclude_pending_ma_halt_delisting = true
 exclude_unverified_material_catalyst = true
+scheduled_macro_events = "A scheduled public event that is market-wide or country-wide (an election, a central-bank meeting, a macro data release) is known in advance: it is not an unverified material catalyst. It qualifies only if it is not specific to the underlying's issuer, its products, or its industry: regulatory, court, FDA, contract, index, and industry-policy decisions are catalysts, not scheduled macro events. Its date comes from data_quality.precedence (Scheduled macro event date); if no listed source gives the date, the event is an unverified material catalyst. Whether it is material to the underlying is agent_discretion: name the event, its date source, and your judgment in the rationale, and exclude the leg if the risk is material."
 
 # ---------------------------------------------------------------------------------------------
 # Definitions used by the rules below
@@ -237,12 +238,23 @@ assigned_shares = "Become CC candidates in selection, with a strike that satisfi
 # ---------------------------------------------------------------------------------------------
 
 [selection]
+# Owner, 2026-09-30 (ADR-0053): try several discovery approaches before giving up, without
+# lowering any rule. The board stays the preferred first screen; the scanner is no longer
+# reserved for an empty board.
 sources = [
-  "First, the Wheelta board (wheelta_board_query): the initial scanner for cash-secured puts. Screen it before any other discovery.",
-  "Only when the current board carries no relevant contract (unavailable or building, or no row passes selection.underlying_filters and selection.contract_filters): the Robinhood scanner, your saved scans (run_scan) and scanner previews (preview_scan).",
+  "The Wheelta board (wheelta_board_query): the preferred scanner for cash-secured puts. Screen it first when it is available.",
+  "The Robinhood scanner: your saved scans (run_scan) and scanner previews (preview_scan). Use it whenever the board is unavailable, building, or has no row passing selection.underlying_filters and selection.contract_filters, in any later discovery round, or alongside the board when you judge it useful.",
   "Your owned watchlists.",
   "Uncovered share lots of at least one contract multiplier of shares (covered calls).",
 ]
+discovery = [
+  "Discovery runs in rounds, up to max_discovery_rounds per run. A round finds contracts, re-quotes them on Robinhood, and applies the cheap checks below before any research.",
+  "Start another round when the rounds so far have not selected trades that use the available opening capacity (selection.sizing, selection.portfolio_caps) and Mignon budget remains, but only if research, selection, and working the orders can finish before the work deadline. Stop when capacity is used, or when Mignons or time run out.",
+  "Each round searches differently from the ones before: exclude underlyings and contracts already rejected this run, and change at least one of source, sort order, expirations within filters.min_dte and filters.max_dte, strikes, sectors, or ETFs versus single stocks. Repeating an identical search is not a new round.",
+  "Cheap checks first: the live Robinhood quote, every value in filters, selection.board_comparison, earnings and ex-dividend dates, and decision facts. Spend web research only on candidates that pass them. A decision-facts gap caused only by quote age is not a rejection: re-quote and check again.",
+  "Rounds never relax a rule: every round applies the same filters, events, limits, and board comparison. Make every agent_discretion judgment in a later round exactly as in the first; earlier rejections are never a reason to accept a risk or a shorter expiration. Trading nothing after the rounds is a valid outcome; never select a weaker candidate to avoid it.",
+]
+max_discovery_rounds = 3
 underlying_filters = [
   "Tradable.",
   "Allowed by scope.underlying_allowlist and scope.underlying_denylist, and by scope.etfs_allowed and scope.leveraged_inverse_etfs_allowed.",
@@ -256,7 +268,7 @@ contract_filters = [
   "Every value in filters.",
   "Apply selection.board_comparison; an absent screen for an independently discovered contract does not by itself fail selection.",
 ]
-board_comparison = "Compare the same premium measure for the same underlying, right, strike, and expiration when a current Wheelta board row supplies a screen used for this candidate. Absolute difference divided by the positive screen premium must not exceed data_quality.tolerances.board_vs_live_premium_divergence_ratio. Record both values and the row/build identity. Missing or stale evidence for a board-derived candidate blocks that candidate; do not relabel it as independently discovered to bypass the check. For a covered call or a contract discovered independently through Robinhood or held shares with no matching screen used, record not_applicable and rely on Robinhood. If the board is unavailable, skip board work while independently sourced work may continue."
+board_comparison = "Compare the same premium measure for the same underlying, right, strike, and expiration when a current Wheelta board row supplies a screen used for this candidate. It passes when the absolute difference divided by the positive screen premium does not exceed data_quality.tolerances.board_vs_live_premium_divergence_ratio, or when the absolute difference per share does not exceed data_quality.tolerances.board_vs_live_premium_divergence_usd. Use the two divergence metrics from the decision-facts tool. Record both values and the row/build identity. Missing or stale evidence for a board-derived candidate blocks that candidate; do not relabel it as independently discovered to bypass the check. For a covered call or a contract discovered independently through Robinhood or held shares with no matching screen used, record not_applicable and rely on Robinhood. If the board is unavailable, skip board work while independently sourced work may continue."
 sizing = [
   "Contracts = floor of the smallest applicable capacity below, expressed in contracts:",
   "limits.max_contracts_per_order;",
@@ -313,7 +325,7 @@ notes = [
   "The orchestrator delegates research to Mignons and makes every decision itself.",
   "Every spawn counts toward max_per_run, follow-ups included. Mignons never spawn Mignons.",
 ]
-max_per_run = 8
+max_per_run = 12 # owner, 2026-09-30 (ADR-0053): was 8; room for later discovery rounds
 max_concurrent = 4
 max_turns_per_mignon = 40
 
@@ -343,7 +355,12 @@ max_next_run_gap_hours = 48
 precedence_rule = "For each fact, the first listed source in data_quality.precedence wins; a disagreement follows on_divergence. A source not listed for a fact never supplies it: web content never supplies prices, strikes, premiums, Greeks, positions, or buying power."
 
 [data_quality.freshness]
-notes = ["Runs happen only during the NYSE regular session, so each max age is for regular hours."]
+notes = [
+  "Runs happen only during the NYSE regular session, so each max age is for regular hours.",
+  "news_max_age_seconds is how long a fetched page stays usable after retrieval; it does not limit the publish age of a source for a scheduled date.",
+  "screening_quote_max_age_seconds applies only to shortlisting or rejecting a contract during discovery. A quote that a selection, decision facts, or an order relies on must meet option_quote_max_age_seconds or equity_quote_max_age_seconds: re-quote before selecting.",
+]
+screening_quote_max_age_seconds = 300 # owner, 2026-09-30 (ADR-0054)
 option_quote_max_age_seconds = 60 # each price step re-quotes anyway (orders.working)
 equity_quote_max_age_seconds = 60
 account_state_max_age_seconds = 120 # also re-read before every order (procedure step 4)
@@ -359,6 +376,8 @@ max_iv_ratio = "5.00"
 
 [data_quality.tolerances]
 board_vs_live_premium_divergence_ratio = "0.25" # board premiums are up to ~2 h old (build schedule)
+# Owner, 2026-09-30 (ADR-0054): on cheap premiums 25% is a few cents; either bound passes.
+board_vs_live_premium_divergence_usd = "0.05"
 fundamentals_divergence_ratio = "0.05"
 
 [[data_quality.precedence]]
@@ -385,6 +404,11 @@ on_divergence = "Any disagreement between tier-1 or broker sources is a contradi
 fact = "Fundamentals"
 sources = ["SEC filing facts", "Robinhood financials and fundamentals", "Wheelta research"]
 on_divergence = "Beyond data_quality.tolerances.fundamentals_divergence_ratio: flag."
+
+[[data_quality.precedence]]
+fact = "Scheduled macro event date"
+sources = ["Tier 1 (the official body that sets it)", "Wheelta calendar", "Tier 2"]
+on_divergence = "Any disagreement between listed sources is a contradiction: treat the event as an unverified material catalyst."
 
 [[data_quality.precedence]]
 fact = "News and catalysts"

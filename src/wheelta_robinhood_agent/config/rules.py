@@ -161,6 +161,8 @@ class Events(_Section):
     ex_dividend_exclusion: StrictStr
     exclude_pending_ma_halt_delisting: BoolRule
     exclude_unverified_material_catalyst: BoolRule
+    # ADR-0054: guidance only; how scheduled market- or country-wide events are treated.
+    scheduled_macro_events: StrictStr
 
 
 class Definitions(_Section):
@@ -207,6 +209,9 @@ class Assignment(_Section):
 
 class Selection(_Section):
     sources: Notes
+    # ADR-0053: discovery rounds. Prompt guidance only; no code counts rounds.
+    discovery: Notes
+    max_discovery_rounds: IntRule
     underlying_filters: Notes
     contract_filters: Notes
     board_comparison: StrictStr
@@ -261,6 +266,9 @@ class Scheduling(_Section):
 
 class Freshness(_Section):
     notes: Notes = ()
+    # ADR-0054: discovery screening only; no code reads it (facts and orders keep the
+    # option/equity ages below).
+    screening_quote_max_age_seconds: IntRule
     option_quote_max_age_seconds: IntRule
     equity_quote_max_age_seconds: IntRule
     account_state_max_age_seconds: IntRule
@@ -278,6 +286,7 @@ class Sanity(_Section):
 
 class Tolerances(_Section):
     board_vs_live_premium_divergence_ratio: DecimalRule
+    board_vs_live_premium_divergence_usd: DecimalRule  # ADR-0054: either bound passes
     fundamentals_divergence_ratio: DecimalRule
 
 

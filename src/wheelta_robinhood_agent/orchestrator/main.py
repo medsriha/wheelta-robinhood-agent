@@ -50,10 +50,12 @@ from wheelta_robinhood_agent.agent.account_scope import (
 )
 from wheelta_robinhood_agent.agent.audit.runner import AuditResult, run_audit
 from wheelta_robinhood_agent.agent.mignons import DELEGATION_TOOL, Role, mignon_limits
+from wheelta_robinhood_agent.agent.order_cleanup import ORDER_WIND_DOWN_SECONDS
 from wheelta_robinhood_agent.agent.result_boundary import VERIFIED_MAPPERS, EvidenceMapper
 from wheelta_robinhood_agent.agent.run_control import RunControl, StopReason
 from wheelta_robinhood_agent.agent.run_loader import (
     RunMeta,
+    check_references,
     load_assembly_context,
     load_audit_context,
     load_decisions,
@@ -855,8 +857,12 @@ class _Run:
     def _render(self, plan: SessionPlan, book: PositionBook) -> RenderedPrompt:
         now = self.deps.clock()
         owned = ledger_orders.owned_unresolved_orders(self.conn, self.scope_id)
+        # ADR-0053: when the wind-down starts (ADR-0050), so the agent can judge whether
+        # another discovery round fits.
+        work = max(self._session_budget() - ORDER_WIND_DOWN_SECONDS, 0.0)
         values = {
             "as_of": now.isoformat(),
+            "work_deadline": (now + timedelta(seconds=work)).isoformat(),
             # ADR-0038: a simulated-venue dry run is told it is live, so it follows the live
             # procedure exactly; the recorded effective mode and venue say what it was.
             "execution_mode": prompt_execution_mode(plan.order_venue).value,
@@ -952,7 +958,7 @@ class _Run:
         prompt: RenderedPrompt | None = None
         if plan.may_start:
             prompt = self._render(plan, book)
-            session = self._session(plan, prompt)
+            session = self._session(plan, prompt, book)
         else:
             self.log.warning(
                 "required source unavailable; no session",
@@ -960,8 +966,18 @@ class _Run:
             )
         return self._finish(plan, book, prompt, session, unavailable_reason)
 
-    def _session(self, plan: SessionPlan, prompt: RenderedPrompt) -> SessionResult:
+    def _session(
+        self, plan: SessionPlan, prompt: RenderedPrompt, book: PositionBook
+    ) -> SessionResult:
         scratch = Path(tempfile.mkdtemp(prefix="wra-agent-", dir=self.deps.scratch_root))
+        meta = self.meta(prompt=prompt, model_id=None)
+
+        def reference_check(parsed: DecisionOutputParsed) -> tuple[str, ...]:
+            # ADR-0052: the same load and assembly as the run record, before it is final.
+            return check_references(
+                self.conn, meta, as_of=self.deps.clock(), book=book, decisions=parsed
+            )
+
         deps = SessionDeps(
             conn=self.conn,
             run_id=self.run_id,
@@ -986,6 +1002,7 @@ class _Run:
             account_scope_table=self.deps.account_scope_table,
             interrupt_grace_seconds=self.deps.interrupt_grace_seconds or INTERRUPT_GRACE_SECONDS,
             status_poll_interval=self.deps.status_poll_interval or STATUS_POLL_INTERVAL_SECONDS,
+            reference_check=reference_check,
         )
         self.metrics.stage_started("agent", self.deps.clock())
         try:
@@ -1037,6 +1054,17 @@ class _Run:
                         "order_cleanup": {
                             "cleanup_turns": session.order_cleanups,
                             "left_unresolved": list(session.orders_left_unresolved),
+                        }
+                    },
+                )
+            if session.reference_repairs or session.reference_check_error:
+                self.event(
+                    RunEventType.METADATA,
+                    {
+                        "reference_check": {
+                            "reference_turns": session.reference_repairs,
+                            "issues_left": list(session.reference_issues or ()),
+                            "error": session.reference_check_error,
                         }
                     },
                 )

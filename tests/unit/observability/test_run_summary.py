@@ -376,3 +376,101 @@ def test_failure_and_audit_diagnostics_are_redacted_and_html_escaped() -> None:
     assert "V1: RuntimeError: cannot load rules" in text
     assert "<bad account" not in html and "&lt;bad account" in html
     assert ACCOUNT not in text and ACCOUNT not in html
+
+
+def test_repeated_candidates_and_research_keep_each_distinct_fact_and_source_once() -> None:
+    contract = "MSFT  261016P00400000"
+    claim = "Earnings are approaching."
+    report = MignonReport(
+        task="Compare candidates",
+        findings=({"claim": claim, "refs": ("candidate:2",), "web_urls": ()},),
+        gaps=("Dividend date unavailable.",),
+        follow_up_questions=("Recheck after earnings?",),
+    )
+    extra = MignonReport(
+        task="Compare candidates",
+        findings=(
+            {"claim": claim, "refs": ("candidate:3",), "web_urls": ("https://example.com/ir",)},
+            {"claim": "Liquidity improved.", "refs": ("candidate:3",), "web_urls": ()},
+        ),
+        gaps=report.gaps,
+        follow_up_questions=report.follow_up_questions,
+    )
+    summary = _input(
+        _record(_decision(_proposal())),
+        candidates=(
+            ConsideredOption(candidate_ref="candidate:1", underlying="AAPL", occ_symbol=str(OCC)),
+            ConsideredOption(
+                candidate_ref="candidate:2",
+                underlying="MSFT",
+                occ_symbol=contract,
+                gaps=("quote: stale",),
+            ),
+            ConsideredOption(
+                candidate_ref="candidate:3",
+                underlying="MSFT",
+                occ_symbol=contract,
+                gaps=("quote: stale", "delta: missing"),
+            ),
+        ),
+        research_reports=(report, extra, report),
+        diagnostic_details=("Unique diagnostic", "Unique diagnostic"),
+        audit_details=("Unique audit issue", "Unique audit issue"),
+    )
+    text, html = render_bodies(None, render_facts_text(summary, REDACTOR), REDACTOR)
+    for body in (text, html):
+        for distinct in (
+            str(OCC),
+            contract,
+            claim,
+            "Liquidity improved.",
+            "Dividend date unavailable.",
+            "Recheck after earnings?",
+            "quote: stale",
+            "delta: missing",
+            "Unique diagnostic",
+            "Unique audit issue",
+            "https://example.com/ir",
+        ):
+            assert body.count(distinct) == 1, distinct
+        assert "candidate:2, candidate:3" in body
+        assert "not_placed" in body and "limit 1.25" in body
+    # Presentation does not prune the authoritative input or the writer's evidence.
+    facts = summary_facts(summary, REDACTOR)
+    assert len(facts["candidates"]) == 3
+    assert len(facts["research_reports"]) == 3
+
+
+def test_selected_candidate_gaps_and_distinct_contracts_are_not_dropped() -> None:
+    summary = _input(
+        _record(_decision(_placed(AttemptStatus.UNKNOWN))),
+        candidates=(
+            ConsideredOption(
+                candidate_ref="candidate:1",
+                underlying="AAPL",
+                occ_symbol=str(OCC),
+                gaps=("quote: stale",),
+            ),
+            ConsideredOption(
+                candidate_ref="candidate:2",
+                underlying="AAPL",
+                occ_symbol="AAPL  261016P00180000",
+                gaps=("quote: stale",),
+            ),
+        ),
+    )
+    text = render_facts_text(summary, REDACTOR)
+    assert "[candidate:1]: selected" in text
+    assert "[candidate:2]: not selected" in text
+    assert text.count("quote: stale") == 2  # Each contract has its own gap.
+    assert "order: unknown" in text
+
+
+def test_research_gaps_keep_their_task_scope() -> None:
+    reports = tuple(
+        MignonReport(task=task, findings=(), gaps=("Calendar missing.",), follow_up_questions=())
+        for task in ("Check AAPL", "Check MSFT")
+    )
+    text = render_facts_text(_input(_record(), research_reports=reports), REDACTOR)
+    assert "Research gap (Check AAPL): Calendar missing." in text
+    assert "Research gap (Check MSFT): Calendar missing." in text

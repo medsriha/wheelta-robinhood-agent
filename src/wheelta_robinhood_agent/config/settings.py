@@ -78,7 +78,7 @@ class Settings(BaseSettings):
 
     APP_ENV: AppEnv = AppEnv.LOCAL
     LOG_LEVEL: LogLevel = LogLevel.INFO
-    RUN_TIMEOUT_SECONDS: PositiveInt = 1500
+    RUN_TIMEOUT_SECONDS: PositiveInt = 2400  # ADR-0053
 
     # Safety controls. Unknown EXECUTION_MODE values are treated as off (CLAUDE.md §18); the
     # raw requested value is kept for the run's config snapshot.

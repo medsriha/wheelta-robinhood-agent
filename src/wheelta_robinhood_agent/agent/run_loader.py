@@ -6,6 +6,9 @@ define the code-issued references the model actually saw), persisted DecisionFac
 stored agent output/parse, and the PositionBook rendered into the prompt.
 
 Loader decisions (documented, not guessed values):
+- ADR-0052: a review/place/cancel call's `order_call:` ref is registered (kind `tool_call`)
+  only when a delivered envelope of that call carries exactly `order_call_ref_for(call id)`.
+  A call the model never received a result for (e.g. denied before dispatch) has no ref.
 - Proposal-only dry runs (order venue `none`) place no order, so `orders` is empty. Runs
   that execute orders (venue `broker`, ADR-0034, or `simulated`, ADR-0038) load every order
   the run placed or observed (`ledger.orders.run_order_records`), for assembly and the audit.
@@ -49,21 +52,27 @@ from wheelta_robinhood_agent.agent.audit.context import (
 )
 from wheelta_robinhood_agent.agent.facts_tool import FACTS_TOOL_NAME, RunEvidence
 from wheelta_robinhood_agent.agent.mapped_evidence import OrderReviewObservation
-from wheelta_robinhood_agent.agent.model_view import is_model_view, model_view
+from wheelta_robinhood_agent.agent.model_view import (
+    ORDER_CALL_REF_KEY,
+    is_model_view,
+    model_view,
+)
 from wheelta_robinhood_agent.agent.result_boundary import (
     evidence_ref_for,
     mapped_evidence_of,
 )
 from wheelta_robinhood_agent.agent.web_cache import LOCAL_SERVER_NAME
 from wheelta_robinhood_agent.config.rules import LoadedRules
-from wheelta_robinhood_agent.domain.assembly import DecisionsInput
+from wheelta_robinhood_agent.domain.assembly import DecisionsInput, assemble_run_record
 from wheelta_robinhood_agent.domain.assembly_context import (
     ASSEMBLER_VERSION,
     AssemblyContext,
     AttemptEvidence,
     DeliveredRef,
     RefKind,
+    order_call_ref_for,
 )
+from wheelta_robinhood_agent.domain.assembly_events import CANCEL_TOOL, PLACE_TOOL, REVIEW_TOOL
 from wheelta_robinhood_agent.domain.decision_output import (
     AgentDecisionOutput,
     DecisionOutputParsed,
@@ -81,6 +90,7 @@ from wheelta_robinhood_agent.domain.facts import DecisionFacts
 from wheelta_robinhood_agent.domain.gating import executes_orders
 from wheelta_robinhood_agent.domain.orders import OrderRecord
 from wheelta_robinhood_agent.domain.positions import PositionBook
+from wheelta_robinhood_agent.domain.reference_check import reference_issues
 from wheelta_robinhood_agent.domain.run_record import Quote, RunRecord
 from wheelta_robinhood_agent.domain.tool_calls import ToolCallRecord
 from wheelta_robinhood_agent.ledger import evidence as ledger_evidence
@@ -152,6 +162,33 @@ def _delivered_envelopes(conn: Conn, run_id: uuid.UUID) -> list[Mapping[str, Any
     return envelopes
 
 
+_ORDER_TOOLS = frozenset({REVIEW_TOOL, PLACE_TOOL, CANCEL_TOOL})
+
+
+def _order_call_ref(
+    envelope: Mapping[str, Any], run_id: uuid.UUID, scope: str
+) -> DeliveredRef | None:
+    """The order-call ref a delivered order-tool envelope carried (ADR-0052), or None."""
+    call_id = envelope.get("tool_call_id")
+    ref = envelope.get(ORDER_CALL_REF_KEY)
+    if envelope.get("tool") not in _ORDER_TOOLS or not isinstance(call_id, str):
+        return None
+    try:
+        tool_call_id = uuid.UUID(call_id)
+    except ValueError:
+        return None
+    if ref != order_call_ref_for(tool_call_id):
+        return None
+    return DeliveredRef(
+        ref=ref,
+        kind=RefKind.TOOL_CALL,
+        run_id=run_id,
+        account_scope_id=scope,
+        delivered=True,
+        tool_call_id=tool_call_id,
+    )
+
+
 def load_delivered(conn: Conn, meta: RunMeta, book: PositionBook | None) -> DeliveredEvidence:
     """Code-issued references delivered in this run (tool results and the rendered book)."""
     refs: dict[str, DeliveredRef] = {}
@@ -163,6 +200,9 @@ def load_delivered(conn: Conn, meta: RunMeta, book: PositionBook | None) -> Deli
     for envelope in _delivered_envelopes(conn, meta.run_id):
         call_id = envelope.get("tool_call_id")
         data = envelope.get("data")
+        order_ref = _order_call_ref(envelope, meta.run_id, scope)
+        if order_ref is not None:
+            refs[order_ref.ref] = order_ref
         if envelope.get("server") == LOCAL_SERVER_NAME and envelope.get("tool") == (
             FACTS_TOOL_NAME
         ):
@@ -519,6 +559,22 @@ def load_assembly_context(
         if executes_orders(meta.order_venue)
         else (),
     )
+
+
+def check_references(
+    conn: Conn,
+    meta: RunMeta,
+    *,
+    as_of: datetime,
+    book: PositionBook | None,
+    decisions: DecisionOutputParsed,
+) -> tuple[str, ...]:
+    """ADR-0052: the reference issues of a parsed output, assembled now from this run's
+    recorded calls with the same assembler the run record uses (`reference_check`)."""
+    context = load_assembly_context(conn, meta, terminated_at=as_of, book=book, output_id=None)
+    record = assemble_run_record(context, decisions)
+    citable = frozenset(r.ref for r in context.refs if r.kind is RefKind.TOOL_CALL)
+    return reference_issues(record, citable)
 
 
 def load_audit_context(

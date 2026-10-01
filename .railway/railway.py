@@ -45,7 +45,7 @@ def railway(ctx):  # type: ignore[no-untyped-def]
             # Runtime
             "APP_ENV": ctx.environment,
             "LOG_LEVEL": "INFO",
-            "RUN_TIMEOUT_SECONDS": "1500",
+            "RUN_TIMEOUT_SECONDS": "2400",  # ADR-0053: room for discovery rounds
             # Safety controls (ADR-0034): armed live places real option orders with no human
             # approval. KILL_SWITCH=true + redeploy stops future runs (OPERATIONS.md R9).
             "EXECUTION_MODE": "live",

@@ -1108,20 +1108,33 @@ def test_board_candidate_facts_carry_the_premium_divergence() -> None:
     assert m is not None and m.value.derivation is not None
     assert m.value.derivation.formula == "board_premium_divergence"
     assert uid(30) in f.input_evidence_ids
+    # ADR-0054: |live bid 0.40 - board bid 0.50| per share, same inputs as the ratio
+    assert metric(f, "board_vs_live_premium_divergence_usd") == D("0.10")
+    usd = f.metric("board_vs_live_premium_divergence_usd")
+    assert usd is not None and usd.unit == "USD" and usd.value.derivation is not None
+    assert usd.value.derivation.formula == "board_premium_divergence_usd"
+    assert usd.value.derivation.input_evidence_ids == m.value.derivation.input_evidence_ids
+    assert uid(30) in usd.value.derivation.input_evidence_ids
+    formulas = {v.formula for v in f.formula_versions}
+    assert {"board_premium_divergence", "board_premium_divergence_usd"} <= formulas
 
 
 def test_board_candidate_without_its_row_is_blocked_by_a_gap() -> None:
     f = facts(open_inputs(candidate=_board_candidate()))
     assert "board_screen" in {g.field for g in f.gaps}
     assert f.metric("board_vs_live_premium_divergence_ratio") is None
+    assert f.metric("board_vs_live_premium_divergence_usd") is None
     zero = facts(open_inputs(candidate=_board_candidate(), board_screen=_screen("0")))
     assert "board_screen" in {g.field for g in zero.gaps}
+    assert zero.metric("board_vs_live_premium_divergence_ratio") is None
+    assert zero.metric("board_vs_live_premium_divergence_usd") is None
 
 
 def test_robinhood_candidates_need_no_board_row() -> None:
     f = facts(open_inputs())
     assert "board_screen" not in {g.field for g in f.gaps}
     assert f.metric("board_vs_live_premium_divergence_ratio") is None
+    assert f.metric("board_vs_live_premium_divergence_usd") is None
 
 
 def test_a_board_screen_must_match_a_board_candidates_contract() -> None:

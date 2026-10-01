@@ -20,9 +20,12 @@ EVIDENCE_KEY: Final = "evidence"
 EVIDENCE_REF_KEY: Final = "evidence_ref"
 EVIDENCE_VIEW_KEY: Final = "evidence_view"
 EVIDENCE_VIEW_VERSION: Final = "compact.v1"
+# ADR-0052: the top-level envelope key carrying a review/place/cancel call's `order_call:`
+# ref. The view keeps top-level keys, so the model always receives it.
+ORDER_CALL_REF_KEY: Final = "order_call_ref"
 # Code-issued row identities and internal cross-references. The model cites only the
-# envelope's `evidence_ref` and `candidate:` refs, and passes broker IDs to tools; it has no
-# use for these, and nothing it outputs may contain them.
+# envelope's `evidence_ref`, `order_call_ref`, and `candidate:` refs, and passes broker IDs to
+# tools; it has no use for these, and nothing it outputs may contain them.
 _INTERNAL_ID_KEYS: Final = frozenset(
     {
         "evidence_id",

@@ -13,11 +13,11 @@ from wheelta_robinhood_agent.domain.facts_rules import FactsRuleMarker, FactsRul
 def test_maps_the_committed_rules_file() -> None:
     loaded = load_rules()
     rules = facts_rules_from(loaded)
-    assert rules.rules_version == str(loaded.version) == "12"
+    assert rules.rules_version == str(loaded.version) == "14"
     assert rules.rules_hash == loaded.sha256
     assert rules.max_contracts_per_order == 10
     assert rules.max_collateral_per_underlying_usd is FactsRuleMarker.NONE
-    assert rules.max_collateral_per_underlying_ratio == Decimal("0.20")
+    assert rules.max_collateral_per_underlying_ratio == Decimal("0.30")
     assert rules.max_total_csp_collateral_ratio == Decimal("1.00")
     assert rules.min_cash_reserve_usd == Decimal("0.00")
     assert rules.cc_max_lot_coverage_ratio == Decimal("1.00")

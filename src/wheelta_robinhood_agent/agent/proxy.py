@@ -32,6 +32,12 @@ delivery of the envelope; it no longer validates proxied results.
 
 Tier S/X calls whose result is unusable are `unknown`, as in the hooks. A cancelled handler
 (CLI interrupt) propagates cancellation; `session.close_unresolved_calls` records `unknown`.
+
+ADR-0052: every envelope a Tier X call (the three option-order tools) produces here carries
+`order_call_ref` (`order_call:<tool call id>`), whatever the outcome: validated, error,
+failed upstream, or not forwarded. The stored envelope and the delivered view both hold it,
+so `run_loader` can confirm the model received the ref it cites in `execution_refs`. The
+static fallback envelope carries none: its delivery stops the session.
 """
 
 import json
@@ -51,10 +57,11 @@ from wheelta_robinhood_agent.agent.hooks import (
     ValidationRequest,
     mcp_tool_output,
 )
-from wheelta_robinhood_agent.agent.model_view import model_view
+from wheelta_robinhood_agent.agent.model_view import ORDER_CALL_REF_KEY, model_view
 from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyCall, ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import ResultKind, ToolEventRecorder
 from wheelta_robinhood_agent.agent.run_control import RunControl
+from wheelta_robinhood_agent.domain.assembly_context import order_call_ref_for
 from wheelta_robinhood_agent.domain.enums import ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.mcp_upstream import McpUpstream, UpstreamError
@@ -125,6 +132,13 @@ def _text_result(text: str) -> types.CallToolResult:
 def _unresolved(tier: ToolTier) -> ToolCallStatus:
     """A Tier S/X action whose result is unusable has an unknown outcome (§14)."""
     return ToolCallStatus.UNKNOWN if tier in (ToolTier.S, ToolTier.X) else ToolCallStatus.FAILED
+
+
+def _labeled(call: ProxyCall, envelope: dict[str, Any]) -> dict[str, Any]:
+    """The envelope with its order-call ref when the call is an order action (ADR-0052)."""
+    if call.tier is not ToolTier.X:
+        return envelope
+    return {**envelope, ORDER_CALL_REF_KEY: order_call_ref_for(call.tool_call_id)}
 
 
 @dataclass(frozen=True)
@@ -231,7 +245,7 @@ class ValidatingProxy:
             self.recorder.store_result(
                 call.tool_call_id, ResultKind.RAW_INVALID, outcome.raw_redacted
             )
-        payload = envelope.model_dump(mode="json")
+        payload = _labeled(call, envelope.model_dump(mode="json"))
         # ADR-0037: the ledger keeps the full envelope; the model gets its view.
         output = mcp_tool_output(model_view(payload))
         size = len(output[0]["text"])
@@ -278,7 +292,7 @@ class ValidatingProxy:
             gaps=(gap,),
             retrieved_at=now,
         ).model_dump(mode="json")
-        return mcp_tool_output(envelope)
+        return mcp_tool_output(_labeled(call, envelope))
 
     def _failed(self, call: ProxyCall, gap: str) -> list[dict[str, str]]:
         """The upstream exchange failed, or its result cannot be delivered, after dispatch:

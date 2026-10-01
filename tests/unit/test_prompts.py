@@ -11,6 +11,7 @@ from wheelta_robinhood_agent.config.prompts import (
     load_prompt,
     render_prompt,
 )
+from wheelta_robinhood_agent.domain.enums import MignonType
 
 ACTIVE_PLACEHOLDERS = {
     "account_ref",
@@ -22,6 +23,7 @@ ACTIVE_PLACEHOLDERS = {
     "policy",
     "position_book",
     "recent_decisions",
+    "work_deadline",
     "workspace_prefix",
 }
 
@@ -30,10 +32,10 @@ def _values(names: set[str]) -> dict[str, str]:
     return {name: f"<{name}>" for name in names}
 
 
-def test_active_prompt_is_v13_with_expected_placeholders() -> None:
+def test_active_prompt_is_v15_with_expected_placeholders() -> None:
     template = load_prompt()
     assert (template.prompt_id, template.version) == (ACTIVE_PROMPT_ID, ACTIVE_PROMPT_VERSION)
-    assert template.version == 13
+    assert template.version == 15
     assert template.placeholders == ACTIVE_PLACEHOLDERS
     assert len(template.sha256) == 64
 
@@ -154,6 +156,27 @@ def test_v13_finishes_with_no_order_working() -> None:
     assert "Finish with no order of yours working (`orders.working`)." in text
     assert "(wind-down)" in text
     assert "open day orders" not in text
+
+
+def test_v15_searches_in_discovery_rounds_before_a_work_deadline() -> None:
+    """ADR-0053: rounds that search differently, cheap checks first, and the deadline shown."""
+    text = load_prompt().text
+    assert "Find new trades in discovery rounds\n(`selection.discovery`)" in text
+    assert "- Work deadline: {{work_deadline}}." in text
+    market = load_mignon_prompts()[MignonType.MARKET]
+    assert market.version == 4
+    assert "Only when the current board carries no relevant contract" not in market.text
+    assert "Honor the task's exclusions" in market.text
+
+
+def test_v14_cites_order_call_refs() -> None:
+    """ADR-0052: execution_refs cite the delivered order_call ref, never a bare call ID, and
+    code returns unresolved references before accepting the output."""
+    text = load_prompt().text
+    assert "Retain the supplied call reference" not in text
+    assert "carries an\n   `order_call_ref` (`order_call:...`), whatever its outcome" in text
+    assert "never the bare tool_call_id" in text
+    assert "Once your output is valid, code checks every reference in it." in text
 
 
 def test_v13_allows_concurrent_closes_only() -> None:

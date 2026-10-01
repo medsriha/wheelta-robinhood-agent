@@ -16,11 +16,14 @@ Rules applied (each formula id below is stamped at version "1"):
 - `cushion`: put (live underlying - strike) / live underlying; call (strike - live underlying)
   / live underlying (definitions.cushion, filters.min_cushion_ratio, ADR-0048). Opening only;
   the same formula pre-trade validation applies before placement.
-- `board_premium_divergence`: |live BID - board BID| / board BID for a board-derived
+- `board_premium_divergence`: |live BID - board BID| / board BID, and
+  `board_premium_divergence_usd`: |live BID - board BID| per share, for a board-derived
   candidate (selection.board_comparison: the same premium measure, the bid, for the same
-  contract, from the run's current Wheelta build; ADR-0041). The agent compares it with
-  data_quality.tolerances.board_vs_live_premium_divergence_ratio. A board-derived candidate
-  without that row, or with a zero board bid, gets a `board_screen` gap instead.
+  contract, from the run's current Wheelta build; ADR-0041). The agent compares them with
+  data_quality.tolerances.board_vs_live_premium_divergence_ratio and
+  board_vs_live_premium_divergence_usd; either bound passes (ADR-0054). Code only computes
+  both. A board-derived candidate without that row, or with a zero board bid, gets a
+  `board_screen` gap instead.
 - `csp_capacity`: floor of the smallest applicable capacity (selection.sizing): order cap;
   per-underlying USD cap and ratio x account value, each minus existing CSP collateral on the
   underlying; (C - reserve); (total_ratio x B - R), with C = available settled cash, R = CSP
@@ -96,6 +99,7 @@ F_YIELD = "annualized_yield_on_collateral"
 F_SPREAD = "spread_ratio_of_mid"
 F_CUSHION = "cushion"
 F_BOARD = "board_premium_divergence"
+F_BOARD_USD = "board_premium_divergence_usd"
 F_CSP = "csp_capacity"
 F_CC = "cc_capacity"
 F_CLOSE = "close_capacity"
@@ -689,7 +693,7 @@ class _Computation:
         self.metric("cushion_ratio", "ratio", value, F_CUSHION, (self.inst.evidence_id, spot_id))
 
     def board_divergence(self, q: Quote | None) -> None:
-        """selection.board_comparison inputs for a board-derived candidate (ADR-0041)."""
+        """selection.board_comparison inputs for a board-derived candidate (ADR-0041, ADR-0054)."""
         screen = self.i.board_screen
         if screen is None:
             detail = (
@@ -703,9 +707,13 @@ class _Computation:
             return
         if q is None:
             return
-        value = _CTX.divide(abs(q.bid - screen.bid), screen.bid)
+        difference = abs(q.bid - screen.bid)
         ids = (q.quote_id, screen.evidence_id)
+        value = _CTX.divide(difference, screen.bid)
         self.metric("board_vs_live_premium_divergence_ratio", "ratio", value, F_BOARD, ids)
+        # ADR-0054: the absolute per-share bound, so the agent never computes it itself.
+        name = "board_vs_live_premium_divergence_usd"
+        self.metric(name, "USD", difference, F_BOARD_USD, ids)
 
     def position_metrics(self, position: PositionBookEntry) -> None:
         self.spread()

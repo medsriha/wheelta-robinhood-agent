@@ -10,6 +10,9 @@ Order of work:
    become `AssemblyFinding`s; nothing is repaired by ticker/price/time matching.
 3. Bind live attempts to decision legs by recorded place-call identity; anything that cannot
    be attributed stays in `unassociated_actions`. Every place/cancel call appears once.
+   ADR-0052: a dispatched place left unassociated whose contract and side fit exactly one
+   decision's leg gets an `unassociated_place_matches_decision` finding naming it. It is
+   still not attached: association comes only from the model's `execution_refs`.
 4. Proposal-only dry run (order venue `none`, ADR-0038): build at most one not_placed/DRY_RUN
    attempt per valid proposal with a known positive quantity, simulating reservations in
    priority order against one baseline. Broker and simulated venues follow step 3.
@@ -36,6 +39,7 @@ from wheelta_robinhood_agent.domain.assembly_context import (
     DeliveredRef,
     RefKind,
     ReservationRequirement,
+    order_call_ref_for,
 )
 from wheelta_robinhood_agent.domain.assembly_events import (
     CANCEL_TOOL,
@@ -527,15 +531,49 @@ class _Assembler:
                 )
         return selected_cancels
 
+    @staticmethod
+    def _place_role(action: PlaceAction) -> Role | None:
+        side = action.intent.side if action.intent is not None else None
+        if side is OrderSide.BUY_TO_CLOSE:
+            return "close"
+        if side is OrderSide.SELL_TO_OPEN:
+            return "open"
+        return None
+
+    def _flag_likely_owner(self, plans: list[_Plan], action: PlaceAction) -> None:
+        """ADR-0052: name the one decision an unassociated dispatched place fits, by broker
+        instrument and side. A finding only: the place stays unassociated."""
+        intent, role = action.intent, self._place_role(action)
+        if (
+            role is None
+            or intent is None
+            or not intent.broker_instrument_id
+            or ReasonCode.NOT_DISPATCHED in action.attempt.reason_codes
+        ):
+            return
+        matches = [
+            p
+            for p in plans
+            if role in p.roles
+            and (subject := p.subject(role)) is not None
+            and subject.broker_instrument_id == intent.broker_instrument_id
+        ]
+        if len(matches) != 1:
+            return
+        call_id = action.call.identity.tool_call_id
+        self.find(
+            "unassociated_place_matches_decision",
+            f"place call {order_call_ref_for(call_id)} is for this decision's {role} contract "
+            "but no execution_refs cites it; left unassociated",
+            matches[0].decision_ref,
+            matches[0].leg_ref(role),
+            (call_id,),
+        )
+
     def _bind_place(self, plan: _Plan, action: PlaceAction) -> None:
         call_id = action.call.identity.tool_call_id
         intent = action.intent
-        side = intent.side if intent is not None else None
-        role: Role | None = None
-        if side is OrderSide.BUY_TO_CLOSE:
-            role = "close"
-        elif side is OrderSide.SELL_TO_OPEN:
-            role = "open"
+        role = self._place_role(action)
         if role is None or intent is None or role not in plan.roles:
             self.find(
                 "incompatible_execution_ref",
@@ -986,6 +1024,7 @@ class _Assembler:
         decisions: list[DecisionRecord] = []
         selected_cancels: set[UUID] = set()
         associated_places: set[UUID] = set()
+        plans: list[_Plan] = []
         if self.output is not None:
             plans = [self.plan(i, d) for i, d in enumerate(self.output.decisions)]
             self.funding(plans)
@@ -1012,6 +1051,7 @@ class _Assembler:
         for action in self.idx.places:
             if action.call.identity.tool_call_id in associated_places:
                 continue
+            self._flag_likely_owner(plans, action)
             intent = action.intent
             unassociated.append(
                 UnassociatedAction(

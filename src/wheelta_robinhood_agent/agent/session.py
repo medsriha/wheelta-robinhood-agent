@@ -28,7 +28,9 @@ Two parts:
   feeds `RunMetrics`. Its final text is parsed into AgentDecisionOutput v6; an invalid output
   gets up to `MAX_OUTPUT_REPAIRS` follow-up turns listing the issues, with every tool denied
   (ADR-0044). Each raw (redacted) response and its parse are persisted, each repair
-  correcting the one before.
+  correcting the one before. A valid output whose references do not resolve, or that leaves
+  an order action it could cite unclaimed, gets up to `MAX_REFERENCE_REPAIRS` such turns
+  listing those issues (ADR-0052, `SessionDeps.reference_check`).
 
 `assert_no_order_tools` re-checks the plan before any session is built: without an order
 venue no Tier X tool is allowed; with one only the three option-order tools are. The venue
@@ -136,6 +138,7 @@ from wheelta_robinhood_agent.config.rules import LoadedRules
 from wheelta_robinhood_agent.config.settings import Settings
 from wheelta_robinhood_agent.domain.account import AgenticEligibility
 from wheelta_robinhood_agent.domain.decision_output import (
+    DecisionOutputParsed,
     DecisionOutputParseResult,
     ParseIssue,
     parse_agent_decision_output,
@@ -176,6 +179,8 @@ from wheelta_robinhood_agent.observability.redaction import Redactor
 
 Conn = psycopg.Connection[tuple[object, ...]]
 TransportFactory = Callable[[ClaudeAgentOptions], Transport]
+# ADR-0052: a parsed output -> the reference issues to send back (empty: none).
+ReferenceCheck = Callable[[DecisionOutputParsed], tuple[str, ...]]
 UpstreamFactory = Callable[[McpHttpServer, float], AbstractAsyncContextManager[McpUpstream]]
 
 REMOTE_RESULT_BOUNDARY_ACCEPTED: Final = False
@@ -458,6 +463,9 @@ class SessionDeps:
     mignon_prompts: Mapping[MignonType, str] = field(default_factory=dict)
     status_poll_interval: float = STATUS_POLL_INTERVAL_SECONDS
     interrupt_grace_seconds: float = INTERRUPT_GRACE_SECONDS
+    # ADR-0052: assembles a parsed output against this run's recorded calls (the
+    # orchestrator binds `run_loader.check_references`). None: no reference turns.
+    reference_check: ReferenceCheck | None = None
 
 
 @dataclass
@@ -482,6 +490,11 @@ class SessionResult:
     # (broker order IDs, or the place call ID when no broker order is known).
     order_cleanups: int = 0
     orders_left_unresolved: tuple[str, ...] = ()
+    # ADR-0052: reference turns sent, the issues still open after the last check (None when
+    # no check ran), and a check that failed (its error type; the output is then accepted).
+    reference_repairs: int = 0
+    reference_issues: tuple[str, ...] | None = None
+    reference_check_error: str | None = None
 
 
 def _web_cache_parts(
@@ -863,6 +876,27 @@ OUTPUT_REPAIR_DENIAL: Final = (
 )
 
 
+# ADR-0052: follow-up turns returning a valid output's reference issues to the agent.
+MAX_REFERENCE_REPAIRS: Final = 2
+
+
+def reference_message(issues: Sequence[str], attempt: int) -> str:
+    """The follow-up turn sent when a valid output's references do not resolve (ADR-0052)."""
+    shown = [f"- {i}" for i in issues[:MAX_REPAIR_ISSUES]]
+    if len(issues) > MAX_REPAIR_ISSUES:
+        shown.append(f"- and {len(issues) - MAX_REPAIR_ISSUES} more")
+    return (
+        f"Your final output is valid JSON, but code could not resolve or associate some of "
+        f"its references (reference check {attempt} of {MAX_REFERENCE_REPAIRS}). Issues:\n"
+        + "\n".join(shown)
+        + "\n\nTools are now disabled; any call is denied. Reply with the complete corrected "
+        "AgentDecisionOutput JSON object. Use only references exactly as code supplied them "
+        "(an order call's `order_call_ref`, never its bare tool_call_id). Keep the same "
+        "decisions, rationale, and next run; change only the references listed. Do not "
+        "describe or repeat actions."
+    )
+
+
 def repair_message(issues: Sequence[ParseIssue], attempt: int) -> str:
     """The follow-up turn sent when the final output fails to parse (ADR-0044)."""
     shown = [
@@ -894,6 +928,9 @@ async def _converse(
     ADR-0050 (order venue only): in the last `ORDER_WIND_DOWN_SECONDS` of the budget the gate
     lets only order reads and cancels through, and a final output returned while owned orders
     are unresolved gets up to `MAX_ORDER_CLEANUPS` turns to cancel them, before any repair.
+    ADR-0052: a valid output is then checked with `deps.reference_check`; its issues get up
+    to `MAX_REFERENCE_REPAIRS` turns, with every tool denied as in a repair. A failing check
+    is recorded and the output accepted: the post-run assembly records the same findings.
     """
     done = anyio.Event()
     last_result: ResultMessage | None = None
@@ -950,12 +987,20 @@ async def _converse(
         with receive_scope, anyio.move_on_after(max(deps.session_budget_seconds(), 0.0)):
             text = await turn(_start_message(result.withheld))
             repairs = 0
+            # ADR-0052: the last valid output and its reference issues. A reference turn may
+            # only improve on it; otherwise it is restored as the effective output.
+            best: tuple[str, DecisionOutputParsed, tuple[str, ...]] | None = None
             while text is not None:
                 result.raw_outputs.append(text)
                 result.raw_output = text
+                result.reference_issues = None
                 if deps.run_control.stop_requested:
                     break
-                if repairs == 0 and result.order_cleanups < MAX_ORDER_CLEANUPS:
+                if (
+                    repairs == 0
+                    and result.reference_repairs == 0
+                    and result.order_cleanups < MAX_ORDER_CLEANUPS
+                ):
                     unresolved = cleanup_candidates(deps)
                     if unresolved:
                         result.order_cleanups += 1
@@ -963,10 +1008,26 @@ async def _converse(
                             output_gate.restrict(CLEANUP_DENIAL, CLEANUP_TOOLS)
                         text = await turn(cleanup_message(unresolved, result.order_cleanups))
                         continue
-                if repairs >= MAX_OUTPUT_REPAIRS:
-                    break
                 parsed = parse_agent_decision_output(deps.redactor.redact_text(text))
-                if parsed.ok:
+                if isinstance(parsed, DecisionOutputParsed):
+                    # Off the event loop, so the watcher still enforces stop and deadline.
+                    issues = await anyio.to_thread.run_sync(_reference_issues, deps, parsed, result)
+                    if best is not None and not _improves(best, parsed, issues, result):
+                        _restore(result, best)
+                        break
+                    best = (text, parsed, issues)
+                    if not issues or result.reference_repairs >= MAX_REFERENCE_REPAIRS:
+                        break
+                    result.reference_repairs += 1
+                    if output_gate is not None:
+                        output_gate.close(OUTPUT_REPAIR_DENIAL)
+                    text = await turn(reference_message(issues, result.reference_repairs))
+                    continue
+                if best is not None:
+                    # The reply to a reference turn did not parse: keep the valid output.
+                    _restore(result, best)
+                    break
+                if repairs >= MAX_OUTPUT_REPAIRS:
                     break
                 repairs += 1
                 if output_gate is not None:
@@ -980,6 +1041,47 @@ async def _converse(
         # The budget elapsed (or the stream ended) without a ResultMessage.
         deps.deadline_check()
         result.error = "session ended without a result message"
+
+
+def _improves(
+    best: tuple[str, DecisionOutputParsed, tuple[str, ...]],
+    parsed: DecisionOutputParsed,
+    issues: tuple[str, ...],
+    result: SessionResult,
+) -> bool:
+    """Whether a reply to a reference turn may replace the last valid output (ADR-0052): the
+    check ran, the reply has fewer issues, and it keeps the same decision actions in order."""
+    _, before, before_issues = best
+    same = [d.action for d in parsed.output.decisions] == [
+        d.action for d in before.output.decisions
+    ]
+    return result.reference_check_error is None and same and len(issues) < len(before_issues)
+
+
+def _restore(
+    result: SessionResult, best: tuple[str, DecisionOutputParsed, tuple[str, ...]]
+) -> None:
+    """Make the last valid output effective again: it is stored once more as the final
+    response, correcting the rejected reply (persist_output chains corrections)."""
+    text, _, issues = best
+    result.raw_outputs.append(text)
+    result.raw_output = text
+    result.reference_issues = issues
+
+
+def _reference_issues(
+    deps: SessionDeps, parsed: DecisionOutputParsed, result: SessionResult
+) -> tuple[str, ...]:
+    """Run the reference check (ADR-0052); record its issues, or its failure as none."""
+    if deps.reference_check is None or result.reference_check_error is not None:
+        return ()
+    try:
+        issues = deps.reference_check(parsed)
+    except Exception as exc:  # noqa: BLE001 - feedback only; the assembly records the same
+        result.reference_check_error = type(exc).__name__
+        return ()
+    result.reference_issues = issues
+    return issues
 
 
 def persist_output(deps: SessionDeps, result: SessionResult) -> None:

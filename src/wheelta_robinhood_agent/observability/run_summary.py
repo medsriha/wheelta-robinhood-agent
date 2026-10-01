@@ -326,6 +326,58 @@ def _attempt_line(attempt: Attempt) -> str:
     return " · ".join(parts)
 
 
+def _candidate_lines(summary: RunSummaryInput) -> list[str]:
+    """One row per contract/status; selected contracts already appear with their decisions."""
+    groups: dict[tuple[str, str, str], tuple[list[str], list[str]]] = {}
+    for model, candidate in zip(summary.candidates, _candidate_facts(summary), strict=True):
+        selection = str(candidate["selection"])
+        key = (model.underlying, model.occ_symbol, selection)
+        refs, gaps = groups.setdefault(key, ([], []))
+        if model.candidate_ref not in refs:
+            refs.append(model.candidate_ref)
+        gaps.extend(gap for gap in model.gaps if gap not in gaps)
+    lines: list[str] = []
+    statuses: set[str] = set()
+    for (underlying, contract, selection), (refs, gaps) in groups.items():
+        if selection == "selected" and not gaps:
+            continue
+        statuses.add(selection)
+        lines.append(f"- {underlying} {contract} [{', '.join(refs)}]: {selection}")
+        lines.extend(f"    Data gap: {gap}" for gap in gaps)
+    if lines:
+        lines.insert(0, "Other candidates / candidate gaps (selection is not execution):")
+        if "not selected" in statuses:
+            lines.append("Not selected does not establish a rejection reason; research follows.")
+        if "unknown" in statuses:
+            lines.append("Selection unknown because valid final decisions are unavailable.")
+    elif not summary.candidates:
+        lines.append("No candidate list recorded; this does not establish none were considered.")
+    return lines
+
+
+def _research_lines(summary: RunSummaryInput) -> list[str]:
+    """Print each exact claim once, retaining all sources and task-scoped gaps/questions."""
+    if not summary.research_reports:
+        return []
+    findings: dict[str, list[str]] = {}
+    tasks: dict[str, None] = {}
+    issues: dict[str, None] = {}
+    for report in summary.research_reports:
+        tasks[report.task] = None
+        for finding in report.findings:
+            refs = findings.setdefault(finding.claim, [])
+            refs.extend(ref for ref in (*finding.refs, *finding.web_urls) if ref not in refs)
+        for gap in report.gaps:
+            issues[f"- Research gap ({report.task}): {gap}"] = None
+        for question in report.follow_up_questions:
+            issues[f"- Research question ({report.task}): {question}"] = None
+    return [
+        "Research (supporting claims, not final decisions): " + "; ".join(tasks),
+        *(f"- {claim} [{', '.join(refs)}]" for claim, refs in findings.items()),
+        *issues,
+    ]
+
+
 def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
     """The deterministic facts block, from recorded values only."""
     lines = [
@@ -351,7 +403,7 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
                 summary.reason or "", summary.reason or "No failure reason was recorded."
             )
         )
-    lines.extend(f"Diagnostic: {detail}" for detail in summary.diagnostic_details)
+    lines.extend(f"Diagnostic: {detail}" for detail in dict.fromkeys(summary.diagnostic_details))
     if record is None:
         lines.append("Run record: not assembled (see the ledger for recorded events)")
     else:
@@ -363,9 +415,11 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
             underlying = f" {d.underlying}" if d.underlying else ""
             lines.append(f"- {d.action.value}{underlying} [{d.decision_ref}]")
             lines.append(f"    Why: {d.rationale}")
-            if d.thesis:
+            if d.thesis and d.thesis.strip() != d.rationale.strip():
                 lines.append(f"    Thesis: {d.thesis}")
-            lines.extend(f"    Reconsider if: {c}" for c in d.invalidation_conditions)
+            lines.extend(
+                f"    Reconsider if: {c}" for c in dict.fromkeys(d.invalidation_conditions)
+            )
             lines.extend(f"    Data gap: {g.field}: {g.detail}" for g in d.gaps)
             lines.extend(
                 f"    {m.name}: {_num(m.value.value) or 'unknown'} {m.unit}" for m in d.metrics
@@ -399,47 +453,17 @@ def render_facts_text(summary: RunSummaryInput, redactor: Redactor) -> str:
             f"{m.name}: {_num(m.value.value) or 'unknown'} {m.unit}" for m in record.metrics
         )
         lines.extend(f"Assembly finding: {f.code}: {f.detail}" for f in record.findings)
-    lines.append("Candidates encountered during research (selection is not execution):")
-    for candidate_model, candidate in zip(
-        summary.candidates, _candidate_facts(summary), strict=True
-    ):
-        lines.append(
-            f"- {candidate['underlying']} {candidate['occ_symbol']} "
-            f"[{candidate['candidate_ref']}]: {candidate['selection']}"
-        )
-        if candidate["selection"] == "not selected":
-            lines.append(
-                "    No separate rejection rationale recorded; see decisions and research below."
-            )
-        elif candidate["selection"] == "unknown":
-            lines.append("    Selection unknown because valid final decisions are unavailable.")
-        lines.extend(f"    Data gap: {gap}" for gap in candidate_model.gaps)
-        lines.extend(
-            f"    Cited research: {finding.claim}"
-            for report in summary.research_reports
-            for finding in report.findings
-            if candidate_model.candidate_ref in finding.refs
-        )
-    if not summary.candidates:
-        lines.append(
-            "No candidate list recorded; this does not establish that none were considered."
-        )
+    lines.extend(_candidate_lines(summary))
     if summary.research_unavailable:
         lines.append(f"Research context unavailable: {summary.research_unavailable}")
-    for report in summary.research_reports:
-        lines.append(f"Research task: {report.task}")
-        for finding in report.findings:
-            refs = ", ".join((*finding.refs, *finding.web_urls))
-            lines.append(f"- Research finding (not a final decision): {finding.claim} [{refs}]")
-        lines.extend(f"- Research gap: {gap}" for gap in report.gaps)
-        lines.extend(f"- Research question: {q}" for q in report.follow_up_questions)
+    lines.extend(_research_lines(summary))
     audit = summary.audit_status or "not run"
     lines.append(
         f"Audit: {audit} · {summary.audit_violations} violation(s) · "
         f"{summary.audit_unverifiable} unverifiable check(s)"
     )
     lines.append("Alerts: " + (", ".join(summary.alerts) if summary.alerts else "none"))
-    lines.extend(f"Audit detail: {detail}" for detail in summary.audit_details)
+    lines.extend(f"Audit detail: {detail}" for detail in dict.fromkeys(summary.audit_details))
     if summary.next_run_at is not None:
         source = f" ({summary.next_run_source})" if summary.next_run_source else ""
         lines.append(f"Next run not before: {summary.next_run_at.isoformat()}{source}")

@@ -757,7 +757,7 @@ def test_board_query_filters_appended_and_both_arg_sets_recorded() -> None:
     updated = spec["updatedInput"]
     assert updated["limit"] == 10
     assert updated["filters"][0] == agent_filters[0]
-    assert {"field": "contract.dte", "op": "gte", "value": 7} in updated["filters"]
+    assert {"field": "contract.dte", "op": "gte", "value": 1} in updated["filters"]
     assert s.rec.names() == ["requested", "dispatched"]
     assert s.rec.event("requested")["arguments_redacted"] == requested
     assert s.rec.event("dispatched")["effective_arguments_redacted"] == updated
