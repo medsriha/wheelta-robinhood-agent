@@ -6,6 +6,7 @@ from wheelta_robinhood_agent.config.settings import (
     SettingsError,
     load_credential_seed_settings,
     load_database_url,
+    load_ledger_readonly_url,
     load_settings,
 )
 from wheelta_robinhood_agent.domain.enums import ExecutionMode
@@ -42,6 +43,7 @@ ALL_VARS = [
     "WHEELTA_MCP_URL",
     "HEARTBEAT_URL",
     "ALERT_WEBHOOK_URL",
+    "LEDGER_READONLY_URL",
     "RUN_SUMMARY_EMAIL_ENABLED",
     "RESEND_API_KEY",
     "RUN_SUMMARY_EMAIL_FROM",
@@ -224,6 +226,18 @@ def test_load_database_url_alone(env: pytest.MonkeyPatch) -> None:
     env.delenv("DATABASE_URL")
     with pytest.raises(SettingsError, match="DATABASE_URL"):
         load_database_url()
+
+
+def test_load_ledger_readonly_url_alone(env: pytest.MonkeyPatch) -> None:
+    env.delenv("ANTHROPIC_API_KEY")
+    env.delenv("DATABASE_URL")
+    with pytest.raises(SettingsError, match="LEDGER_READONLY_URL"):
+        load_ledger_readonly_url()
+    env.setenv("LEDGER_READONLY_URL", " ")
+    with pytest.raises(SettingsError, match="LEDGER_READONLY_URL"):
+        load_ledger_readonly_url()
+    env.setenv("LEDGER_READONLY_URL", "postgresql://ledger_reader:p@proxy:1/db")
+    assert load_ledger_readonly_url().get_secret_value().startswith("postgresql://ledger_reader")
 
 
 def test_claude_code_login_mode_is_local_only(env: pytest.MonkeyPatch) -> None:

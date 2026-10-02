@@ -228,3 +228,5 @@ docs/
 
 # Personal Claude Code settings (Robinhood order-tool deny rules live here)
 .claude/settings.local.json
+.claude/settings.json
+.claude/skills/ledger-debug/SKILL.md

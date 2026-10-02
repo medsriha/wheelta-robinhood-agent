@@ -6,12 +6,14 @@ attempt with its review/place/cancel calls (simulated in a dry run, ADR-0038), t
 findings attached to it, and the full tool-call timeline. Or lists recent runs to pick dry
 and live runs to compare. Never writes to the ledger and never calls a broker.
 
-Uses DATABASE_URL and APP_ENV from the usual settings (`.env` locally).
+Uses DATABASE_URL and APP_ENV from the usual settings (`.env` locally). With `--prod`, reads
+the production ledger instead, as the read-only `ledger_reader` role (LEDGER_READONLY_URL).
 
 Usage:
   uv run python scripts/trace_run.py --list [N]            recent runs that started a session
   uv run python scripts/trace_run.py RUN_ID [--json]       one run's decision trace
   uv run python scripts/trace_run.py --slot 2026-09-28T15:05:00Z [--agent close|sell] [--json]
+  add --prod to any of these to read the production ledger
 
 A due tick has two runs (ADR-0057): the Buy-to-Close run (`close`) and the Sell Options run
 (`sell`). `--slot` without `--agent` traces the slot's last run that started a session.
@@ -28,8 +30,12 @@ from wheelta_robinhood_agent.agent.trace_loader import (
     load_decision_trace,
     run_id_at,
 )
-from wheelta_robinhood_agent.config.settings import SettingsError, load_settings
-from wheelta_robinhood_agent.domain.enums import AgentRole
+from wheelta_robinhood_agent.config.settings import (
+    SettingsError,
+    load_ledger_readonly_url,
+    load_settings,
+)
+from wheelta_robinhood_agent.domain.enums import AgentRole, AppEnv
 from wheelta_robinhood_agent.ledger.db import connect
 from wheelta_robinhood_agent.ledger.errors import UnknownEntity
 from wheelta_robinhood_agent.observability.decision_trace import render_trace_markdown
@@ -45,6 +51,9 @@ def _parse(argv: list[str]) -> argparse.Namespace:
         "--agent", type=AgentRole, choices=list(AgentRole), help="with --slot: which agent's run"
     )
     parser.add_argument("--json", action="store_true", help="print the trace as JSON")
+    parser.add_argument(
+        "--prod", action="store_true", help="read production as ledger_reader (LEDGER_READONLY_URL)"
+    )
     return parser.parse_args(argv)
 
 
@@ -71,16 +80,20 @@ def _listing(rows: tuple[RunListing, ...]) -> str:
 def main(argv: list[str] | None = None) -> int:
     args = _parse(sys.argv[1:] if argv is None else argv)
     try:
-        settings = load_settings()
+        if args.prod:
+            url, environment = load_ledger_readonly_url(), AppEnv.PRODUCTION
+        else:
+            settings = load_settings()
+            url, environment = settings.DATABASE_URL, settings.APP_ENV
     except SettingsError as exc:
         sys.stderr.write(f"settings invalid: {exc}\n")
         return 1
-    with connect(settings.DATABASE_URL) as conn:
+    with connect(url) as conn:
         if args.list is not None:
-            sys.stdout.write(_listing(list_runs(conn, settings.APP_ENV, args.list)))
+            sys.stdout.write(_listing(list_runs(conn, environment, args.list)))
             return 0
         try:
-            run_id = args.run_id or run_id_at(conn, settings.APP_ENV, args.slot, args.agent)
+            run_id = args.run_id or run_id_at(conn, environment, args.slot, args.agent)
             trace = load_decision_trace(conn, run_id)
         except UnknownEntity as exc:
             sys.stderr.write(f"{exc}\n")

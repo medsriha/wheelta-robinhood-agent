@@ -443,6 +443,37 @@ def load_database_url() -> SecretStr:
         raise SettingsError(f"invalid configuration: {problems}") from None
 
 
+class LedgerReaderSettings(BaseSettings):
+    """Only LEDGER_READONLY_URL: the production ledger as the read-only `ledger_reader` role,
+    for operator debugging from a desktop (scripts/, docs/OPERATIONS.md). Never a Railway
+    variable; the agent never reads it."""
+
+    model_config = SettingsConfigDict(
+        extra="ignore", frozen=True, case_sensitive=True, env_file=None, hide_input_in_errors=True
+    )
+
+    LEDGER_READONLY_URL: SecretStr
+
+    @field_validator("LEDGER_READONLY_URL")
+    @classmethod
+    def _not_blank(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("required; must not be blank")
+        return value
+
+
+def load_ledger_readonly_url() -> SecretStr:
+    """Load LEDGER_READONLY_URL alone, failing fast without echoing the value."""
+    try:
+        return LedgerReaderSettings().LEDGER_READONLY_URL
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or '<settings>'}: {err['msg']}"
+            for err in exc.errors()
+        )
+        raise SettingsError(f"invalid configuration: {problems}") from None
+
+
 class CredentialSeedSettings(BaseSettings):
     """Only what the Robinhood credential seed command needs (ADR-0021): the environment,
     the ledger, the encryption key, and the seed-only ROBINHOOD_OAUTH_* values the probe
