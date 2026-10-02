@@ -27,7 +27,8 @@ ACTIVE_PROMPTS: Mapping[AgentRole, tuple[str, int]] = MappingProxyType(
         # ADR-0061: typed Mignon briefs; ADR-0062: board status in the run context.
         # ADR-0066: code works each order (work_option_order / await_order_work).
         AgentRole.CLOSE: ("wheel_close", 3),
-        AgentRole.SELL: ("wheel_sell", 3),
+        # ADR-0070: discovery continues while opening capacity is unused.
+        AgentRole.SELL: ("wheel_sell", 4),
     }
 )
 # ADR-0025: one prompt per Mignon type; each returns MignonReport v1 (v2 prompts: ADR-0032).

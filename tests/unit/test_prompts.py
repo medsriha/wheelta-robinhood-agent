@@ -56,7 +56,7 @@ def test_active_prompts_per_role_with_expected_placeholders() -> None:
     assert set(templates) == {AgentRole.CLOSE, AgentRole.SELL}
     assert ACTIVE_PROMPTS == {
         AgentRole.CLOSE: ("wheel_close", 3),
-        AgentRole.SELL: ("wheel_sell", 3),
+        AgentRole.SELL: ("wheel_sell", 4),
     }
     for role, template in templates.items():
         assert (template.prompt_id, template.version) == ACTIVE_PROMPTS[role]
@@ -330,3 +330,12 @@ def test_v3_code_works_every_order() -> None:
         assert "Call `work_option_order` with option_id, side, quantity, start_price" in flat
         assert "Wait with `await_order_work` until the job's status is no longer" in flat
         assert "review_option_order" not in text and "place_option_order" not in text
+
+
+def test_v4_sell_discovery_continues_while_capacity_remains() -> None:
+    """ADR-0070: one trade does not end selection; rounds follow selection.discovery."""
+    flat = " ".join(_sell().text.split())
+    assert "when every candidate so far is rejected" not in flat
+    assert "One trade does not end selection" in flat
+    assert "First work the candidates that already passed the cheap checks this run" in flat
+    assert "Judge the time left only from the work deadline" in flat
