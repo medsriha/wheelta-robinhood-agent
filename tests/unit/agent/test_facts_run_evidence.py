@@ -56,3 +56,16 @@ def test_a_newer_complete_read_wins_over_older_halves() -> None:
 
 def test_no_reads_is_none() -> None:
     assert RunEvidence(()).positions() is None
+
+
+def test_first_picks_the_earliest_complete_read() -> None:
+    """The cash baseline uses the run's opening positions (ADR-0072)."""
+    old = _read(1, SHARES, age=90)
+    reads = _evidence(old, _read(2, OPTIONS, age=80), _read(3, SHARES, age=10))
+    read = reads.positions(first=True)
+    assert read is not None and read.complete
+    assert read.source_tool_call_ids == (uuid.UUID(int=101), uuid.UUID(int=102))
+
+
+def test_no_baseline_without_snapshot_or_orders() -> None:
+    assert _evidence(_read(9, SHARES | OPTIONS)).cash_baseline() is None

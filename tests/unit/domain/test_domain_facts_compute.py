@@ -27,6 +27,7 @@ from wheelta_robinhood_agent.domain.evidence import Gap, SourcedValue
 from wheelta_robinhood_agent.domain.facts import DecisionFacts, FactsPurpose
 from wheelta_robinhood_agent.domain.facts_compute import (
     CandidateProvenance,
+    CashBaseline,
     ConfirmedFill,
     FactInputs,
     OpenOrdersRead,
@@ -510,6 +511,44 @@ def test_reservation_is_unavailable_when_cash_does_not_net_to_buying_power(
 ) -> None:
     f = facts(open_inputs(account=snapshot(r=None, gross=gross), **HELD))
     assert f.initial_quantity is None
+    assert "csp_reserved_cash_usd" in gap_kinds(f)
+
+
+# ADR-0072: a put filled this run, its premium in `cash` but not yet in buying power. The
+# run opened with no puts and 7000 settled; now one $45 put (R = 4500) and 100 unsettled.
+OPENING = CashBaseline(
+    account=snapshot(c="7000", r=None, gross="7000"), positions=positions(), open_orders=orders()
+)
+
+
+def test_unsettled_proceeds_since_a_balanced_baseline_still_derive_the_reservation() -> None:
+    acct = snapshot(c="2500", r=None, gross="7100")
+    f = facts(open_inputs(account=acct, cash_baseline=OPENING, **HELD))
+    assert "csp_reserved_cash_usd" not in gap_kinds(f)
+    assert metric(f, "derived_csp_reserved_cash_usd") == D(4500)
+    assert f.initial_quantity is not None
+
+
+@pytest.mark.parametrize(
+    ("net", "gross", "opening_gross"),
+    [
+        ("2499.99", "7100", "7000"),  # buying power moved by more than the new collateral
+        ("2500", "6900", "7000"),  # cash fell: not unsettled proceeds
+        ("2500", "7100", "7100"),  # the baseline itself had unsettled proceeds
+    ],
+)
+def test_baseline_check_fails_closed(net: str, gross: str, opening_gross: str) -> None:
+    opening = OPENING.model_copy(
+        update={"account": snapshot(c="7000", r=None, gross=opening_gross)}
+    )
+    acct = snapshot(c=net, r=None, gross=gross)
+    f = facts(open_inputs(account=acct, cash_baseline=opening, **HELD))
+    assert f.initial_quantity is None
+    assert "csp_reserved_cash_usd" in gap_kinds(f)
+
+
+def test_unsettled_proceeds_without_a_baseline_fail_closed() -> None:
+    f = facts(open_inputs(account=snapshot(c="2500", r=None, gross="7100"), **HELD))
     assert "csp_reserved_cash_usd" in gap_kinds(f)
 
 

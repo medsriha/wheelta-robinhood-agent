@@ -51,6 +51,7 @@ from wheelta_robinhood_agent.domain.facts import DecisionFacts, FactsPurpose
 from wheelta_robinhood_agent.domain.facts_compute import (
     BoardScreen,
     CandidateProvenance,
+    CashBaseline,
     FactInputs,
     OpenOrdersRead,
     OptionInstrument,
@@ -223,23 +224,36 @@ class RunEvidence:
                     )
         return reads
 
-    def positions(self) -> PositionsRead | None:
+    def positions(self, first: bool = False) -> PositionsRead | None:
         """The latest complete positions read: a read covering both kinds, or the latest
         shares-only and options-only reads of this run combined (ADR-0031), whichever is
         newer. A lone half is returned as is, so the facts record which half is missing.
-        Options halves include pending short rows once resolved (ADR-0034)."""
+        Options halves include pending short rows once resolved (ADR-0034). `first` picks
+        the earliest complete read instead (the cash baseline, ADR-0072)."""
         reads = [p for e in self.items for p in e.positions] + self._resolved_option_reads()
         reads.sort(key=lambda p: p.as_of)
         complete = [p for p in reads if p.complete]
         shares = [p for p in reads if p.covers == {PositionsCoverage.SHARES}]
         options = [p for p in reads if p.covers == {PositionsCoverage.OPTIONS}]
-        candidates: list[PositionsRead] = complete[-1:]
+        i = 0 if first else -1
+        candidates: list[PositionsRead] = complete[i:][:1]
         if shares and options:
-            candidates.append(combine_positions(shares[-1], options[-1]))
+            candidates.append(combine_positions(shares[i], options[i]))
         if candidates:
-            return max(candidates, key=lambda p: p.as_of)
-        latest: PositionsRead | None = self._latest(reads)
+            pick = min if first else max
+            return pick(candidates, key=lambda p: p.as_of)
+        latest: PositionsRead | None = None if first else self._latest(reads)
         return latest
+
+    def cash_baseline(self) -> CashBaseline | None:
+        """The run's first account snapshot with its first complete positions and open-orders
+        reads (ADR-0072); None if any is missing."""
+        snapshots = [a for e in self.items for a in e.account_snapshots]
+        pos = self.positions(first=True)
+        orders = [o for e in self.items for o in e.open_orders]
+        if not snapshots or pos is None or not pos.complete or not orders:
+            return None
+        return CashBaseline(account=snapshots[0], positions=pos, open_orders=orders[0])
 
     def board_screens(self) -> dict[str, BoardScreen]:
         """Board rows of the run's current Wheelta build, by OCC symbol (ADR-0041).
@@ -360,6 +374,7 @@ class DecisionFactsService:
                 account=evidence.account(),
                 positions=evidence.positions(),
                 open_orders=evidence.open_orders(),
+                cash_baseline=evidence.cash_baseline(),
                 candidate=candidate,
                 board_screen=(
                     evidence.board_screens().get(str(instrument.occ_symbol))

@@ -274,6 +274,16 @@ class OpenOrdersRead(_Observation):
     orders: tuple[WorkingOrder, ...] = ()
 
 
+class CashBaseline(DomainModel):
+    """The run's first account snapshot with its first complete positions and open-orders
+    reads (ADR-0072): the cash a later snapshot's unsettled proceeds are measured from. It is
+    used only if its own cash minus put collateral equals its buying power to the cent."""
+
+    account: AccountSnapshot
+    positions: PositionsRead
+    open_orders: OpenOrdersRead
+
+
 class BoardScreen(_Observation):
     """One Wheelta board row's contract screen (ADR-0041): build-time, never a quote.
 
@@ -328,6 +338,7 @@ class FactInputs(DomainModel):
     account: AccountSnapshot | None = None
     positions: PositionsRead | None = None
     open_orders: OpenOrdersRead | None = None
+    cash_baseline: CashBaseline | None = None
     candidate: CandidateProvenance | None = None
     # ADR-0041: the current-build board row matching a board-derived candidate's contract.
     board_screen: BoardScreen | None = None
@@ -408,6 +419,9 @@ class FactInputs(DomainModel):
         ids += [self.account.snapshot_id] if self.account else []
         ids += [self.positions.evidence_id] if self.positions else []
         ids += [self.open_orders.evidence_id] if self.open_orders else []
+        if self.cash_baseline is not None:
+            b = self.cash_baseline
+            ids += [b.account.snapshot_id, b.positions.evidence_id, b.open_orders.evidence_id]
         ids += [self.board_screen.evidence_id] if self.board_screen else []
         ids += [self.debit_funding.evidence_id] if self.debit_funding else []
         ids += list(self.position.entry_fill_ids) if self.position else []
@@ -418,6 +432,32 @@ class FactInputs(DomainModel):
 # --------------------------------------------------------------------------------------------
 # Computation
 # --------------------------------------------------------------------------------------------
+
+
+def _cover(
+    pos: PositionsRead, orders: OpenOrdersRead, right: OptionRight, underlying: str | None
+) -> tuple[Decimal, int] | None:
+    """Short contracts plus working sell-to-open orders of `right` on `underlying` (every
+    underlying if None), each counted once: (sum of strike x m x qty, sum of m x qty). None
+    if any multiplier is unverified."""
+    items = [
+        (h.occ_symbol.strike, h.multiplier, h.short_quantity)
+        for h in pos.short_options
+        if underlying in (None, h.underlying) and h.occ_symbol.right is right
+    ] + [
+        (o.occ_symbol.strike, o.multiplier, o.unfilled_quantity)
+        for o in orders.orders
+        if underlying in (None, o.underlying)
+        and o.occ_symbol.right is right
+        and o.side is OrderSide.SELL_TO_OPEN
+    ]
+    collateral, shares = _ZERO, 0
+    for strike, mult, qty in items:
+        if mult is None:
+            return None
+        collateral += strike * mult * qty
+        shares += mult * qty
+    return collateral, shares
 
 
 class _Computation:
@@ -580,8 +620,11 @@ class _Computation:
         R = strike x multiplier x quantity over short puts and the unfilled part of working
         sell-to-open puts, each counted once. The broker nets that collateral from
         `buying_power` but not from `cash`, so R must equal the snapshot's gross `cash_usd`
-        minus `available_settled_cash_usd` to the cent; otherwise None with a gap (unsettled
-        proceeds, an unknown hold, or a broker change would make C or R wrong).
+        minus `available_settled_cash_usd` to the cent. Failing that, R is still used when
+        buying power equals the run's balanced baseline cash minus R and cash has not fallen
+        (ADR-0072): the difference is then proceeds received since the baseline, not yet
+        settled. Otherwise None with a gap (an unknown hold or a broker change would make C or
+        R wrong).
         """
         field = "csp_reserved_cash_usd"
         if self.positions is None or self.orders is None:
@@ -596,16 +639,38 @@ class _Computation:
         if gross is None or net is None:
             self.gap(field, DataQuality.MISSING, "the snapshot lacks gross cash or buying power")
             return None
+        ids: tuple[UUID, ...] = (
+            acct.snapshot_id,
+            self.positions.evidence_id,
+            self.orders.evidence_id,
+        )
         if gross - r != net:
-            self.gap(
-                field,
-                DataQuality.CONTRADICTORY,
-                f"cash {gross} minus put collateral {r} does not equal buying power {net}",
-            )
-            return None
-        ids = (acct.snapshot_id, self.positions.evidence_id, self.orders.evidence_id)
+            base = self.settled_baseline_cash()
+            # ADR-0072: proceeds that arrived since the baseline sit in `cash` but not in
+            # buying power until they settle. Buying power must then equal the baseline's
+            # (settled) cash minus today's collateral, and cash may only have grown.
+            if base is None or net != base[0] - r or gross < base[0]:
+                self.gap(
+                    field,
+                    DataQuality.CONTRADICTORY,
+                    f"cash {gross} minus put collateral {r} does not equal buying power {net}",
+                )
+                return None
+            ids += base[1]
         self.metric("derived_csp_reserved_cash_usd", "USD", r, F_CSP, ids)
         return r
+
+    def settled_baseline_cash(self) -> tuple[Decimal, tuple[UUID, ...]] | None:
+        """The baseline's gross cash and evidence ids when its cash minus its put collateral
+        equals its buying power to the cent (no unsettled proceeds then), else None."""
+        b = self.i.cash_baseline
+        if b is None or not b.positions.complete:
+            return None
+        gross, net = b.account.cash_usd, b.account.available_settled_cash_usd
+        cover = _cover(b.positions, b.open_orders, OptionRight.PUT, None)
+        if gross is None or net is None or cover is None or gross - cover[0] != net:
+            return None
+        return gross, (b.account.snapshot_id, b.positions.evidence_id, b.open_orders.evidence_id)
 
     @cached_property
     def positions(self) -> PositionsRead | None:
@@ -774,25 +839,10 @@ class _Computation:
         if pos is None or orders is None:
             return None
         underlying = None if every_underlying else self.inst.underlying
-        items = [
-            (h.occ_symbol.strike, h.multiplier, h.short_quantity)
-            for h in pos.short_options
-            if underlying in (None, h.underlying) and h.occ_symbol.right is right
-        ] + [
-            (o.occ_symbol.strike, o.multiplier, o.unfilled_quantity)
-            for o in orders.orders
-            if underlying in (None, o.underlying)
-            and o.occ_symbol.right is right
-            and o.side is OrderSide.SELL_TO_OPEN
-        ]
-        collateral, shares = _ZERO, 0
-        for strike, mult, qty in items:
-            if mult is None:
-                self.gap(field, DataQuality.MISSING, "an existing contract's multiplier is unknown")
-                return None
-            collateral += strike * mult * qty
-            shares += mult * qty
-        return collateral, shares
+        cover = _cover(pos, orders, right, underlying)
+        if cover is None:
+            self.gap(field, DataQuality.MISSING, "an existing contract's multiplier is unknown")
+        return cover
 
     def csp_capacity(self) -> int | None:
         collateral = self.collateral
