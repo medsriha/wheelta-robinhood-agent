@@ -1,0 +1,34 @@
+{
+  "provenance": {
+    "tool": "get_portfolio",
+    "arguments": {
+      "account_number": "ACCOUNT_REDACTED"
+    },
+    "server": "robinhood-trading 1.6.0",
+    "captured_on": "2026-10-02",
+    "captured_via": "Claude Code session (read-only call, owner-approved)",
+    "scrubbing": "account_number replaced with ACCOUNT_REDACTED; the tool's `guide` prose dropped",
+    "note": "Agentic cash account holding 2 short DHT 2026-10-16 $22 puts (collateral 4400.00), no working orders, unsettled_funds 0 per get_accounts: buying_power = cash - 4400 (ADR-0071)"
+  },
+  "data": {
+    "total_value": "19983.77",
+    "equity_value": "0",
+    "options_value": "-90",
+    "futures_value": "0",
+    "event_contracts_value": "0",
+    "crypto_value": "0",
+    "cash": "20073.77",
+    "pending_deposits": "0",
+    "mutual_funds_value": "0",
+    "fixed_income_value": "0",
+    "currency": "USD",
+    "buying_power": {
+      "buying_power": "15673.7700",
+      "unleveraged_buying_power": "15673.7700",
+      "display_currency": "USD"
+    },
+    "crypto_buying_power": {
+      "buying_power": "15673.7700"
+    }
+  }
+}

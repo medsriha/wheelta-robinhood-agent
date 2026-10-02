@@ -117,7 +117,10 @@ def snapshot(
     age: int = 30,
     verified: bool = True,
     quality: DataQuality | None = None,
+    gross: str | None = "auto",
 ) -> AccountSnapshot:
+    if gross == "auto":  # the broker's cash: settled cash plus any reported reservation
+        gross = str(D(c) + D(r or "0")) if c is not None else None
     cash = {
         "available_settled_cash_usd": D(c) if c is not None else None,
         "csp_reserved_cash_usd": D(r) if r is not None else None,
@@ -143,6 +146,7 @@ def snapshot(
         tax_lots_ref=None,
         quality=quality or (DataQuality.MISSING if gaps else DataQuality.OK),
         gaps=gaps,
+        cash_usd=D(gross) if gross is not None else None,
         **fields,
     )
 
@@ -475,7 +479,7 @@ def test_missing_settled_cash_is_a_gap() -> None:
     assert "available_settled_cash_usd" in gap_kinds(f)
 
 
-# -- ADR-0031: CSP reservation derived from complete positions and orders reads --------------
+# -- ADR-0071: CSP reservation derived from positions and orders, checked against cash -------
 
 
 def test_reservation_is_zero_without_short_puts_or_working_puts() -> None:
@@ -485,15 +489,26 @@ def test_reservation_is_zero_without_short_puts_or_working_puts() -> None:
     assert derived.initial_quantity == reported.initial_quantity is not None
 
 
-@pytest.mark.parametrize(
-    "kw",
-    [
-        {"positions": positions(shorts=(short(OTHER_PUT, qty=1, inst="inst-9"),))},
-        {"open_orders": orders(working())},
-    ],
-)
-def test_reservation_is_unavailable_when_puts_are_held_or_working(kw: dict[str, Any]) -> None:
-    f = facts(open_inputs(account=snapshot(r=None), **kw))
+HELD = {"positions": positions(shorts=(short(OTHER_PUT, qty=1, inst="inst-9"),))}
+WORKING = {"open_orders": orders(working())}
+
+
+@pytest.mark.parametrize("kw", [HELD, WORKING])
+def test_reservation_is_derived_when_cash_minus_collateral_is_buying_power(
+    kw: dict[str, Any],
+) -> None:
+    """One $45 put held or working: R = 4500, and cash = buying power + 4500 (ADR-0071)."""
+    derived = facts(open_inputs(account=snapshot(r=None, gross="11500"), **kw))
+    reported = facts(open_inputs(account=snapshot(r="4500"), **kw))
+    assert "csp_reserved_cash_usd" not in gap_kinds(derived)
+    assert derived.initial_quantity == reported.initial_quantity is not None
+
+
+@pytest.mark.parametrize("gross", ["7000", "11499.99", None])
+def test_reservation_is_unavailable_when_cash_does_not_net_to_buying_power(
+    gross: str | None,
+) -> None:
+    f = facts(open_inputs(account=snapshot(r=None, gross=gross), **HELD))
     assert f.initial_quantity is None
     assert "csp_reserved_cash_usd" in gap_kinds(f)
 

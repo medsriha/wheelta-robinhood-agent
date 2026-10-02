@@ -69,7 +69,9 @@ class AccountSnapshot(DomainModel):
 
     Rules (INTERFACES.md "AccountSnapshot"; VALIDATION.md "CSP accounting"):
     - `available_settled_cash_usd` is already net of broker reservations; it excludes
-      unsettled proceeds and margin credit (semantics unverified).
+      unsettled proceeds and margin credit (`get_portfolio` `buying_power`, ADR-0071).
+    - `cash_usd` is the broker's gross `cash`, which does not net CSP collateral (ADR-0071);
+      None on snapshots recorded before it.
     - `csp_reserved_cash_usd` counts short puts plus unfilled working STO puts once.
     - `csp_cash_base_usd` equals the sum of those two when both are present, else None.
     - Each unavailable cash field is named in `gaps`; `quality=ok` requires no gaps.
@@ -84,6 +86,7 @@ class AccountSnapshot(DomainModel):
     agentic_verified: bool
     account_value_usd: Dec | None
     available_settled_cash_usd: NonNegDec | None
+    cash_usd: NonNegDec | None = None
     csp_reserved_cash_usd: NonNegDec | None
     csp_cash_base_usd: NonNegDec | None
     csp_cash_base_evidence_ids: tuple[UUID, ...] = ()

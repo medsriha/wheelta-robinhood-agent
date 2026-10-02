@@ -366,15 +366,15 @@ def test_portfolio_is_agentic_verified_only_after_the_trusted_check() -> None:
     assert len(out.gaps) == 2
 
 
-def test_portfolio_uses_cash_not_buying_power() -> None:
-    data = _data("get_portfolio.empty_account.json")
-    data["buying_power"]["buying_power"] = "5000.0000"
-    data["cash"] = "1200.50"
-    data["total_value"] = "5000.00"
+def test_portfolio_settled_cash_is_buying_power_net_of_put_collateral() -> None:
+    """ADR-0071: with puts held, `cash` stays gross; `buying_power` nets the collateral."""
+    data = _data("get_portfolio.short_put_held.json")
     out = map_portfolio(_request("get_portfolio", data, account_number="****1234"), _ids())
     (snap,) = out.account_snapshots
-    assert snap.account_value_usd == Decimal("5000.00")
-    assert snap.available_settled_cash_usd == Decimal("1200.50")
+    assert snap.account_value_usd == Decimal("19983.77")
+    assert snap.available_settled_cash_usd == Decimal("15673.77")
+    assert snap.cash_usd == Decimal("20073.77")
+    assert snap.csp_reserved_cash_usd is None  # derived and checked by the facts
 
 
 @pytest.mark.parametrize("cash", ["-1", None])

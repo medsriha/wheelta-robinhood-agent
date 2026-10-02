@@ -5,7 +5,7 @@ and these functions decide whether the session starts:
 
 - **Buy-to-Close agent:** at least one short option position is held. A complete
   options-positions read with no short row means there is nothing to close or roll.
-- **Sell Options agent:** settled cash (`get_portfolio` `cash`, ADR-0031) of at least
+- **Sell Options agent:** settled cash (`get_portfolio` `buying_power`, ADR-0071) of at least
   `sessions.sell_min_settled_cash_usd`, or 100 shares of one symbol not already covered by
   short options on that symbol. `get_option_positions` rows carry no call/put, so every
   short row on a symbol is counted against its shares: this can only under-count coverable

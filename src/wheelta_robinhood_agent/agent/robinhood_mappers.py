@@ -492,10 +492,12 @@ def map_portfolio(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> M
 
     `total_value` -> `account_value_usd` (USD only; any other currency raises). `account_ref`
     is the redacted `account_number` argument (the hook has already required the full
-    configured number). `cash` -> `available_settled_cash_usd` (owner decision, ADR-0031;
-    a negative value raises). `buying_power` is only schema-checked. `csp_reserved_cash_usd`
-    and `csp_cash_base_usd` stay None with named gaps: the portfolio reports no reservation,
-    and the facts derive it from positions and orders reads. The response
+    configured number). `buying_power.buying_power` -> `available_settled_cash_usd`: the
+    broker nets CSP collateral and unsettled proceeds from it, not from `cash` (ADR-0071,
+    superseding ADR-0031's mapping); `cash` -> `cash_usd`. A negative value raises.
+    `csp_reserved_cash_usd` and `csp_cash_base_usd` stay None with named gaps: the portfolio
+    reports no reservation, and the facts derive it from positions and orders reads and check
+    it against `cash_usd - available_settled_cash_usd`. The response
     proves no Agentic eligibility: `agentic_verified` is True only when this run's trusted
     `get_accounts` check passed (`request.account_eligible`), else False with a gap. The
     snapshot quality stays `missing` while any cash field is missing. The payload has no
@@ -515,7 +517,8 @@ def map_portfolio(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> M
         account_ref=account_ref,
         agentic_verified=request.account_eligible,
         account_value_usd=parsed.total_value,
-        available_settled_cash_usd=parsed.cash,
+        available_settled_cash_usd=parsed.buying_power.buying_power,
+        cash_usd=parsed.cash,
         csp_reserved_cash_usd=None,
         csp_cash_base_usd=None,
         positions_ref=None,

@@ -29,9 +29,9 @@ Rules applied (each formula id below is stamped at version "1"):
   underlying; (C - reserve); (total_ratio x B - R), with C = available settled cash, R = CSP
   reserved cash, B = C + R (definitions.cash_accounting; VALIDATION.md "CSP accounting").
   When the snapshot does not report R, it is derived from complete positions and orders
-  reads: zero if no short put or working sell-to-open put exists, otherwise unavailable
-  (whether the broker's cash nets that collateral is unverified; ADR-0031). Positions count
-  only when a read covers both shares and options.
+  reads (short puts plus unfilled working sell-to-open puts) and must equal the broker's
+  gross cash minus its buying power, else unavailable (ADR-0071). Positions count only when
+  a read covers both shares and options.
 - `cc_capacity`: floor((owned shares x coverage ratio - shares already covered by short
   calls and working sell-to-open calls) / multiplier), plus the order cap (selection.sizing).
 - `close_capacity`: short quantity minus working buy-to-close quantity on the contract, and,
@@ -575,32 +575,37 @@ class _Computation:
         return value
 
     def derived_csp_reservation(self) -> Decimal | None:
-        """CSP reserved cash from this run's complete positions and orders reads (ADR-0031).
+        """CSP reserved cash from this run's complete positions and orders reads (ADR-0071).
 
-        Zero when the account holds no short puts and has no working sell-to-open puts: then
-        nothing is reserved and `available_settled_cash_usd` needs no netting. Otherwise None
-        with a gap: whether the broker's `cash` already nets that collateral is unverified.
+        R = strike x multiplier x quantity over short puts and the unfilled part of working
+        sell-to-open puts, each counted once. The broker nets that collateral from
+        `buying_power` but not from `cash`, so R must equal the snapshot's gross `cash_usd`
+        minus `available_settled_cash_usd` to the cent; otherwise None with a gap (unsettled
+        proceeds, an unknown hold, or a broker change would make C or R wrong).
         """
         field = "csp_reserved_cash_usd"
-        pos, orders = self.positions, self.orders
-        if pos is None or orders is None:
+        if self.positions is None or self.orders is None:
             self.gap(field, DataQuality.MISSING, "needs complete positions and open-orders reads")
             return None
-        puts = [h for h in pos.short_options if h.occ_symbol.right is OptionRight.PUT]
-        working = [
-            o
-            for o in orders.orders
-            if o.occ_symbol.right is OptionRight.PUT and o.side is OrderSide.SELL_TO_OPEN
-        ]
-        if any(h.short_quantity for h in puts) or any(o.unfilled_quantity for o in working):
+        cover = self.covering(OptionRight.PUT, field, every_underlying=True)
+        acct = self.account
+        if cover is None or acct is None:
+            return None
+        r = cover[0]
+        gross, net = acct.cash_usd, acct.available_settled_cash_usd
+        if gross is None or net is None:
+            self.gap(field, DataQuality.MISSING, "the snapshot lacks gross cash or buying power")
+            return None
+        if gross - r != net:
             self.gap(
                 field,
-                DataQuality.MISSING,
-                "short puts or working sell-to-open puts exist; whether the broker's cash "
-                "already nets their collateral is unverified",
+                DataQuality.CONTRADICTORY,
+                f"cash {gross} minus put collateral {r} does not equal buying power {net}",
             )
             return None
-        return _ZERO
+        ids = (acct.snapshot_id, self.positions.evidence_id, self.orders.evidence_id)
+        self.metric("derived_csp_reserved_cash_usd", "USD", r, F_CSP, ids)
+        return r
 
     @cached_property
     def positions(self) -> PositionsRead | None:
@@ -759,22 +764,24 @@ class _Computation:
             self.metric("capacity_order_cap_contracts", "contracts", Decimal(cap), F_QUANTITY, ids)
         return cap
 
-    def covering(self, right: OptionRight, field: str) -> tuple[Decimal, int] | None:
-        """Existing short contracts plus working sell-to-open orders on this underlying and
-        right, each counted once: (sum of strike x m x qty, sum of m x qty). None if a
-        multiplier is unverified or a read is unavailable."""
+    def covering(
+        self, right: OptionRight, field: str, every_underlying: bool = False
+    ) -> tuple[Decimal, int] | None:
+        """Existing short contracts plus working sell-to-open orders on this underlying (or on
+        every underlying) and right, each counted once: (sum of strike x m x qty, sum of
+        m x qty). None if a multiplier is unverified or a read is unavailable."""
         pos, orders = self.positions, self.orders
         if pos is None or orders is None:
             return None
-        underlying = self.inst.underlying
+        underlying = None if every_underlying else self.inst.underlying
         items = [
             (h.occ_symbol.strike, h.multiplier, h.short_quantity)
             for h in pos.short_options
-            if h.underlying == underlying and h.occ_symbol.right is right
+            if underlying in (None, h.underlying) and h.occ_symbol.right is right
         ] + [
             (o.occ_symbol.strike, o.multiplier, o.unfilled_quantity)
             for o in orders.orders
-            if o.underlying == underlying
+            if underlying in (None, o.underlying)
             and o.occ_symbol.right is right
             and o.side is OrderSide.SELL_TO_OPEN
         ]

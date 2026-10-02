@@ -63,7 +63,8 @@ class Upstream:
         fail: str | None = None,
     ) -> None:
         portfolio = _fixture("get_portfolio.funded_no_positions.json")
-        portfolio["cash"] = cash
+        portfolio["cash"] = cash  # settled cash is buying power (ADR-0071)
+        portfolio["buying_power"]["buying_power"] = cash
         self.payloads: dict[str, dict[str, Any]] = {
             "get_portfolio": portfolio,
             "get_equity_positions": {"positions": shares or []},
