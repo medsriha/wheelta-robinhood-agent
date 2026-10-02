@@ -88,6 +88,59 @@ _FACTS = f"mcp__{LOCAL_SERVER_NAME}__get_decision_facts"
 # like _FACTS (hooks -> mignons; order_walk is imported by hooks); tests pin the names.
 _ORDER_WORK = ("mcp__wra_orders__work_option_order", "mcp__wra_orders__await_order_work")
 
+# ADR-0068: every Mignon may call every research read, not only those its usual task needs, so
+# it can surface what the brief did not ask for (analyst ratings, insider Form 4s, politician
+# trades, technicals). These are the Robinhood reads that touch no account (account_scope.py
+# NOT_ACCOUNT_SCOPED), `run_scan` (login-scoped, the market Mignon's since ADR-0025), and every
+# Wheelta tool. Web stays with the company and macro Mignons.
+_MIGNON_READS: Final = frozenset(
+    {
+        *_rh(
+            "search",
+            "get_equity_quotes",
+            "get_equity_historicals",
+            "get_equity_fundamentals",
+            "get_equity_price_book",
+            "get_equity_technical_indicators",
+            "get_equity_analyst_ratings",
+            "get_option_chains",
+            "get_option_instruments",
+            "get_option_quotes",
+            "get_option_historicals",
+            "get_indexes",
+            "get_index_quotes",
+            "get_index_historicals",
+            "get_earnings_calendar",
+            "get_earnings_results",
+            "get_financials",
+            "get_sec_filing_index",
+            "get_sec_filing",
+            "get_sec_filing_facts",
+            "get_sec_filing_facts_catalog",
+            "get_politician_trades",
+            "get_scanner_filter_specs",
+            "get_scanner_datapoints",
+            "preview_scan",
+            "run_scan",
+            "get_popular_watchlists",
+        ),
+        *_wh(
+            "board_status",
+            "board_fields",
+            "board_query",
+            "board_row",
+            "assignment_rates",
+            "macro_snapshot",
+            "macro_series",
+            "candles",
+            "quotes",
+            "correlations",
+            "calendar_events",
+            "company_research",
+        ),
+    }
+)
+
 ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
     {
         Role.ORCHESTRATOR: frozenset(
@@ -140,69 +193,9 @@ ROLE_TOOLS: Mapping[Role, frozenset[str]] = MappingProxyType(
                 ),
             }
         ),
-        Role.MARKET: frozenset(
-            {
-                *_rh(
-                    "search",
-                    "get_equity_quotes",
-                    "get_equity_historicals",
-                    "get_equity_price_book",
-                    "get_equity_technical_indicators",
-                    "get_option_chains",
-                    "get_option_instruments",
-                    "get_option_quotes",
-                    "get_option_historicals",
-                    "get_indexes",
-                    "get_index_quotes",
-                    "get_index_historicals",
-                    "get_scanner_filter_specs",
-                    "get_scanner_datapoints",
-                    "preview_scan",
-                    "run_scan",
-                    "get_popular_watchlists",
-                ),
-                *_wh(
-                    "board_status",
-                    "board_fields",
-                    "board_query",
-                    "board_row",
-                    "assignment_rates",
-                    "candles",
-                    "quotes",
-                    "correlations",
-                ),
-            }
-        ),
-        Role.COMPANY: frozenset(
-            {
-                *WEB_TOOLS,
-                _WEB_CACHE,
-                *_rh(
-                    "search",
-                    "get_equity_quotes",
-                    "get_equity_fundamentals",
-                    "get_equity_analyst_ratings",
-                    "get_financials",
-                    "get_sec_filing_index",
-                    "get_sec_filing",
-                    "get_sec_filing_facts",
-                    "get_sec_filing_facts_catalog",
-                    "get_earnings_calendar",
-                    "get_earnings_results",
-                    "get_politician_trades",
-                ),
-                *_wh("company_research", "calendar_events"),
-            }
-        ),
-        Role.MACRO: frozenset(
-            {
-                *WEB_TOOLS,
-                _WEB_CACHE,
-                *_rh("get_indexes", "get_index_quotes", "get_index_historicals"),
-                *_rh("get_earnings_calendar"),
-                *_wh("macro_snapshot", "macro_series", "calendar_events", "correlations"),
-            }
-        ),
+        Role.MARKET: _MIGNON_READS,
+        Role.COMPANY: _MIGNON_READS | {*WEB_TOOLS, _WEB_CACHE},
+        Role.MACRO: _MIGNON_READS | {*WEB_TOOLS, _WEB_CACHE},
     }
 )
 
@@ -233,16 +226,18 @@ MIGNON_DESCRIPTIONS: Mapping[MignonType, str] = MappingProxyType(
         MignonType.MARKET: (
             "Market research: live quotes, option chains and quotes, historicals, technicals, "
             "the Robinhood scanner preview, and the Wheelta candidate board. Returns a "
-            "MignonReport with code-issued candidate and evidence refs."
+            "MignonReport with code-issued candidate and evidence refs, plus any material "
+            "finding beyond the task."
         ),
         MignonType.COMPANY: (
             "Company research: fundamentals, financials, SEC filings, earnings, analyst "
             "ratings, Wheelta company research and calendar, and trusted web sources. Returns "
-            "a MignonReport."
+            "a MignonReport, plus any material finding beyond the task."
         ),
         MignonType.MACRO: (
             "Macro research: Wheelta macro regime and series, index data, market calendar, "
-            "correlations, and trusted web sources. Returns a MignonReport."
+            "correlations, and trusted web sources. Returns a MignonReport, plus any material "
+            "finding beyond the task."
         ),
     }
 )

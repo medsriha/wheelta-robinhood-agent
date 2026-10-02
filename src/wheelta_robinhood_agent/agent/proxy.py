@@ -65,7 +65,7 @@ import secrets
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, MutableMapping
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 
@@ -85,6 +85,10 @@ from wheelta_robinhood_agent.agent.mignons import Role, role_allowed
 from wheelta_robinhood_agent.agent.model_view import ORDER_CALL_REF_KEY, model_view
 from wheelta_robinhood_agent.agent.proxy_dispatch import ProxyCall, ProxyDispatch
 from wheelta_robinhood_agent.agent.recorder import ResultKind, ToolEventRecorder
+from wheelta_robinhood_agent.agent.result_boundary import (
+    SEC_FILING_TOOL,
+    SEC_FILING_UNAVAILABLE_GAP,
+)
 from wheelta_robinhood_agent.agent.run_control import RunControl
 from wheelta_robinhood_agent.domain.assembly_context import order_call_ref_for
 from wheelta_robinhood_agent.domain.enums import ToolCallStatus, ToolTier
@@ -92,6 +96,9 @@ from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.loopback_http import LOOPBACK_HOST
 from wheelta_robinhood_agent.integrations.mcp_upstream import McpUpstream, UpstreamError
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
+from wheelta_robinhood_agent.integrations.robinhood.registry import (
+    SERVER_NAME as ROBINHOOD_SERVER,
+)
 
 TOOL_USE_ID_META: Final = "claudecode/toolUseId"
 # The proxy's upstream deadline is the CLI's per-call timeout minus this margin, leaving time
@@ -183,6 +190,14 @@ def _unresolved(tier: ToolTier) -> ToolCallStatus:
     return ToolCallStatus.UNKNOWN if tier in (ToolTier.S, ToolTier.X) else ToolCallStatus.FAILED
 
 
+def _sec_filing_id(call: ProxyCall) -> str | None:
+    """The filing_id of a Robinhood get_sec_filing call, else None."""
+    if (call.server, call.tool) != (ROBINHOOD_SERVER, SEC_FILING_TOOL):
+        return None
+    filing_id = call.effective_input.get("filing_id")
+    return filing_id if isinstance(filing_id, str) else None
+
+
 def _labeled(call: ProxyCall, envelope: dict[str, Any]) -> dict[str, Any]:
     """The envelope with its order-call ref when the call is an order action (ADR-0052)."""
     if call.tier is not ToolTier.X:
@@ -205,6 +220,9 @@ class ValidatingProxy:
     # ADR-0034: set in live mode. A failed intent write means the call is not forwarded; a
     # failed write after a result stops the run but still delivers the envelope.
     order_recorder: OrderRecorder | None = None
+    # filing_ids Robinhood answered "content not available" for in this run: never forwarded
+    # again (one proxy per source serves the orchestrator and every Mignon).
+    unavailable_filings: set[str] = field(default_factory=set)
 
     def _stop(self) -> None:
         try:
@@ -294,6 +312,9 @@ class ValidatingProxy:
         if stopped and not call.after_stop_cancel:
             return self._not_forwarded(call, "run stop requested")
         sent = call.upstream_input if call.upstream_input is not None else arguments
+        filing_id = _sec_filing_id(call)
+        if filing_id is not None and filing_id in self.unavailable_filings:
+            return self._not_forwarded(call, SEC_FILING_UNAVAILABLE_GAP)
         if self.order_recorder is not None:
             try:
                 self.order_recorder.before_dispatch(call)
@@ -343,6 +364,8 @@ class ValidatingProxy:
                 "; request less data",
             )
         valid = envelope.kind is EnvelopeKind.VALIDATED
+        if filing_id is not None and SEC_FILING_UNAVAILABLE_GAP in envelope.gaps:
+            self.unavailable_filings.add(filing_id)
         ref = self.recorder.store_result(
             call.tool_call_id, ResultKind.VALIDATED if valid else ResultKind.ERROR, payload
         )

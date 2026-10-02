@@ -149,18 +149,19 @@ def coverage_gaps(
     """What the report left out of the brief (ADR-0061), as code-written gaps.
 
     `reported` is (subject, value names) per finding. Every brief subject needs a finding
-    with that subject; every finding with a subject needs a value for each `want` field. A
-    gap does not reject the report: it tells the orchestrator what is still unknown.
-    Deterministic order: brief subjects first, then findings in report order."""
-    rows = [(s, frozenset(v)) for s, v in reported]
-    covered = {s for s, _ in rows if s is not None}
-    gaps = [f"subject {s}: not reported" for s in brief.subjects if s not in covered]
-    seen: set[tuple[str, str]] = set()
-    for subject, values in rows:
-        if subject is None:
-            continue
-        for want in brief.want:
-            if want not in values and (subject, want) not in seen:
-                seen.add((subject, want))
-                gaps.append(f"subject {subject}: no value for {want!r}")
+    with that subject; every reported subject needs a value for each `want` field in at least
+    one of its findings, so an extra finding without values (ADR-0068) leaves no gap. A gap
+    does not reject the report: it tells the orchestrator what is still unknown.
+    Deterministic order: brief subjects first, then subjects in report order."""
+    by_subject: dict[str, set[str]] = {}
+    for subject, values in reported:
+        if subject is not None:
+            by_subject.setdefault(subject, set()).update(values)
+    gaps = [f"subject {s}: not reported" for s in brief.subjects if s not in by_subject]
+    gaps.extend(
+        f"subject {subject}: no value for {want!r}"
+        for subject, values in by_subject.items()
+        for want in brief.want
+        if want not in values
+    )
     return tuple(gaps)

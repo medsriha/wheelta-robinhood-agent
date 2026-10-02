@@ -15,7 +15,9 @@ import anyio
 import mcp_types as types
 import pytest
 from test_hooks import (
+    COMPANY,
     NOW,
+    SCOPE,
     FakeRecorder,
     FakeValidator,
     Session,
@@ -23,6 +25,7 @@ from test_hooks import (
     wire,
 )
 
+from wheelta_robinhood_agent.agent.account_scope import NOT_SCOPED
 from wheelta_robinhood_agent.agent.model_view import is_model_view, model_view
 from wheelta_robinhood_agent.agent.proxy import (
     PROXY_DEDUP_KEY,
@@ -38,7 +41,11 @@ from wheelta_robinhood_agent.agent.proxy_dispatch import (
     ProxyDispatch,
     delivered_matches,
 )
-from wheelta_robinhood_agent.agent.result_boundary import BoundaryValidator, mapped_evidence_of
+from wheelta_robinhood_agent.agent.result_boundary import (
+    SEC_FILING_UNAVAILABLE_GAP,
+    BoundaryValidator,
+    mapped_evidence_of,
+)
 from wheelta_robinhood_agent.domain.enums import ToolCallStatus, ToolTier
 from wheelta_robinhood_agent.domain.run import StopReason
 from wheelta_robinhood_agent.integrations.mcp_upstream import (
@@ -628,3 +635,49 @@ def test_execute_reports_an_upstream_failure_as_unknown_for_tier_x() -> None:
     done = anyio.run(r.proxy.execute, admitted.use_id)
     assert done.status is ToolCallStatus.UNKNOWN and done.payload["kind"] == "error"
     assert outcomes(r)[0]["status"] is ToolCallStatus.UNKNOWN
+
+
+# ---- unavailable SEC filings -------------------------------------------------------------------
+
+SEC_FILING = "mcp__robinhood__get_sec_filing"
+NO_CONTENT = 'API error 404: {"detail":"Filing content is not available."}'
+
+
+def _filing_rig(text: str) -> Rig:
+    response = {"content": [{"type": "text", "text": text}], "isError": True}
+    return rig(
+        behavior=response,
+        validator=BoundaryValidator(redactor=Redactor()),
+        account_scope_table={**SCOPE, "get_sec_filing": NOT_SCOPED},
+    )
+
+
+def test_an_unavailable_filing_is_diagnosed_and_never_forwarded_again_in_the_run() -> None:
+    """2026-10-01 production: Mignons refetched filings Robinhood never serves (11 calls)."""
+    r = _filing_rig(NO_CONTENT)
+    first = {"filing_id": "f-1"}
+    r.session.pre(SEC_FILING, first, **COMPANY)
+    envelope = wire(r.call("get_sec_filing", first))
+    assert envelope["kind"] == "error" and envelope["gaps"] == [SEC_FILING_UNAVAILABLE_GAP]
+    assert "f-1" in r.proxy.unavailable_filings
+    # The same filing again, by any caller and with a section: answered without the upstream.
+    again = {"filing_id": "f-1", "section": "toc"}
+    r.session.pre(SEC_FILING, again, use_id="toolu_2", **COMPANY)
+    envelope = wire(r.call("get_sec_filing", again, use_id="toolu_2"))
+    assert SEC_FILING_UNAVAILABLE_GAP in envelope["gaps"][0]
+    assert len(r.upstream.calls) == 1
+    assert outcomes(r)[-1]["status"] is ToolCallStatus.FAILED
+    # Another filing is still forwarded.
+    other = {"filing_id": "f-2"}
+    r.session.pre(SEC_FILING, other, use_id="toolu_3", **COMPANY)
+    r.call("get_sec_filing", other, use_id="toolu_3")
+    assert len(r.upstream.calls) == 2
+
+
+def test_other_sec_filing_errors_keep_the_tools_message_and_are_forwarded_again() -> None:
+    r = _filing_rig("API error 500: boom")
+    args = {"filing_id": "f-1"}
+    r.session.pre(SEC_FILING, args, **COMPANY)
+    envelope = wire(r.call("get_sec_filing", args))
+    assert envelope["gaps"] == ["the tool returned an error: API error 500: boom"]
+    assert not r.proxy.unavailable_filings

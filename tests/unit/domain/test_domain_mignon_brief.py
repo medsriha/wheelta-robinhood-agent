@@ -95,6 +95,13 @@ def test_coverage_names_missing_subjects_and_values_in_order() -> None:
     assert coverage_gaps(MignonBrief(objective="q"), [(None, [])]) == ()
 
 
+def test_coverage_accepts_values_spread_over_a_subjects_findings() -> None:
+    """ADR-0068: an extra finding on a subject carries no values and adds no gap."""
+    brief = MignonBrief(objective="q", subjects=("AAPL",), want=("bid", "delta"))
+    assert coverage_gaps(brief, [("AAPL", ["bid", "delta"]), ("AAPL", [])]) == ()
+    assert coverage_gaps(brief, [("AAPL", ["bid"]), ("AAPL", ["delta"])]) == ()
+
+
 def _report(finding: dict[str, object]) -> str:
     return json.dumps({"task": "t", "findings": [finding], "gaps": [], "follow_up_questions": []})
 

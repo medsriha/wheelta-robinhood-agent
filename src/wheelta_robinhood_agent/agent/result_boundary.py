@@ -100,6 +100,28 @@ from wheelta_robinhood_agent.observability.redaction import REDACTED, Redactor, 
 EVIDENCE_REF_PREFIX: Final = "evidence:"
 # Characters of a tool's own error message kept in the error envelope's gap.
 MAX_TOOL_ERROR_CHARS: Final = 500
+# Robinhood lists filings in get_sec_filing_index whose content it never serves; get_sec_filing
+# then answers 404 with this detail, for the TOC and every section, every time (observed for
+# LUV and ETHA filings, 2026-09-29..10-01, 13 calls, none succeeded). The gap says so in code's
+# words so the agent stops asking; the proxy also stops forwarding that filing for the run.
+SEC_FILING_TOOL: Final = "get_sec_filing"
+SEC_FILING_UNAVAILABLE_MARKER: Final = "Filing content is not available"
+SEC_FILING_UNAVAILABLE_GAP: Final = (
+    "Robinhood has no content for this filing: it is listed by get_sec_filing_index but "
+    "get_sec_filing returns 404 for it, and it stays unavailable for the rest of this run. "
+    "Do not request this filing_id again (with or without a section); use another filing "
+    "or another source for what you needed."
+)
+
+
+def sec_filing_unavailable(server: str, tool: str, error_payload: JsonValue) -> bool:
+    """Whether a tool error is Robinhood's permanent "no content for this filing" 404."""
+    return (
+        server == ROBINHOOD_SERVER
+        and tool == SEC_FILING_TOOL
+        and isinstance(error_payload, str)
+        and SEC_FILING_UNAVAILABLE_MARKER in error_payload
+    )
 
 
 def evidence_ref_for(tool_call_id: uuid.UUID) -> str:
@@ -233,6 +255,8 @@ class BoundaryValidator:
                 # anything else the fixed gap. Tavily's own text is never delivered.
                 diagnosed = diagnose_error(request.tool, payload)
                 gap = str(diagnosed) if diagnosed is not None else TAVILY_ERROR_GAP
+            elif sec_filing_unavailable(request.server, request.tool, payload):
+                gap = SEC_FILING_UNAVAILABLE_GAP
             else:
                 gap = self._tool_error_gap(payload)
             return self._invalid(request, EnvelopeKind.ERROR, gap)

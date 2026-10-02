@@ -35,9 +35,10 @@ MIGNON_PROMPTS: Mapping[MignonType, tuple[str, int]] = MappingProxyType(
     {
         # ADR-0056: web-sourced numbers, absences as gaps, dropped findings, fetch hygiene.
         # ADR-0061: typed briefs, subject findings with requested values, tool know-how.
-        MignonType.MARKET: ("mignon_market", 6),
-        MignonType.COMPANY: ("mignon_company", 5),
-        MignonType.MACRO: ("mignon_macro", 5),
+        # ADR-0068: any research read; material findings beyond the brief.
+        MignonType.MARKET: ("mignon_market", 7),
+        MignonType.COMPANY: ("mignon_company", 6),
+        MignonType.MACRO: ("mignon_macro", 6),
     }
 )
 

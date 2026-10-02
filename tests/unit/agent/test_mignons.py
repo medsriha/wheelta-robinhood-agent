@@ -59,6 +59,16 @@ def test_mignons_hold_no_account_state_actions_or_delegation(role: Role) -> None
     assert f"mcp__wra_local__{FACTS_TOOL_NAME}" not in ROLE_TOOLS[role]
 
 
+@pytest.mark.parametrize("role", MIGNON_ROLES)
+def test_every_mignon_holds_every_research_read(role: Role) -> None:
+    """ADR-0068: each Mignon may call any non-account Robinhood read and any Wheelta tool."""
+    for name, spec in ROBINHOOD_ACCOUNT_SCOPE.items():
+        if spec.scope is AccountScope.NOT_ACCOUNT_SCOPED:
+            assert ROBINHOOD_REGISTRY.qualified(name) in ROLE_TOOLS[role], name
+    for spec in WHEELTA_REGISTRY.tools:
+        assert WHEELTA_REGISTRY.qualified(spec.name) in ROLE_TOOLS[role], spec.name
+
+
 def test_orchestrator_reads_no_web_and_delegates() -> None:
     tools = ROLE_TOOLS[Role.ORCHESTRATOR]
     assert DELEGATION_TOOL in tools
