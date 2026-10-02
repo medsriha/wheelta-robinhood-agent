@@ -1,0 +1,145 @@
+{
+ "provenance": {
+  "tool": "get_popular_watchlists",
+  "arguments": {},
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "read-only call from a Claude Code session's Robinhood MCP connection (no account-scoped call)",
+  "scrubbing": "public market data; the tool's `guide` prose dropped"
+ },
+ "data": {
+  "lists": [
+   {
+    "id": "ea06e8e3-e435-4d19-9b51-33f8930d8cb4",
+    "display_name": "Trending stocks",
+    "item_count": 20,
+    "is_badged": true
+   },
+   {
+    "id": "8a47e5c9-1cd1-40c7-981c-494d1de4af1d",
+    "display_name": "Newly listed crypto",
+    "item_count": 31
+   },
+   {
+    "id": "f79523c4-7ac3-4592-91dc-7887039a4ad2",
+    "display_name": "Index options",
+    "item_count": 11
+   },
+   {
+    "id": "97b746a5-bc2f-4c64-a828-1af0fc399bf9",
+    "display_name": "Tradable crypto",
+    "item_count": 90
+   },
+   {
+    "id": "8ce9f620-5bb0-4b6a-8c61-5a06763f7a8b",
+    "display_name": "IPO Access",
+    "item_count": 48
+   },
+   {
+    "id": "782df05d-eb78-464c-b041-e9ae207053d2",
+    "display_name": "Altcoins",
+    "item_count": 5
+   },
+   {
+    "id": "e8ef4c1f-244f-4db5-a582-c4c37f3c8e8e",
+    "display_name": "100 most popular",
+    "item_count": 100
+   },
+   {
+    "id": "eddbebe5-34cc-4df1-953c-d3e3cb55bc19",
+    "display_name": "Daily movers",
+    "item_count": 20
+   },
+   {
+    "id": "89144893-4a99-4de8-9048-1f907df83b85",
+    "display_name": "Cannabis",
+    "item_count": 16
+   },
+   {
+    "id": "a18cdf8c-46c3-4585-be8f-d2cd57ec8bb1",
+    "display_name": "Upcoming earnings",
+    "item_count": 31
+   },
+   {
+    "id": "4ef6b14b-e876-4127-9b9c-29703a8a8559",
+    "display_name": "24 Hour Market",
+    "item_count": 1338
+   },
+   {
+    "id": "3abb2fa2-5599-4357-97ae-e9a113bba139",
+    "display_name": "Technology",
+    "item_count": 1001
+   },
+   {
+    "id": "390067d9-8ef5-413b-bce8-63c760c9d4d7",
+    "display_name": "Tech, media, & telecom",
+    "item_count": 1130
+   },
+   {
+    "id": "79651aa7-6744-41fb-af15-21545a18172c",
+    "display_name": "ETFs",
+    "item_count": 3066
+   },
+   {
+    "id": "1bb3fceb-3815-4c18-b13a-036dbcff8f3a",
+    "display_name": "Energy",
+    "item_count": 311
+   },
+   {
+    "id": "39849561-15c5-4daa-bc90-341d83f776f8",
+    "display_name": "Pharma",
+    "item_count": 606
+   },
+   {
+    "id": "e01bf952-fc63-4260-91ab-54ab76d669b5",
+    "display_name": "Growth & value ETFs",
+    "item_count": 551
+   },
+   {
+    "id": "2ac39394-043f-41dc-9af4-a11c2393f261",
+    "display_name": "Energy & water",
+    "item_count": 329
+   },
+   {
+    "id": "917fdacd-370d-4443-be78-7f505796552f",
+    "display_name": "Healthcare",
+    "item_count": 1138
+   },
+   {
+    "id": "0e28612a-57e9-426c-ae77-0d66a05525ea",
+    "display_name": "Consumer goods",
+    "item_count": 1246
+   },
+   {
+    "id": "12442aa7-2280-4d5a-86e4-1ee5353f3892",
+    "display_name": "Futures",
+    "item_count": 52
+   },
+   {
+    "id": "2b93c47b-7c9e-4123-87e9-4fafca8b9b7f",
+    "display_name": "Real estate",
+    "item_count": 286
+   },
+   {
+    "id": "abf792ed-9b7c-437b-93f3-23cfdf7c1161",
+    "display_name": "Business",
+    "item_count": 297
+   },
+   {
+    "id": "79254266-2900-4fa3-88e6-80220b1eac0f",
+    "display_name": "Software",
+    "item_count": 641
+   },
+   {
+    "id": "681d516c-095a-4777-8521-345192dc2f3c",
+    "display_name": "Bond ETFs",
+    "item_count": 789
+   },
+   {
+    "id": "4babfae9-ef29-4ee9-8cd1-af0aee4eaefa",
+    "display_name": "Finance",
+    "item_count": 1657
+   }
+  ]
+ }
+}

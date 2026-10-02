@@ -1,0 +1,60 @@
+{
+ "provenance": {
+  "tool": "get_sec_filing",
+  "arguments": {
+   "filing_id": "ff11165c-afda-4baf-abbd-1e792ccc8503"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "read-only call from a Claude Code session's Robinhood MCP connection (no account-scoped call)",
+  "scrubbing": "public SEC filing (AAPL Form 4 filed 2026-10-01); the tool's `guide` prose dropped; text kept verbatim, including the server's mis-encoded characters"
+ },
+ "data": {
+  "table_of_contents": {
+   "filing_id": "ff11165c-afda-4baf-abbd-1e792ccc8503",
+   "form_type": "4",
+   "sections": [
+    {
+     "id": "sec-form-4-â-statement-of-changes-in-beneficial-ownership",
+     "title": "SEC Form 4 â Statement of Changes in Beneficial Ownership",
+     "level": 1
+    },
+    {
+     "id": "reporting-person-issuer-information",
+     "title": "Reporting Person & Issuer Information",
+     "level": 2
+    },
+    {
+     "id": "relationship-of-reporting-person-to-issuer",
+     "title": "Relationship of Reporting Person to Issuer",
+     "level": 3
+    },
+    {
+     "id": "filing-type",
+     "title": "Filing Type",
+     "level": 3
+    },
+    {
+     "id": "table-i-non-derivative-securities-acquired-disposed-of-or-beneficially-owned",
+     "title": "Table I - Non-Derivative Securities Acquired, Disposed of, or Beneficially Owned",
+     "level": 2
+    },
+    {
+     "id": "table-ii-derivative-securities-acquired-disposed-of-or-beneficially-owned",
+     "title": "Table II - Derivative Securities Acquired, Disposed of, or Beneficially Owned",
+     "level": 2
+    },
+    {
+     "id": "explanation-of-responses",
+     "title": "Explanation of Responses",
+     "level": 2
+    },
+    {
+     "id": "signature",
+     "title": "Signature",
+     "level": 2
+    }
+   ]
+  }
+ }
+}

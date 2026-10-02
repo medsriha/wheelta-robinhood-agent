@@ -78,6 +78,10 @@ def test_verified_mappers_are_exactly_the_mapped_tools() -> None:
     assert {k for k in VERIFIED_MAPPERS if k[0] == "robinhood"} == {
         ("robinhood", "get_equity_quotes"),
         ("robinhood", "get_option_instruments"),
+        # ADR-0069
+        ("robinhood", "get_sec_filing"),
+        ("robinhood", "get_politician_trades"),
+        ("robinhood", "get_popular_watchlists"),
         ("robinhood", "get_option_quotes"),
         ("robinhood", "get_portfolio"),
         ("robinhood", "get_option_orders"),

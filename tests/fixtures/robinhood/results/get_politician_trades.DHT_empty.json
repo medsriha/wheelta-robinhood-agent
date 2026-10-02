@@ -1,0 +1,15 @@
+{
+ "provenance": {
+  "tool": "get_politician_trades",
+  "arguments": {
+   "equity_symbol": "DHT"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "read-only call from a Claude Code session's Robinhood MCP connection (no account-scoped call)",
+  "scrubbing": "public market data; the tool's `guide` prose dropped"
+ },
+ "data": {
+  "trades": []
+ }
+}

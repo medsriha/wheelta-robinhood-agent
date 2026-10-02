@@ -217,9 +217,9 @@ def test_v17_and_mignon_prompts_explain_dropped_and_web_sourced_findings() -> No
         assert "never as a price, strike, premium, Greek, position, or buying power" in text
     prompts = load_mignon_prompts()
     assert {m: p.version for m, p in prompts.items()} == {
-        MignonType.MARKET: 6,
-        MignonType.COMPANY: 5,
-        MignonType.MACRO: 5,
+        MignonType.MARKET: 7,
+        MignonType.COMPANY: 6,
+        MignonType.MACRO: 6,
     }
     for prompt in prompts.values():
         assert "web pages alone never support a number" not in prompt.text
@@ -229,6 +229,17 @@ def test_v17_and_mignon_prompts_explain_dropped_and_web_sourced_findings() -> No
         flat = " ".join(prompts[web].text.split())
         assert "do not retry a URL that failed: code denies both" in flat
         assert "not extracted pages" in flat
+
+
+def test_mignon_prompts_allow_material_findings_beyond_the_task() -> None:
+    """ADR-0068: after the brief, any research read; extra findings are marked and cited."""
+    for prompt in load_mignon_prompts().values():
+        flat = " ".join(prompt.body.split())
+        assert "## Beyond your task" in prompt.body
+        assert "Answer the brief you were given first" in flat
+        assert 'Start its `claim` with "Beyond the task:"' in flat
+        assert '`form_type` `["4"]`' in flat
+        assert "it cannot support a finding" in flat
 
 
 def test_web_mignon_prompts_use_tavily() -> None:
@@ -253,7 +264,7 @@ def test_v15_searches_in_discovery_rounds_before_a_work_deadline() -> None:
     for template in _both():
         assert "- Work deadline: {{work_deadline}}." in template.text
     market = load_mignon_prompts()[MignonType.MARKET]
-    assert market.version == 6
+    assert market.version == 7
     assert "Only when the current board carries no relevant contract" not in market.text
     assert "Honor the brief's `exclude` and `notes`" in market.text
 

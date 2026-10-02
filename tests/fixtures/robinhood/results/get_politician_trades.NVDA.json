@@ -1,0 +1,211 @@
+{
+ "provenance": {
+  "tool": "get_politician_trades",
+  "arguments": {
+   "equity_symbol": "NVDA"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "read-only call from a Claude Code session's Robinhood MCP connection (no account-scoped call)",
+  "scrubbing": "public market data; the tool's `guide` prose dropped"
+ },
+ "data": {
+  "trades": [
+   {
+    "politician_name": "Sen. Cory A. Booker",
+    "party": "DEMOCRAT",
+    "position": "Senator",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "15001",
+     "max": "50000"
+    },
+    "transaction_date": "2026-08-11",
+    "disclosure_date": "2026-09-09",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Gilbert Ray Cisneros, Jr.",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-08-18",
+    "disclosure_date": "2026-09-11",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Daniel Meuser",
+    "party": "REPUBLICAN",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-04-23",
+    "disclosure_date": "2026-05-21",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Daniel Meuser",
+    "party": "REPUBLICAN",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-05-26",
+    "disclosure_date": "2026-07-03",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Daniel Meuser",
+    "party": "REPUBLICAN",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-02-24",
+    "disclosure_date": "2026-04-06",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Daniel Meuser",
+    "party": "REPUBLICAN",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-03-24",
+    "disclosure_date": "2026-04-21",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Dan Newhouse",
+    "party": "REPUBLICAN",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-07-09",
+    "disclosure_date": "2026-07-20",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. John McGuire",
+    "party": "REPUBLICAN",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "BUY",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-08-17",
+    "disclosure_date": "2026-09-03",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Cleo Fields",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "BUY",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-06-25",
+    "disclosure_date": "2026-07-17",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Gilbert Ray Cisneros, Jr.",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "BUY",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-07-16",
+    "disclosure_date": "2026-09-07",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Gilbert Ray Cisneros, Jr.",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "BUY",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-03-12",
+    "disclosure_date": "2026-04-08",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Gilbert Ray Cisneros, Jr.",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-03-24",
+    "disclosure_date": "2026-04-08",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Gilbert Ray Cisneros, Jr.",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "SELL",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-04-13",
+    "disclosure_date": "2026-05-11",
+    "source": "Tip Ranks"
+   }
+  ]
+ }
+}

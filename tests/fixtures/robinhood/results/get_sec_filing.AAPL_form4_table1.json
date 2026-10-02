@@ -1,0 +1,22 @@
+{
+ "provenance": {
+  "tool": "get_sec_filing",
+  "arguments": {
+   "filing_id": "ff11165c-afda-4baf-abbd-1e792ccc8503",
+   "section": "table-i-non-derivative-securities-acquired-disposed-of-or-beneficially-owned"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "read-only call from a Claude Code session's Robinhood MCP connection (no account-scoped call)",
+  "scrubbing": "public SEC filing (AAPL Form 4 filed 2026-10-01); the tool's `guide` prose dropped; text kept verbatim, including the server's mis-encoded characters"
+ },
+ "data": {
+  "section": {
+   "filing_id": "ff11165c-afda-4baf-abbd-1e792ccc8503",
+   "form_type": "4",
+   "section_id": "table-i-non-derivative-securities-acquired-disposed-of-or-beneficially-owned",
+   "section_title": "Table I - Non-Derivative Securities Acquired, Disposed of, or Beneficially Owned",
+   "content": "## Table I - Non-Derivative Securities Acquired, Disposed of, or Beneficially Owned\n\n| 1. Title of Security (Instr. 3) | 2. Transaction Date | 2A. Deemed Execution Date | 3. Transaction Code (Instr. 8) | | 4. Securities Acquired (A) or Disposed Of (D) | | | 5. Amount of Securities Beneficially Owned Following Reported Transaction(s) | 6. Ownership Form: Direct (D) or Indirect (I) | 7. Nature of Indirect Beneficial Ownership |\n|---|---|---|---|---|---|---|---|---|---|---|\n| | | | **Code** | **V** | **Amount** | **(A) or (D)** | **Price** | | | |\n| Common Stock Â¹ | 09/29/2026 | â | S | | 2,399 | D | $336.18 | 41,992 | D | â |\n\n---"
+  }
+ }
+}

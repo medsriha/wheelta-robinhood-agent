@@ -1,0 +1,22 @@
+{
+ "provenance": {
+  "tool": "get_sec_filing",
+  "arguments": {
+   "filing_id": "f631bf0e-51be-4018-9def-47ef21f66a1e",
+   "section": "macroeconomic-conditions"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "read-only call from a Claude Code session's Robinhood MCP connection (no account-scoped call)",
+  "scrubbing": "public SEC filing (AAPL 10-Q filed 2026-07-31); the tool's `guide` prose dropped"
+ },
+ "data": {
+  "section": {
+   "filing_id": "f631bf0e-51be-4018-9def-47ef21f66a1e",
+   "form_type": "10-Q",
+   "section_id": "macroeconomic-conditions",
+   "section_title": "Macroeconomic Conditions",
+   "content": "### Macroeconomic Conditions\n\nMacroeconomic conditions, including inflation, interest rates, component pricing and currency fluctuations, have directly and indirectly impacted, and could in the future materially impact, the Company's results of operations and financial condition.\n\nThe Company is experiencing a period of supply constraints and increasing costs for components driven by factors such as industry supply-demand imbalances for components, including advanced semiconductors, storage (NAND) and memory (DRAM). The Company expects these trends to intensify, which may materially negatively impact the Company's revenue, costs, gross margin, results of operations and financial condition. Actions, such as price increases, that have been and may in the future be taken by the Company may not effectively mitigate these negative impacts, and may also reduce demand for the Company's products and materially adversely affect the Company's revenue, costs, gross margin, results of operations and financial condition."
+  }
+ }
+}

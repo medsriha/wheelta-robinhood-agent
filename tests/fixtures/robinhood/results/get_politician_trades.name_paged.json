@@ -1,0 +1,62 @@
+{
+ "provenance": {
+  "tool": "get_politician_trades",
+  "arguments": {
+   "politician_name": "Cleo Fields"
+  },
+  "server": "robinhood-trading 1.6.0",
+  "captured_on": "2026-10-01",
+  "captured_via": "read-only call from a Claude Code session's Robinhood MCP connection (no account-scoped call)",
+  "scrubbing": "public STOCK Act disclosures; `trades` trimmed to the first 3 of 25; the tool's `guide` prose dropped"
+ },
+ "data": {
+  "trades": [
+   {
+    "politician_name": "Rep. Cleo Fields",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "AAPL",
+    "transaction_type": "BUY",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-08-12",
+    "disclosure_date": "2026-09-03",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Cleo Fields",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "NVDA",
+    "transaction_type": "BUY",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-06-25",
+    "disclosure_date": "2026-07-17",
+    "source": "Tip Ranks"
+   },
+   {
+    "politician_name": "Rep. Cleo Fields",
+    "party": "DEMOCRAT",
+    "position": "Representative",
+    "asset_type": "EQUITY",
+    "symbol": "QNT",
+    "transaction_type": "BUY",
+    "amount_range": {
+     "min": "1001",
+     "max": "15000"
+    },
+    "transaction_date": "2026-06-03",
+    "disclosure_date": "2026-06-29",
+    "source": "Tip Ranks"
+   }
+  ],
+  "has_more": true
+ }
+}

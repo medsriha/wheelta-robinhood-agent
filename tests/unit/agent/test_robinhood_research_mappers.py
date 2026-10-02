@@ -27,6 +27,9 @@ from wheelta_robinhood_agent.agent.robinhood_mappers import (
     map_equity_fundamentals,
     map_financials,
     map_option_chains,
+    map_politician_trades,
+    map_popular_watchlists,
+    map_sec_filing,
     map_sec_filing_index,
 )
 from wheelta_robinhood_agent.domain.enums import ToolTier
@@ -81,6 +84,13 @@ FIXTURE_CASES = [
     ("get_equity_analyst_ratings", "get_equity_analyst_ratings.DHT_LUV_NCLH.json"),
     ("get_option_chains", "get_option_chains.T.json"),
     ("get_option_chains", "get_option_chains.SPY.json"),
+    # ADR-0069, captured 2026-10-01.
+    ("get_sec_filing", "get_sec_filing.AAPL_form4_toc.json"),
+    ("get_sec_filing", "get_sec_filing.AAPL_form4_table1.json"),
+    ("get_sec_filing", "get_sec_filing.AAPL_10q_section.json"),
+    ("get_politician_trades", "get_politician_trades.NVDA.json"),
+    ("get_politician_trades", "get_politician_trades.name_paged.json"),
+    ("get_popular_watchlists", "get_popular_watchlists.json"),
 ]
 
 
@@ -315,3 +325,137 @@ def test_option_chains_reject_a_fractional_multiplier() -> None:
     data["chains"][0]["trade_value_multiplier"] = "100.5000"
     with pytest.raises(ValueError, match="multiplier"):
         map_option_chains(_request("get_option_chains", data), _ids())
+
+
+# --------------------------------------------------------------------------------------------
+# ADR-0069: get_sec_filing, get_politician_trades, get_popular_watchlists
+# --------------------------------------------------------------------------------------------
+
+
+def test_sec_filing_toc_lists_sections_to_request() -> None:
+    out = map_sec_filing(
+        _fixture_request("get_sec_filing", "get_sec_filing.AAPL_form4_toc.json"), _ids()
+    )
+    (toc,) = out.sec_filing_contents
+    assert toc.form_type == "4" and len(toc.sections) == 8
+    table = toc.sections[4]
+    assert table.section_id.startswith("table-i-non-derivative") and table.level == 2
+    assert not out.sec_filing_sections and not out.gaps
+
+
+def test_sec_filing_section_keeps_the_filers_text_verbatim() -> None:
+    out = map_sec_filing(
+        _fixture_request("get_sec_filing", "get_sec_filing.AAPL_form4_table1.json"), _ids()
+    )
+    (section,) = out.sec_filing_sections
+    assert section.form_type == "4"
+    assert "| S | | 2,399 | D | $336.18 | 41,992 |" in section.content
+    assert section.as_of == RETRIEVED and not out.sec_filing_contents
+
+
+@pytest.mark.parametrize(
+    ("args", "match"),
+    [
+        ({"filing_id": "another"}, "table of contents"),
+        ({"filing_id": "f631bf0e-51be-4018-9def-47ef21f66a1e", "section": "x"}, "another"),
+        ({}, "filing_id"),
+    ],
+)
+def test_sec_filing_must_answer_the_request(args: dict[str, Any], match: str) -> None:
+    data = _data("get_sec_filing.AAPL_10q_section.json")
+    if args.get("filing_id") == "another":
+        data = _data("get_sec_filing.AAPL_form4_toc.json")
+    with pytest.raises(ValueError, match=match):
+        map_sec_filing(_request("get_sec_filing", data, **args), _ids())
+
+
+def test_sec_filing_rejects_both_kinds_or_extra_keys() -> None:
+    both = _data("get_sec_filing.AAPL_form4_table1.json")
+    both["table_of_contents"] = _data("get_sec_filing.AAPL_form4_toc.json")["table_of_contents"]
+    with pytest.raises(ValueError, match="one section only"):
+        map_sec_filing(
+            _request("get_sec_filing", both, **_args("get_sec_filing.AAPL_form4_table1.json")),
+            _ids(),
+        )
+    extra = _data("get_sec_filing.AAPL_10q_section.json")
+    extra["section"]["page"] = 2
+    with pytest.raises(ValidationError):
+        map_sec_filing(
+            _request("get_sec_filing", extra, **_args("get_sec_filing.AAPL_10q_section.json")),
+            _ids(),
+        )
+
+
+def test_politician_trades_by_symbol_keep_ranges_and_dates() -> None:
+    out = map_politician_trades(
+        _fixture_request("get_politician_trades", "get_politician_trades.NVDA.json"), _ids()
+    )
+    assert len(out.politician_trades) == 13
+    first = out.politician_trades[0]
+    assert first.politician_name == "Sen. Cory A. Booker" and first.symbol == "NVDA"
+    assert first.transaction_type == "SELL" and first.source == "Tip Ranks"
+    assert (first.amount_min_usd, first.amount_max_usd) == (Decimal(15001), Decimal(50000))
+    assert (first.transaction_date, first.disclosure_date) == (
+        date(2026, 8, 11),
+        date(2026, 9, 9),
+    )
+    assert out.gaps == (
+        "get_politician_trades: amounts are disclosed USD ranges, never exact "
+        "figures; disclosures lag the trade by up to 45 days, so this is history, not a "
+        "current signal",
+    )
+
+
+def test_politician_trades_by_name_span_tickers_and_flag_more() -> None:
+    out = map_politician_trades(
+        _fixture_request("get_politician_trades", "get_politician_trades.name_paged.json"),
+        _ids(),
+    )
+    assert [t.symbol for t in out.politician_trades] == ["AAPL", "NVDA", "QNT"]
+    assert "get_politician_trades: more trades exist for politician Cleo Fields; not listed" in (
+        out.gaps
+    )
+
+
+def test_politician_trades_empty_is_a_gap_and_symbol_must_match() -> None:
+    out = map_politician_trades(
+        _fixture_request("get_politician_trades", "get_politician_trades.DHT_empty.json"), _ids()
+    )
+    assert not out.politician_trades
+    assert out.gaps == ("get_politician_trades: no disclosed trades for DHT",)
+    with pytest.raises(ValueError, match="another symbol"):
+        map_politician_trades(
+            _request(
+                "get_politician_trades",
+                _data("get_politician_trades.NVDA.json"),
+                equity_symbol="amd",
+            ),
+            _ids(),
+        )
+
+
+def test_politician_trades_reject_inverted_ranges_and_missing_arguments() -> None:
+    data = _data("get_politician_trades.NVDA.json")
+    data["trades"][0]["amount_range"] = {"min": "50000", "max": "15001"}
+    with pytest.raises(ValueError, match="minimum exceeds"):
+        map_politician_trades(_request("get_politician_trades", data, equity_symbol="NVDA"), _ids())
+    with pytest.raises(ValueError, match="equity_symbol or politician_name"):
+        map_politician_trades(
+            _request("get_politician_trades", _data("get_politician_trades.NVDA.json")), _ids()
+        )
+
+
+def test_popular_watchlists_keep_names_sizes_and_unknown_badges() -> None:
+    out = map_popular_watchlists(
+        _fixture_request("get_popular_watchlists", "get_popular_watchlists.json"), _ids()
+    )
+    assert len(out.popular_watchlists) == 26
+    trending, crypto = out.popular_watchlists[:2]
+    assert (trending.display_name, trending.item_count, trending.is_badged) == (
+        "Trending stocks",
+        20,
+        True,
+    )
+    assert crypto.is_badged is None
+    assert any(w.display_name == "100 most popular" for w in out.popular_watchlists)
+    assert not out.gaps

@@ -22,9 +22,11 @@ Conventions shared by all mappers:
   bid/ask) produces no evidence and a named gap instead.
 
 Research reads (ADR-0042): earnings, the SEC filing index, financials, fundamentals, analyst
-ratings, and option chains become typed, citable evidence. Their shapes come from the results
-recorded on 2026-09-29 and the tools' own guidance. No decision fact is computed from them;
-an option chain in particular never stands in for an instrument or a quote.
+ratings, and option chains become typed, citable evidence; ADR-0069 adds SEC filing contents
+and section text, politician trades, and curated list names (captured 2026-10-01). Their
+shapes come from the recorded results and the tools' own guidance. No decision fact is
+computed from them; an option chain in particular never stands in for an instrument or a
+quote.
 
 Tools deliberately NOT registered:
 
@@ -74,7 +76,12 @@ from wheelta_robinhood_agent.agent.mapped_evidence import (
     OrderLeg,
     OrderReviewObservation,
     PendingOptionPositions,
+    PoliticianTrade,
+    PopularWatchlist,
+    SecFilingContents,
     SecFilingListing,
+    SecFilingSection,
+    SecFilingSectionEntry,
 )
 from wheelta_robinhood_agent.domain.account import AccountSnapshot
 from wheelta_robinhood_agent.domain.enums import (
@@ -1162,6 +1169,200 @@ def map_sec_filing_index(
     return MappedEvidence(sec_filings=filings, gaps=tuple(gaps))
 
 
+# ADR-0069: `get_sec_filing` returns either a table of contents (no `section` argument) or
+# one section's text, never both (the tool's guidance; captured 2026-10-01).
+
+
+class _TocEntry(_Exact):
+    id: Annotated[str, Field(min_length=1)]
+    title: str
+    level: StrictInt
+
+
+class _Toc(_Exact):
+    filing_id: Annotated[str, Field(min_length=1)]
+    form_type: Annotated[str, Field(min_length=1)]
+    sections: tuple[_TocEntry, ...]
+
+
+class _Section(_Exact):
+    filing_id: Annotated[str, Field(min_length=1)]
+    form_type: Annotated[str, Field(min_length=1)]
+    section_id: Annotated[str, Field(min_length=1)]
+    section_title: str
+    content: str
+
+
+class _FilingRead(_Exact):
+    table_of_contents: _Toc | None = None
+    section: _Section | None = None
+
+
+def map_sec_filing(request: MappingRequest, new_id: Callable[[], uuid.UUID]) -> MappedEvidence:
+    """`get_sec_filing` -> a `SecFilingContents` (no `section` requested) or one
+    `SecFilingSection`.
+
+    The result must be the kind the request asked for and name the requested filing (and
+    section). Section text is the filer's own words, kept verbatim; a 404 for a filing
+    Robinhood has not processed is a tool error handled before any mapper.
+    """
+    filing_id = request.effective_input.get("filing_id")
+    section_id = request.effective_input.get("section")
+    if not isinstance(filing_id, str) or not filing_id:
+        raise ValueError("expected a filing_id argument")
+    parsed = _FilingRead.model_validate(_unwrap(request.payload))
+    provenance = {
+        "evidence_id": new_id(),
+        "as_of": request.retrieved_at,
+        "source_tool_call_ids": (request.tool_call_id,),
+    }
+    if section_id is None:
+        toc = parsed.table_of_contents
+        if toc is None or parsed.section is not None or toc.filing_id != filing_id:
+            raise ValueError("expected the requested filing's table of contents only")
+        contents = SecFilingContents(
+            **provenance,
+            filing_id=toc.filing_id,
+            form_type=toc.form_type,
+            sections=tuple(
+                SecFilingSectionEntry(section_id=e.id, title=e.title, level=e.level)
+                for e in toc.sections
+            ),
+        )
+        gaps = () if contents.sections else (_gap_text(request.tool, "no sections listed"),)
+        return MappedEvidence(sec_filing_contents=(contents,), gaps=gaps)
+    section = parsed.section
+    if section is None or parsed.table_of_contents is not None:
+        raise ValueError("expected one section only")
+    if section.filing_id != filing_id or section.section_id != section_id:
+        raise ValueError("section names another filing or section than requested")
+    return MappedEvidence(
+        sec_filing_sections=(
+            SecFilingSection(
+                **provenance,
+                filing_id=section.filing_id,
+                form_type=section.form_type,
+                section_id=section.section_id,
+                section_title=section.section_title,
+                content=section.content,
+            ),
+        )
+    )
+
+
+class _AmountRange(_Exact):
+    min: DecStr
+    max: DecStr
+
+
+class _PoliticianTrade(_External):
+    politician_name: Annotated[str, Field(min_length=1)]
+    party: Annotated[str, Field(min_length=1)]
+    position: Annotated[str, Field(min_length=1)]
+    asset_type: Annotated[str, Field(min_length=1)]
+    symbol: Annotated[str, Field(min_length=1)]
+    transaction_type: Annotated[str, Field(min_length=1)]
+    amount_range: _AmountRange
+    transaction_date: IsoDate
+    disclosure_date: IsoDate
+    source: Annotated[str, Field(min_length=1)]
+
+
+class _PoliticianTrades(_Exact):
+    trades: tuple[_PoliticianTrade, ...]
+    has_more: StrictBool = False
+
+
+POLITICIAN_TRADES_NOTE: Final = (
+    "get_politician_trades: amounts are disclosed USD ranges, never exact figures; "
+    "disclosures lag the trade by up to 45 days, so this is history, not a current signal"
+)
+
+
+def map_politician_trades(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID]
+) -> MappedEvidence:
+    """`get_politician_trades` -> one `PoliticianTrade` per disclosed transaction.
+
+    Requested by `equity_symbol`, every trade must name that ticker; by `politician_name`
+    (a partial, case-insensitive match) the trades can name any ticker. A range whose
+    minimum exceeds its maximum is rejected. `has_more` means the list is cut, and a gap
+    says so. Every non-empty result carries the range-and-lag note from the tool's guidance.
+    """
+    symbol = request.effective_input.get("equity_symbol")
+    name = request.effective_input.get("politician_name")
+    wanted = symbol.strip().upper() if isinstance(symbol, str) else None
+    if wanted is None and not (isinstance(name, str) and name.strip()):
+        raise ValueError("expected an equity_symbol or politician_name argument")
+    parsed = _PoliticianTrades.model_validate(_unwrap(request.payload))
+    trades: list[PoliticianTrade] = []
+    for t in parsed.trades:
+        if wanted is not None and t.symbol != wanted:
+            raise ValueError("trade names another symbol than requested")
+        if t.amount_range.min > t.amount_range.max:
+            raise ValueError("amount range minimum exceeds its maximum")
+        trades.append(
+            PoliticianTrade(
+                evidence_id=new_id(),
+                as_of=request.retrieved_at,
+                source_tool_call_ids=(request.tool_call_id,),
+                politician_name=t.politician_name,
+                party=t.party,
+                position=t.position,
+                asset_type=t.asset_type,
+                symbol=t.symbol,
+                transaction_type=t.transaction_type,
+                amount_min_usd=t.amount_range.min,
+                amount_max_usd=t.amount_range.max,
+                transaction_date=t.transaction_date,
+                disclosure_date=t.disclosure_date,
+                source=t.source,
+            )
+        )
+    subject = wanted if wanted is not None else f"politician {name!s}"
+    gaps: list[str] = []
+    if not trades:
+        gaps.append(_gap_text(request.tool, f"no disclosed trades for {subject}"))
+    else:
+        gaps.append(POLITICIAN_TRADES_NOTE)
+    if parsed.has_more:
+        gaps.append(_gap_text(request.tool, f"more trades exist for {subject}; not listed"))
+    return MappedEvidence(politician_trades=tuple(trades), gaps=tuple(gaps))
+
+
+class _PopularList(_External):
+    id: uuid.UUID
+    display_name: Annotated[str, Field(min_length=1)]
+    item_count: StrictInt
+    is_badged: StrictBool | None = None
+
+
+class _PopularLists(_Exact):
+    lists: tuple[_PopularList, ...]
+
+
+def map_popular_watchlists(
+    request: MappingRequest, new_id: Callable[[], uuid.UUID]
+) -> MappedEvidence:
+    """`get_popular_watchlists` -> one `PopularWatchlist` per curated list (one page, per the
+    tool's guidance). Names and sizes only: which symbols a list holds is not in the result."""
+    parsed = _PopularLists.model_validate(_unwrap(request.payload))
+    rows = tuple(
+        PopularWatchlist(
+            evidence_id=new_id(),
+            as_of=request.retrieved_at,
+            source_tool_call_ids=(request.tool_call_id,),
+            list_id=str(row.id),
+            display_name=row.display_name,
+            item_count=row.item_count,
+            is_badged=row.is_badged,
+        )
+        for row in parsed.lists
+    )
+    gaps = () if rows else (_gap_text(request.tool, "no curated lists returned"),)
+    return MappedEvidence(popular_watchlists=rows, gaps=gaps)
+
+
 _PERCENT: Final = Decimal(100)
 
 
@@ -1434,6 +1635,9 @@ ROBINHOOD_MAPPERS: Mapping[str, EvidenceMapper] = MappingProxyType(
         "get_earnings_results": map_earnings_results,
         "get_earnings_calendar": map_earnings_calendar,
         "get_sec_filing_index": map_sec_filing_index,
+        "get_sec_filing": map_sec_filing,
+        "get_politician_trades": map_politician_trades,
+        "get_popular_watchlists": map_popular_watchlists,
         "get_financials": map_financials,
         "get_equity_fundamentals": map_equity_fundamentals,
         "get_equity_analyst_ratings": map_equity_analyst_ratings,

@@ -171,6 +171,35 @@ class SecFilingListing(_Observed):
     description: str
 
 
+class SecFilingSectionEntry(_Model):
+    """One entry of a filing's table of contents: the `section_id` to pass back to
+    `get_sec_filing`, its title, and its heading level."""
+
+    section_id: NonEmptyStr
+    title: str
+    level: int
+
+
+class SecFilingContents(_Observed):
+    """A filing's table of contents from `get_sec_filing` without `section` (ADR-0069)."""
+
+    filing_id: NonEmptyStr
+    form_type: NonEmptyStr
+    sections: tuple[SecFilingSectionEntry, ...]
+
+
+class SecFilingSection(_Observed):
+    """One section's text from `get_sec_filing` (ADR-0069): the filer's own words, Markdown
+    as Robinhood renders it, kept verbatim (including the server's mis-encoded characters).
+    A tier-1 source; a Form 4 table is the insider's reported transaction."""
+
+    filing_id: NonEmptyStr
+    form_type: NonEmptyStr
+    section_id: NonEmptyStr
+    section_title: str
+    content: str
+
+
 class FinancialPeriod(_Observed):
     """One reported fiscal period from `get_financials` (ADR-0042). USD amounts as reported;
     `fiscal_quarter` is None for an annual period."""
@@ -225,6 +254,35 @@ class AnalystRatings(_Observed):
     mean_price_target: Decimal | None
     high_price_target: Decimal | None
     updated_at: AwareDatetime | None
+
+
+class PoliticianTrade(_Observed):
+    """One disclosed politician trade from `get_politician_trades` (ADR-0069), as Tip Ranks
+    reports STOCK Act disclosures. The amount is a disclosed range in USD, never an exact
+    figure; `disclosure_date` lags `transaction_date` by up to 45 days."""
+
+    politician_name: NonEmptyStr
+    party: NonEmptyStr
+    position: NonEmptyStr
+    asset_type: NonEmptyStr
+    symbol: NonEmptyStr
+    transaction_type: NonEmptyStr
+    amount_min_usd: Decimal
+    amount_max_usd: Decimal
+    transaction_date: date
+    disclosure_date: date
+    source: NonEmptyStr
+
+
+class PopularWatchlist(_Observed):
+    """One Robinhood-curated list from `get_popular_watchlists` (ADR-0069): its name and
+    size only; the members are not part of this result. `is_badged` (Robinhood marks the list
+    new) is None when the result omits it."""
+
+    list_id: NonEmptyStr
+    display_name: NonEmptyStr
+    item_count: int
+    is_badged: bool | None
 
 
 class OptionChainObservation(_Observed):
@@ -312,6 +370,11 @@ class MappedEvidence(_Model):
     fundamentals: tuple[EquityFundamentals, ...] = ()
     analyst_ratings: tuple[AnalystRatings, ...] = ()
     option_chains: tuple[OptionChainObservation, ...] = ()
+    # ADR-0069: filing contents and text, politician trades, curated lists. Citable context.
+    sec_filing_contents: tuple[SecFilingContents, ...] = ()
+    sec_filing_sections: tuple[SecFilingSection, ...] = ()
+    politician_trades: tuple[PoliticianTrade, ...] = ()
+    popular_watchlists: tuple[PopularWatchlist, ...] = ()
     # ADR-0045: Wheelta macro snapshot. Citable context; no decision fact uses it.
     macro_regimes: tuple[MacroRegime, ...] = ()
     macro_indicators: tuple[MacroIndicator, ...] = ()
@@ -332,6 +395,10 @@ class MappedEvidence(_Model):
             *self.fundamentals,
             *self.analyst_ratings,
             *self.option_chains,
+            *self.sec_filing_contents,
+            *self.sec_filing_sections,
+            *self.politician_trades,
+            *self.popular_watchlists,
             *self.macro_regimes,
             *self.macro_indicators,
         )
