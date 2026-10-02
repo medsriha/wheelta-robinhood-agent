@@ -230,3 +230,4 @@ docs/
 .claude/settings.local.json
 .claude/settings.json
 .claude/skills/ledger-debug/SKILL.md
+scripts/trade_sheet_apps_script.gs

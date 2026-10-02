@@ -41,6 +41,7 @@ from wheelta_robinhood_agent.ledger.positions import (
     entry_lineages,
     link_fill,
     open_position,
+    opening_orders,
     position_book,
     record_assignment,
     record_gap,
@@ -552,3 +553,26 @@ def test_opened_thesis_wins_over_the_entry_note(conn: Conn, run_id: uuid.UUID) -
     entry = _entry(conn, position_id)
     assert entry.entry_note == opening
     assert entry.thesis == "Range-bound into earnings"
+
+
+def test_opening_orders_name_the_entry_orders_of_the_closed_lineage(
+    conn: Conn, run_id: uuid.UUID
+) -> None:
+    position_id = _open_with_entry(conn, run_id)
+    entry_order = conn.execute(
+        "SELECT o.broker_order_id FROM position_events e JOIN orders o USING (order_id) "
+        "WHERE e.entity_id = %s AND e.event_type = 'fill_linked'",
+        (position_id,),
+    ).fetchone()
+    close_order = _order(conn, run_id)
+    link_fill(
+        conn,
+        position_id,
+        run_id=run_id,
+        fill_event_id=_exec_fill(conn, run_id, close_order, "C-9", 2, "0.40"),
+        role=FillRole.CLOSE,
+        observed_at=T0,
+    )
+    unlinked = _order(conn, run_id)
+    assert entry_order is not None
+    assert opening_orders(conn, [close_order, unlinked]) == {close_order: (entry_order[0],)}

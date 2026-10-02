@@ -138,6 +138,10 @@ class Settings(BaseSettings):
     # Exact model ID for the summary prose; unset or blank means AGENT_MODEL.
     RUN_SUMMARY_MODEL: str | None = None
 
+    # ADR-0073: Apps Script web app that writes each live fill to the owner's Google Sheet
+    # trade log. Unset means no sheet updates.
+    TRADE_SHEET_WEBHOOK_URL: SecretStr | None = None
+
     @field_validator("RUN_TIMEOUT_SECONDS")
     @classmethod
     def _run_budget_below_cron_interval(cls, value: int) -> int:
@@ -155,6 +159,7 @@ class Settings(BaseSettings):
         "RUN_SUMMARY_EMAIL_TO",
         "RUN_SUMMARY_MODEL",
         "TAVILY_API_KEY",
+        "TRADE_SHEET_WEBHOOK_URL",
         mode="before",
     )
     @classmethod

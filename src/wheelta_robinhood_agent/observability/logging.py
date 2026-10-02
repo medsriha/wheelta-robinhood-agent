@@ -113,6 +113,7 @@ def settings_secrets(settings: Settings) -> tuple[SecretStr, ...]:
         settings.ALERT_WEBHOOK_URL,
         settings.RESEND_API_KEY,
         settings.RUN_SUMMARY_EMAIL_TO,
+        settings.TRADE_SHEET_WEBHOOK_URL,
     )
     return tuple(secret for secret in candidates if secret is not None)
 

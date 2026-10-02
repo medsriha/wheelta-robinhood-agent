@@ -380,6 +380,30 @@ def entry_lineages(
     return {order: next(iter(ids)) for order, ids in found.items() if len(ids) == 1}
 
 
+def opening_orders(conn: Conn, order_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, tuple[str, ...]]:
+    """For each order whose fills closed a lineage, the broker order IDs of that lineage's
+    entry and replacement fills (ADR-0073: the sheet finds the closed row by them)."""
+    if not order_ids:
+        return {}
+    found: dict[uuid.UUID, set[str]] = {}
+    for row in _rows(
+        conn,
+        "SELECT DISTINCT c.order_id, o.broker_order_id FROM position_events c "
+        "JOIN position_events e ON e.entity_id = c.entity_id "
+        "AND e.event_type = 'fill_linked' AND e.payload->>'role' = ANY(%s) "
+        "JOIN orders o ON o.order_id = e.order_id "
+        "WHERE c.event_type = 'fill_linked' AND c.payload->>'role' = %s "
+        "AND c.order_id = ANY(%s)",
+        (
+            [FillRole.ENTRY.value, FillRole.REPLACEMENT.value],
+            FillRole.CLOSE.value,
+            list(order_ids),
+        ),
+    ):
+        found.setdefault(row["order_id"], set()).add(row["broker_order_id"])
+    return {order: tuple(sorted(ids)) for order, ids in found.items()}
+
+
 def close_position(
     conn: Conn,
     position_id: uuid.UUID,

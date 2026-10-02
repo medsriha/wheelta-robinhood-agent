@@ -67,6 +67,7 @@ from wheelta_robinhood_agent.agent.board_probe import (
     skip_reason,
     unavailable,
 )
+from wheelta_robinhood_agent.agent.facts_tool import load_run_evidence
 from wheelta_robinhood_agent.agent.mignons import DELEGATION_TOOL, Role, mignon_limits
 from wheelta_robinhood_agent.agent.order_cleanup import ORDER_WIND_DOWN_SECONDS
 from wheelta_robinhood_agent.agent.proxy import upstream_timeout_seconds
@@ -152,6 +153,7 @@ from wheelta_robinhood_agent.integrations.notifications.email import (
     RunSummaryEmailConfig,
     send_run_summary,
 )
+from wheelta_robinhood_agent.integrations.notifications.trade_sheet import post_trade_fills
 from wheelta_robinhood_agent.integrations.registry import ToolRegistry
 from wheelta_robinhood_agent.integrations.robinhood.registry import ROBINHOOD_REGISTRY
 from wheelta_robinhood_agent.integrations.robinhood.registry import SERVER_NAME as ROBINHOOD
@@ -240,12 +242,15 @@ from wheelta_robinhood_agent.orchestrator.signals import (
     install_stop_signal_handlers,
     trip_if_deadline_passed,
 )
+from wheelta_robinhood_agent.orchestrator.trade_sheet import sheet_fills
 
 Conn = psycopg.Connection[tuple[object, ...]]
 _LOG = logging.getLogger("wheelta_robinhood_agent.run")
 NOTIFY_TIMEOUT_SECONDS = 10.0
 # ADR-0029: summary email deliveries share the alerts_sent ledger table under this kind.
 RUN_SUMMARY_EMAIL_KIND = "run_summary_email"
+# Apps Script web apps can take several seconds to start.
+TRADE_SHEET_TIMEOUT_SECONDS = 60.0
 # Time kept back from the run budget for assembly, audit, and finalization.
 FINALIZE_RESERVE_SECONDS = 60.0
 
@@ -580,6 +585,7 @@ class _Tick:
             _heartbeat(self.settings, self.deps, lead.final_status, lead.run_id, self.slot, reason)
         if any(r.session_started for r in finished):
             self._send_summary(finished)
+            self._update_trade_sheet(finished)
         return combined_exit_code(
             tuple(exit_code_for(r.final_status) for r in finished if r.final_status)
         )
@@ -591,6 +597,47 @@ class _Tick:
             return min(chosen, key=lambda n: n.not_before)
         fallback = [r.next_run for r in runs if r.next_run is not None]
         return fallback[0] if fallback else None
+
+    def _update_trade_sheet(self, runs: Sequence["_Run"]) -> None:
+        """ADR-0073: write this tick's live fills to the owner's Google Sheet trade log.
+        Informational: never changes a status or the exit code. Simulated fills never go."""
+        url = self.settings.TRADE_SHEET_WEBHOOK_URL
+        if url is None:
+            return
+        log = self.log.bind(stage="trade_sheet")
+        try:
+            fills: list[dict[str, object]] = []
+            for r in runs:
+                if not r.session_started or r.order_venue is not OrderVenue.BROKER:
+                    continue
+                records = ledger_orders.run_order_records(self.conn, r.run_id)
+                order_ids = [rec.broker_order.order_id for rec in records if rec.broker_order]
+                fills += sheet_fills(
+                    records,
+                    load_run_evidence(self.conn, r.run_id),
+                    r.role,
+                    ledger_positions.opening_orders(self.conn, order_ids),
+                )
+            if not fills:
+                return
+            with httpx.Client() as client:
+                result = post_trade_fills(
+                    fills, client=client, url=url, timeout_seconds=TRADE_SHEET_TIMEOUT_SECONDS
+                )
+        except Exception as exc:  # noqa: BLE001 - informational: never fail the run
+            log.warning("trade sheet update failed", extra={"error_type": type(exc).__name__})
+            return
+        # ponytail: a failed post is not retried on a later tick; add the fills by hand.
+        clean = result.delivered and set(result.statuses) <= {"written", "duplicate"}
+        log.log(
+            logging.INFO if clean else logging.WARNING,
+            "trade sheet update",
+            extra={
+                "delivered": result.delivered,
+                "statuses": list(result.statuses),
+                "error": result.error,
+            },
+        )
 
     def _send_summary(self, runs: Sequence["_Run"]) -> None:
         """ADR-0029, ADR-0057: email the tick summary. Informational: never changes a status
