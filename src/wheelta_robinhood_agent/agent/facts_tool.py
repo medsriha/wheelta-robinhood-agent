@@ -245,15 +245,20 @@ class RunEvidence:
         latest: PositionsRead | None = None if first else self._latest(reads)
         return latest
 
-    def cash_baseline(self) -> CashBaseline | None:
+    def cash_baseline(self, unsettled_usd: Decimal | None = None) -> CashBaseline | None:
         """The run's first account snapshot with its first complete positions and open-orders
-        reads (ADR-0072); None if any is missing."""
+        reads, and the session-start `unsettled_funds` (ADR-0072); None if a read is missing."""
         snapshots = [a for e in self.items for a in e.account_snapshots]
         pos = self.positions(first=True)
         orders = [o for e in self.items for o in e.open_orders]
         if not snapshots or pos is None or not pos.complete or not orders:
             return None
-        return CashBaseline(account=snapshots[0], positions=pos, open_orders=orders[0])
+        return CashBaseline(
+            account=snapshots[0],
+            positions=pos,
+            open_orders=orders[0],
+            unsettled_usd=unsettled_usd,
+        )
 
     def board_screens(self) -> dict[str, BoardScreen]:
         """Board rows of the run's current Wheelta build, by OCC symbol (ADR-0041).
@@ -313,6 +318,8 @@ class DecisionFactsService:
     rules: FactsRules
     clock: Callable[[], datetime]
     id_factory: Callable[[], uuid.UUID] = new_id
+    # ADR-0072: the trusted get_accounts check's unsettled_funds at session start.
+    opening_unsettled_usd: Decimal | None = None
 
     def compute(self, request: FactsRequest) -> dict[str, JsonValue]:
         """The tool's result body. Raises FactsRequestError for an invalid subject/purpose;
@@ -374,7 +381,7 @@ class DecisionFactsService:
                 account=evidence.account(),
                 positions=evidence.positions(),
                 open_orders=evidence.open_orders(),
-                cash_baseline=evidence.cash_baseline(),
+                cash_baseline=evidence.cash_baseline(self.opening_unsettled_usd),
                 candidate=candidate,
                 board_screen=(
                     evidence.board_screens().get(str(instrument.occ_symbol))

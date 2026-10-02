@@ -129,6 +129,8 @@ class AgenticEligibility(DomainModel):
     itself never reaches the model or the ledger. `account_ref` is redacted (last four only).
     `eligible` holds exactly when `reasons` is empty; each reason names a failed condition.
     `account_type` and `option_level` are recorded as reported, never interpreted.
+    `unsettled_funds_usd` is the account's `unsettled_funds` at the check (ADR-0072), None if
+    absent or malformed; it only lets the facts reconcile a run's opening cash.
     """
 
     account_ref: NonEmptyStr
@@ -136,6 +138,7 @@ class AgenticEligibility(DomainModel):
     reasons: tuple[NonEmptyStr, ...] = ()
     account_type: str | None = None
     option_level: str | None = None
+    unsettled_funds_usd: NonNegDec | None = None
     retrieved_at: UtcDatetime
 
     @model_validator(mode="after")

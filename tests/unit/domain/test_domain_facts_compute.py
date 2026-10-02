@@ -547,6 +547,24 @@ def test_baseline_check_fails_closed(net: str, gross: str, opening_gross: str) -
     assert "csp_reserved_cash_usd" in gap_kinds(f)
 
 
+def test_a_run_opening_with_unsettled_proceeds_reconciles_with_unsettled_funds() -> None:
+    """The broker's session-start unsettled_funds (100) balance the opening cash: 7100 - 100
+    - 4500 = 2500. Wrong or missing unsettled_funds fail closed."""
+    acct = snapshot(c="2500", r=None, gross="7100")
+    held = HELD["positions"]
+    for unsettled, ok in (("100", True), ("99.90", False), (None, False)):
+        opening = CashBaseline(
+            account=acct,
+            positions=held,
+            open_orders=orders(),
+            unsettled_usd=D(unsettled) if unsettled else None,
+        )
+        f = facts(open_inputs(account=acct, cash_baseline=opening, **HELD))
+        assert ("csp_reserved_cash_usd" not in gap_kinds(f)) is ok
+        if ok:
+            assert metric(f, "baseline_unsettled_cash_usd") == D(100)
+
+
 def test_unsettled_proceeds_without_a_baseline_fail_closed() -> None:
     f = facts(open_inputs(account=snapshot(c="2500", r=None, gross="7100"), **HELD))
     assert "csp_reserved_cash_usd" in gap_kinds(f)

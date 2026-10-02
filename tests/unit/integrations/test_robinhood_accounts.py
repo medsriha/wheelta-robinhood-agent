@@ -6,6 +6,7 @@ Built from the scrubbed capture `tests/fixtures/robinhood/results/get_accounts.a
 import copy
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,18 @@ def test_other_accounts_are_dropped_and_never_returned() -> None:
 def test_each_failed_condition_is_named(overrides: dict[str, Any], reason: str) -> None:
     result = check(listing(**overrides))
     assert not result.eligible and reason in result.reasons
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("99.9000", Decimal("99.9000")), ("-1", None), ("abc", None), ("NaN", None), (None, None)],
+)
+def test_unsettled_funds_is_kept_or_unknown_never_ineligible(
+    raw: str | None, expected: Decimal | None
+) -> None:
+    """ADR-0072: a bad amount only feeds the facts' cash check, which then fails closed."""
+    result = check(listing(unsettled_funds=raw))
+    assert result.eligible and result.unsettled_funds_usd == expected
 
 
 def test_last_four_digits_are_not_identity() -> None:

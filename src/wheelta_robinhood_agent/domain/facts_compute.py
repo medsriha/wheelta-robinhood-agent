@@ -277,11 +277,14 @@ class OpenOrdersRead(_Observation):
 class CashBaseline(DomainModel):
     """The run's first account snapshot with its first complete positions and open-orders
     reads (ADR-0072): the cash a later snapshot's unsettled proceeds are measured from. It is
-    used only if its own cash minus put collateral equals its buying power to the cent."""
+    used only if its cash minus `unsettled_usd` (the trusted `get_accounts` check's
+    `unsettled_funds` at session start; None counts as 0) minus put collateral equals its
+    buying power to the cent."""
 
     account: AccountSnapshot
     positions: PositionsRead
     open_orders: OpenOrdersRead
+    unsettled_usd: NonNegDec | None = None
 
 
 class BoardScreen(_Observation):
@@ -621,10 +624,10 @@ class _Computation:
         sell-to-open puts, each counted once. The broker nets that collateral from
         `buying_power` but not from `cash`, so R must equal the snapshot's gross `cash_usd`
         minus `available_settled_cash_usd` to the cent. Failing that, R is still used when
-        buying power equals the run's balanced baseline cash minus R and cash has not fallen
-        (ADR-0072): the difference is then proceeds received since the baseline, not yet
-        settled. Otherwise None with a gap (an unknown hold or a broker change would make C or
-        R wrong).
+        buying power equals the run's balanced baseline settled cash minus R and cash has not
+        fallen (ADR-0072): the difference is then proceeds not yet settled, reported by the
+        broker at session start or received since. Otherwise None with a gap (an unknown hold
+        or a broker change would make C or R wrong).
         """
         field = "csp_reserved_cash_usd"
         if self.positions is None or self.orders is None:
@@ -649,28 +652,35 @@ class _Computation:
             # ADR-0072: proceeds that arrived since the baseline sit in `cash` but not in
             # buying power until they settle. Buying power must then equal the baseline's
             # (settled) cash minus today's collateral, and cash may only have grown.
-            if base is None or net != base[0] - r or gross < base[0]:
+            if base is None or net != base[1] - r or gross < base[0]:
                 self.gap(
                     field,
                     DataQuality.CONTRADICTORY,
                     f"cash {gross} minus put collateral {r} does not equal buying power {net}",
                 )
                 return None
-            ids += base[1]
+            ids += base[2]
         self.metric("derived_csp_reserved_cash_usd", "USD", r, F_CSP, ids)
         return r
 
-    def settled_baseline_cash(self) -> tuple[Decimal, tuple[UUID, ...]] | None:
-        """The baseline's gross cash and evidence ids when its cash minus its put collateral
-        equals its buying power to the cent (no unsettled proceeds then), else None."""
+    def settled_baseline_cash(self) -> tuple[Decimal, Decimal, tuple[UUID, ...]] | None:
+        """The baseline's gross cash, its settled cash (gross less its unsettled funds), and
+        evidence ids when settled cash minus its put collateral equals its buying power to
+        the cent, else None."""
         b = self.i.cash_baseline
         if b is None or not b.positions.complete:
             return None
         gross, net = b.account.cash_usd, b.account.available_settled_cash_usd
         cover = _cover(b.positions, b.open_orders, OptionRight.PUT, None)
-        if gross is None or net is None or cover is None or gross - cover[0] != net:
+        if gross is None or net is None or cover is None:
             return None
-        return gross, (b.account.snapshot_id, b.positions.evidence_id, b.open_orders.evidence_id)
+        settled = gross - (b.unsettled_usd or _ZERO)
+        if settled - cover[0] != net:
+            return None
+        ids = (b.account.snapshot_id, b.positions.evidence_id, b.open_orders.evidence_id)
+        if b.unsettled_usd:
+            self.metric("baseline_unsettled_cash_usd", "USD", b.unsettled_usd, F_CSP, ids)
+        return gross, settled, ids
 
     @cached_property
     def positions(self) -> PositionsRead | None:

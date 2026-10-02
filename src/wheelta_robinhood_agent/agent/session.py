@@ -649,13 +649,15 @@ def build_session_options(
     output_gate: OutputRepairGate | None = None,
     loopback: LoopbackEndpoint | None = None,
     runner: OrderWorkRunner | None = None,
+    opening_unsettled_usd: Decimal | None = None,
 ) -> ClaudeAgentOptions:
     """Hooks, local server, validating proxies (one per open upstream), and options (no I/O).
 
     ADR-0066: with `runner` (an order venue and a proxied Robinhood) the `wra_orders` server
     is served and the runner is bound to the hooks' executor gate and the Robinhood proxy.
 
-    `account_eligible` is the result of the session's trusted `get_accounts` check;
+    `account_eligible` is the result of the session's trusted `get_accounts` check, and
+    `opening_unsettled_usd` its `unsettled_funds` (ADR-0072);
     `output_gate` is closed by the session during final-output repair turns (ADR-0044).
     With `loopback` (ADR-0063, module docstring) the Mignon roles' servers are mounted on its
     app and the in-process proxies list only the orchestrator's tools."""
@@ -722,6 +724,7 @@ def build_session_options(
         account_scope_id=deps.account_scope_id,
         rules=facts_rules_from(deps.rules),
         clock=deps.clock,
+        opening_unsettled_usd=opening_unsettled_usd,
     )
     local = build_local_server([lookup_tool, build_facts_tool(facts_service, deps.run_control)])
     sdk_servers: dict[str, McpSdkServerConfig] = {LOCAL_SERVER_NAME: local}
@@ -1598,6 +1601,9 @@ async def _run_client_with(
         output_gate=gate,
         loopback=loopback,
         runner=runner,
+        opening_unsettled_usd=(
+            result.eligibility.unsettled_funds_usd if result.eligibility and eligible else None
+        ),
     )
     if runner is not None:
         # ADR-0066: jobs outlive no session; leaving waits for each (latch: one cancel).

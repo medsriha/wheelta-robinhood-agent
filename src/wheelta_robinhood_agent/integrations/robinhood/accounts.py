@@ -19,6 +19,7 @@ the check as failed, never as eligible).
 import hmac
 from collections.abc import Mapping
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, JsonValue, SecretStr, StrictBool, StrictStr
@@ -39,6 +40,7 @@ class _Account(BaseModel):
     permanently_deactivated: StrictBool
     type: StrictStr | None = None
     option_level: StrictStr | None = None
+    unsettled_funds: StrictStr | None = None
 
 
 class _Listing(BaseModel):
@@ -89,5 +91,16 @@ def check_eligibility(
         reasons=tuple(reasons),
         account_type=account.type,
         option_level=account.option_level,
+        unsettled_funds_usd=_non_negative(account.unsettled_funds),
         retrieved_at=retrieved_at,
     )
+
+
+def _non_negative(raw: str | None) -> Decimal | None:
+    """A malformed or negative amount is unknown (None), never an eligibility failure: it only
+    feeds the facts' cash reconciliation, which then fails closed (ADR-0072)."""
+    try:
+        value = Decimal(raw) if raw is not None else None
+    except InvalidOperation:
+        return None
+    return value if value is not None and value.is_finite() and value >= 0 else None
